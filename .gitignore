@@ -1,0 +1,28 @@
+# Environment
+.env
+.env.local
+.env.*
+
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Build output
+dist/
+public/assets/
+
+# Logs
+*.log
+logs/
+
+# PM2
+.pm2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
