@@ -7,6 +7,44 @@ import { requireAuth } from '../middleware/auth';
 const router = Router();
 router.use(requireAuth);
 
+// Press releases go through the normal send queue + send-gate, from the
+// cold-outreach subdomain only (marcus@tp.finance is reply-scan only).
+const PRESS_SENDER_DOMAIN = '@go.tp.finance';
+
+/** Active @go.tp.finance account with the most remaining budget, or null. */
+async function getPressSenderAccount(): Promise<{ id: string; email: string; display_name: string | null } | null> {
+  const res = await query<{ id: string; email: string; display_name: string | null }>(
+    `SELECT id, email, display_name FROM email_accounts
+     WHERE is_active = true AND tenant = $1 AND LOWER(email) LIKE $2
+     ORDER BY LEAST(daily_limit - sends_today, hourly_limit - sends_this_hour) DESC, email
+     LIMIT 1`,
+    [TENANT, `%${PRESS_SENDER_DOMAIN}`]
+  );
+  return res.rows[0] || null;
+}
+
+/**
+ * True if the address (or its domain) is on the tenant suppression list, or
+ * belongs to a contact tagged unsubscribed/bounced/hold. Press sends have no
+ * contact_id, so send-gate can't check this for us.
+ */
+async function isSuppressedRecipient(email: string): Promise<boolean> {
+  const domain = (email.split('@')[1] || '').toLowerCase();
+  const res = await query<{ id: string }>(
+    `SELECT id FROM suppressed_emails
+     WHERE tenant = $1 AND (LOWER(email) = LOWER($2) OR LOWER(domain) = $3)
+     UNION ALL
+     SELECT id FROM contacts
+     WHERE tenant = $1 AND LOWER(email) = LOWER($2)
+       AND COALESCE(tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[]
+     LIMIT 1`,
+    [TENANT, email, domain]
+  );
+  return res.rows.length > 0;
+}
+
+const NO_PRESS_SENDER_ERROR = `No active ${PRESS_SENDER_DOMAIN} sending account. Connect/activate one before sending press releases.`;
+
 // ── 1. GET /api/press-releases/contacts — List press contacts ────────────────
 
 router.get('/contacts', async (_req: Request, res: Response) => {
@@ -395,17 +433,18 @@ router.post('/:id/send', async (req: Request, res: Response) => {
       return;
     }
 
-    // Get sending account — always send press releases and follow-ups from Marcus
-    const accountRes = await query(
-      `SELECT * FROM email_accounts WHERE is_active = true AND tenant = '${TENANT}' AND email = 'marcus@tp.finance' LIMIT 1`
-    );
-
-    if (!accountRes.rows[0]) {
-      res.status(400).json({ error: 'marcus@tp.finance is not connected/active for sending' });
+    if (await isSuppressedRecipient(pr.contact_email)) {
+      res.status(409).json({ error: `${pr.contact_email} is suppressed (unsubscribed/bounced/hold or on the suppression list); not sending` });
       return;
     }
 
-    const account = accountRes.rows[0] as { id: string; email: string };
+    // Sending account: an active @go.tp.finance account (never marcus@tp.finance)
+    const account = await getPressSenderAccount();
+    if (!account) {
+      res.status(409).json({ error: NO_PRESS_SENDER_ERROR });
+      return;
+    }
+
     const trackingId = crypto.randomUUID();
 
     const emailHtml = buildPressReleaseEmail(pr);
@@ -419,14 +458,16 @@ router.post('/:id/send', async (req: Request, res: Response) => {
       [pr.contact_email, account.email, subject, emailHtml, trackingId, account.id]
     );
 
-    await sendQueue.add({ emailSendId: sendRes.rows[0].id });
+    // Queued; send-gate enforces send window + account limits at send time
+    await sendQueue.add({ emailSendId: sendRes.rows[0].id, fromName: account.display_name || undefined });
+    await query(`UPDATE email_sends SET last_enqueued_at = NOW() WHERE id = $1`, [sendRes.rows[0].id]);
 
     await query(
       `UPDATE press_releases SET status = 'sent', sent_at = NOW(), email_send_id = $1, updated_at = NOW() WHERE id = $2`,
       [sendRes.rows[0].id, id]
     );
 
-    console.log(`[PressReleases] Sent press release ${id} to ${pr.contact_email} (${pr.publication})`);
+    console.log(`[PressReleases] Queued press release ${id} to ${pr.contact_email} (${pr.publication})`);
     res.json({ success: true, sent_to: pr.contact_email, publication: pr.publication });
   } catch (err) {
     console.error('[PressReleases] Error sending press release:', err);
@@ -458,21 +499,23 @@ router.post('/send-all', async (req: Request, res: Response) => {
       return;
     }
 
-    const accountRes = await query(
-      `SELECT * FROM email_accounts WHERE is_active = true AND tenant = '${TENANT}' AND email = 'marcus@tp.finance' LIMIT 1`
-    );
-
-    if (!accountRes.rows[0]) {
-      res.status(400).json({ error: 'marcus@tp.finance is not connected/active for sending' });
+    const account = await getPressSenderAccount();
+    if (!account) {
+      res.status(409).json({ error: NO_PRESS_SENDER_ERROR });
       return;
     }
 
-    const account = accountRes.rows[0] as { id: string; email: string };
     let sent = 0;
+    const suppressed: string[] = [];
 
     for (const row of drafts.rows) {
       const draft = row as any;
       if (!draft.contact_email) continue;
+
+      if (await isSuppressedRecipient(draft.contact_email)) {
+        suppressed.push(draft.contact_email);
+        continue;
+      }
 
       const fullPr = await query(
         `SELECT pr.*, pc.email as contact_email, pc.contact_name, pc.publication
@@ -494,7 +537,8 @@ router.post('/send-all', async (req: Request, res: Response) => {
         [pr.contact_email, account.email, subject, emailHtml, trackingId, account.id]
       );
 
-      await sendQueue.add({ emailSendId: sendRes.rows[0].id });
+      await sendQueue.add({ emailSendId: sendRes.rows[0].id, fromName: account.display_name || undefined });
+      await query(`UPDATE email_sends SET last_enqueued_at = NOW() WHERE id = $1`, [sendRes.rows[0].id]);
 
       await query(
         `UPDATE press_releases SET status = 'sent', sent_at = NOW(), email_send_id = $1, updated_at = NOW() WHERE id = $2`,
@@ -504,8 +548,8 @@ router.post('/send-all', async (req: Request, res: Response) => {
       sent++;
     }
 
-    console.log(`[PressReleases] Sent ${sent} press releases for: ${announcement_title}`);
-    res.json({ success: true, sent_count: sent });
+    console.log(`[PressReleases] Queued ${sent} press releases for: ${announcement_title} (skipped ${suppressed.length} suppressed)`);
+    res.json({ success: true, sent_count: sent, suppressed_count: suppressed.length, suppressed });
   } catch (err) {
     console.error('[PressReleases] Error sending all press releases:', err);
     res.status(500).json({ error: 'Failed to send press releases' });

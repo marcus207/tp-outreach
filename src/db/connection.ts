@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 export const TENANT = process.env.TENANT || 'tp';
-export const BRAND_NAME = process.env.BRAND_NAME || 'Turning Point Capital';
+export const BRAND_NAME = process.env.BRAND_NAME || 'Turning Point Capital Advisory';
 export const BRAND_DOMAIN = process.env.BRAND_DOMAIN || 'tp.finance';
 export const BRAND_EMAIL = process.env.BRAND_EMAIL || 'marcus@tp.finance';
 

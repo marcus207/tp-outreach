@@ -1,11 +1,14 @@
 /**
- * Tests for SendQueue.processEmailSend — the BullMQ email send worker.
+ * Tests for SendQueue.processEmailSend — the BullMQ email send worker —
+ * and the shared send-gate rules / send window helpers.
  *
  * Regression tests:
- *   - Idempotency: duplicate BullMQ jobs must not send twice
- *   - Global window check: campaign emails (no enrollment) must respect the window
- *   - Unsubscribed / inactive enrollment guards
- *   - No re-queue on window miss (prevents overnight BullMQ job accumulation)
+ *   - Idempotency: duplicate BullMQ jobs must not send twice ('sending' claim)
+ *   - Single window: Mon-Fri 08:00-17:00 Europe/London for ALL sends
+ *   - Never email lenders / hold / unsubscribed / bounced / suppressed
+ *   - Suppression applies to sends with no contact_id (press releases)
+ *   - Failed sequence sends never strand the enrollment
+ *   - A delivered email is never flipped to 'failed' by a counter error
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
@@ -17,13 +20,15 @@ import {
 
 const {
   mockQueueAdd, mockQueueClose, mockQuery, mockSendEmail, mockIncrementSendCounts,
-  MockQueue, MockWorker,
+  mockScheduleNextStep, mockHandleFailedSend, MockQueue, MockWorker,
 } = vi.hoisted(() => {
   const mockQueueAdd = vi.fn().mockResolvedValue(undefined);
   const mockQueueClose = vi.fn().mockResolvedValue(undefined);
   const mockQuery = vi.fn();
   const mockSendEmail = vi.fn();
   const mockIncrementSendCounts = vi.fn();
+  const mockScheduleNextStep = vi.fn().mockResolvedValue(undefined);
+  const mockHandleFailedSend = vi.fn().mockResolvedValue(undefined);
   const MockQueue = vi.fn(function() {
     return {
       add: mockQueueAdd,
@@ -38,7 +43,7 @@ const {
   });
   return {
     mockQueueAdd, mockQueueClose, mockQuery, mockSendEmail, mockIncrementSendCounts,
-    MockQueue, MockWorker,
+    mockScheduleNextStep, mockHandleFailedSend, MockQueue, MockWorker,
   };
 });
 
@@ -50,6 +55,7 @@ vi.mock('bullmq', () => ({
 vi.mock('../db/connection', () => ({
   query: mockQuery,
   TENANT: 'test-tenant',
+  BULL_PREFIX: 'bull-test-tenant',
 }));
 
 vi.mock('../services/gmail-client', () => ({
@@ -59,9 +65,17 @@ vi.mock('../services/gmail-client', () => ({
   },
 }));
 
+vi.mock('../services/daily-planner', () => ({
+  dailyPlanner: {
+    scheduleNextStep: mockScheduleNextStep,
+    handleFailedSend: mockHandleFailedSend,
+  },
+}));
+
 // ── Imports (after mocks) ───────────────────────────────────────────
 
 import { SendQueue } from '../services/send-queue';
+import { isWithinSendWindow, nextSendWindowStart, msUntilSendWindowCloses } from '../services/send-gate';
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -75,7 +89,8 @@ function makeSendRecord(overrides: Record<string, unknown> = {}) {
     tracking_id: 'track-1',
     email_account_id: 'acct-1',
     enrollment_id: null as string | null,
-    contact_id: 'contact-1',
+    broadcast_id: null as string | null,
+    contact_id: 'contact-1' as string | null,
     status: 'queued',
     ...overrides,
   };
@@ -90,40 +105,55 @@ function setupSendMocks(overrides: {
   enrollmentStatus?: string;
   sequenceStatus?: string;
   contactTags?: string[];
+  contactType?: string | null;
+  contacts?: Record<string, unknown>[];
+  suppressed?: boolean;
   account?: Record<string, unknown> | null;
-  sequenceWindow?: { send_window_start: string; send_window_end: string; skip_weekends: boolean };
+  claimSucceeds?: boolean;
 } = {}) {
   const send = makeSendRecord(overrides.send || {});
   const account = overrides.account !== null
     ? makeAccount(overrides.account as any || {})
     : null;
 
+  const contacts = overrides.contacts ?? (send.contact_id
+    ? [{
+        id: send.contact_id,
+        email: send.to_email,
+        tags: overrides.contactTags || [],
+        contact_type: overrides.contactType ?? 'developer',
+      }]
+    : []);
+
   const responses: Record<string, unknown[]> = {
+    "SET status = 'sending'": overrides.claimSucceeds === false ? [] : [{ id: send.id }],
     'FROM email_sends WHERE id': [send],
-    'FROM contacts WHERE id': [{ tags: overrides.contactTags || [] }],
+    'FROM contacts': contacts,
+    'FROM suppressed_emails': overrides.suppressed ? [{ id: 'supp-1' }] : [],
     'FROM email_accounts WHERE id': account ? [account] : [],
   };
 
   if (send.enrollment_id) {
-    // Enrollment + sequence status check (JOIN query with se.status, s.status)
     responses['se.status as enrollment_status'] = [
       {
         enrollment_status: overrides.enrollmentStatus || 'active',
         sequence_status: overrides.sequenceStatus || 'active',
       },
     ];
-    // Window settings query (JOIN query with s.send_window_start)
-    responses['s.send_window_start'] = [
-      overrides.sequenceWindow || {
-        send_window_start: '09:00',
-        send_window_end: '17:00',
-        skip_weekends: true,
-      },
-    ];
   }
 
   setupQueryResponses(mockQuery, responses);
   return { send, account };
+}
+
+function sqlCalls(fragment: string) {
+  return mockQuery.mock.calls.filter(
+    (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes(fragment)
+  );
+}
+
+function failedUpdates() {
+  return sqlCalls("SET status = 'failed'");
 }
 
 // ── Setup / teardown ────────────────────────────────────────────────
@@ -143,50 +173,115 @@ afterEach(() => {
 });
 
 /** Call the private processEmailSend method directly. */
-async function processEmail(data: { emailSendId: string; threadId?: string; fromName?: string }) {
+async function processEmail(data: { emailSendId: string; threadId?: string; fromName?: string; preCounted?: boolean }) {
   return (sq as any).processEmailSend(data);
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Send window helpers — Mon-Fri 08:00-17:00 Europe/London
+// ═════════════════════════════════════════════════════════════════════
+
+describe('send window helpers', () => {
+  const utc = (y: number, m: number, d: number, h: number, min = 0) =>
+    new Date(Date.UTC(y, m - 1, d, h, min));
+
+  it('BST: 07:00 UTC (08:00 London) is inside, 06:59 UTC is outside', () => {
+    expect(isWithinSendWindow(utc(2026, 4, 15, 7, 0))).toBe(true);
+    expect(isWithinSendWindow(utc(2026, 4, 15, 6, 59))).toBe(false);
+  });
+
+  it('BST: 16:00 UTC (17:00 London) is outside, 15:59 UTC is inside', () => {
+    expect(isWithinSendWindow(utc(2026, 4, 15, 16, 0))).toBe(false);
+    expect(isWithinSendWindow(utc(2026, 4, 15, 15, 59))).toBe(true);
+  });
+
+  it('GMT: 08:00 UTC inside, 17:00 UTC outside', () => {
+    expect(isWithinSendWindow(utc(2026, 1, 14, 8, 0))).toBe(true);
+    expect(isWithinSendWindow(utc(2026, 1, 14, 7, 59))).toBe(false);
+    expect(isWithinSendWindow(utc(2026, 1, 14, 17, 0))).toBe(false);
+  });
+
+  it('weekends are outside', () => {
+    expect(isWithinSendWindow(utc(2026, 4, 18, 10))).toBe(false); // Sat
+    expect(isWithinSendWindow(utc(2026, 4, 19, 10))).toBe(false); // Sun
+  });
+
+  it('nextSendWindowStart returns the same instant when inside the window', () => {
+    const d = utc(2026, 4, 15, 12, 34);
+    expect(nextSendWindowStart(d).getTime()).toBe(d.getTime());
+  });
+
+  it('nextSendWindowStart: before window → same day 08:00 London', () => {
+    expect(nextSendWindowStart(utc(2026, 4, 15, 5, 0)).toISOString()).toBe('2026-04-15T07:00:00.000Z');
+  });
+
+  it('nextSendWindowStart: after window → next day 08:00 London', () => {
+    expect(nextSendWindowStart(utc(2026, 4, 14, 22, 0)).toISOString()).toBe('2026-04-15T07:00:00.000Z');
+  });
+
+  it('nextSendWindowStart: Friday evening / Saturday → Monday 08:00 London', () => {
+    expect(nextSendWindowStart(utc(2026, 4, 17, 18, 0)).toISOString()).toBe('2026-04-20T07:00:00.000Z');
+    expect(nextSendWindowStart(utc(2026, 4, 18, 10, 0)).toISOString()).toBe('2026-04-20T07:00:00.000Z');
+  });
+
+  it('nextSendWindowStart: across DST change (Sat 24 Oct BST → Mon 26 Oct GMT)', () => {
+    expect(nextSendWindowStart(utc(2026, 10, 24, 12, 0)).toISOString()).toBe('2026-10-26T08:00:00.000Z');
+  });
+
+  it('msUntilSendWindowCloses', () => {
+    expect(msUntilSendWindowCloses(utc(2026, 4, 15, 15, 30))).toBe(30 * 60 * 1000);
+    expect(msUntilSendWindowCloses(utc(2026, 4, 15, 20, 0))).toBe(0);
+  });
+});
 
 // ═════════════════════════════════════════════════════════════════════
 // Idempotency — duplicate BullMQ jobs must not double-send
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processEmailSend — idempotency', () => {
-  it('status "sent" → skips without sending', async () => {
+  it.each(['sent', 'failed', 'sending'])('status "%s" → skips without sending', async (status) => {
     setInsideWindow();
-    setupSendMocks({ send: { status: 'sent' } });
+    setupSendMocks({ send: { status } });
 
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates().length).toBe(0);
   });
 
-  it('status "failed" → skips without sending', async () => {
-    setInsideWindow();
-    setupSendMocks({ send: { status: 'failed' } });
-
-    await processEmail({ emailSendId: 'send-1' });
-
-    expect(mockSendEmail).not.toHaveBeenCalled();
-  });
-
-  it('status "queued" → proceeds to send', async () => {
+  it('status "queued" → claims as sending, then sends', async () => {
     setInsideWindow();
     setupSendMocks();
 
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    const claim = sqlCalls("SET status = 'sending'");
+    expect(claim.length).toBe(1);
+    expect(claim[0][0]).toContain("status = 'queued'");
+    expect(claim[0][0]).toContain('RETURNING');
+    // Claim happened before Gmail was called
+    const claimOrder = mockQuery.mock.invocationCallOrder[mockQuery.mock.calls.indexOf(claim[0])];
+    expect(claimOrder).toBeLessThan(mockSendEmail.mock.invocationCallOrder[0]);
+  });
+
+  it('claim lost to another job (UPDATE returns no row) → does not send', async () => {
+    setInsideWindow();
+    setupSendMocks({ claimSucceeds: false });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 });
 
 // ═════════════════════════════════════════════════════════════════════
-// Global window check — applies to ALL emails (campaign + sequence)
+// Single window check — applies to ALL emails (campaign + sequence)
 // ═════════════════════════════════════════════════════════════════════
 
-describe('processEmailSend — global window check', () => {
+describe('processEmailSend — window check', () => {
   it('campaign email (no enrollment) outside window 22:00 → blocked', async () => {
-    setOutsideWindow(); // 22:00 UTC
+    setOutsideWindow();
     setupSendMocks({ send: { enrollment_id: null } });
 
     await processEmail({ emailSendId: 'send-1' });
@@ -195,7 +290,7 @@ describe('processEmailSend — global window check', () => {
   });
 
   it('campaign email inside window → sends', async () => {
-    setInsideWindow(); // 14:30 UTC
+    setInsideWindow();
     setupSendMocks({ send: { enrollment_id: null } });
 
     await processEmail({ emailSendId: 'send-1' });
@@ -212,8 +307,8 @@ describe('processEmailSend — global window check', () => {
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
-  it('weekend with skip_weekends → blocked', async () => {
-    setWeekend(); // Sat 10:00 UTC
+  it('weekend → blocked', async () => {
+    setWeekend();
     setupSendMocks({ send: { enrollment_id: null } });
 
     await processEmail({ emailSendId: 'send-1' });
@@ -221,42 +316,32 @@ describe('processEmailSend — global window check', () => {
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
-  it('does NOT re-queue when outside window (prevents BullMQ job accumulation)', async () => {
-    setOutsideWindow();
-    setupSendMocks();
-
-    await processEmail({ emailSendId: 'send-1' });
-
-    // Must NOT add any new jobs — requeueStuckSends handles retry
-    expect(mockQueueAdd).not.toHaveBeenCalled();
-  });
-
-  it('uses sequence window settings when enrollment exists', async () => {
-    // 08:00 UTC — outside default 09:00-17:00 but inside custom 07:00-18:00
-    setUTCTime(2026, 4, 15, 8, 0);
-
-    setupSendMocks({
-      send: { enrollment_id: 'enr-1' },
-      sequenceWindow: { send_window_start: '07:00', send_window_end: '18:00', skip_weekends: true },
-    });
+  it('07:30 UTC in BST (08:30 London) → sends', async () => {
+    setUTCTime(2026, 4, 15, 7, 30);
+    setupSendMocks({ send: { enrollment_id: 'enr-1' } });
 
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
   });
 
-  it('sequence with narrow window overrides default at 14:30', async () => {
-    setInsideWindow(); // 14:30 — inside default window
-
-    // But sequence has narrow 08:00-14:00 window
-    setupSendMocks({
-      send: { enrollment_id: 'enr-1' },
-      sequenceWindow: { send_window_start: '08:00', send_window_end: '14:00', skip_weekends: true },
-    });
+  it('16:30 UTC in BST (17:30 London) → blocked', async () => {
+    setUTCTime(2026, 4, 15, 16, 30);
+    setupSendMocks({ send: { enrollment_id: 'enr-1' } });
 
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('does NOT re-queue or fail when outside window', async () => {
+    setOutsideWindow();
+    setupSendMocks();
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+    expect(failedUpdates().length).toBe(0);
   });
 });
 
@@ -265,7 +350,7 @@ describe('processEmailSend — global window check', () => {
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processEmailSend — enrollment/contact guards', () => {
-  it('inactive enrollment → marks as failed, does not send', async () => {
+  it('inactive enrollment → marks failed, cancels (permanent), does not send', async () => {
     setInsideWindow();
     setupSendMocks({
       send: { enrollment_id: 'enr-1' },
@@ -275,11 +360,10 @@ describe('processEmailSend — enrollment/contact guards', () => {
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
-
-    const updateCalls = mockQuery.mock.calls.filter(
-      (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('Enrollment cancelled')
-    );
-    expect(updateCalls.length).toBe(1);
+    const fails = failedUpdates();
+    expect(fails.length).toBe(1);
+    expect(fails[0][1][0]).toBe('Enrollment cancelled');
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Enrollment cancelled', true);
   });
 
   it('paused sequence → skips send but does NOT mark as failed', async () => {
@@ -292,70 +376,191 @@ describe('processEmailSend — enrollment/contact guards', () => {
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
-
-    // Must NOT update email_sends to failed — just skip
-    const failCalls = mockQuery.mock.calls.filter(
-      (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes("status = 'failed'")
-    );
-    expect(failCalls.length).toBe(0);
+    expect(failedUpdates().length).toBe(0);
   });
 
-  it('unsubscribed contact → marks as failed, does not send', async () => {
+  it('unsubscribed contact → marks failed, does not send', async () => {
     setInsideWindow();
     setupSendMocks({ contactTags: ['unsubscribed'] });
 
     await processEmail({ emailSendId: 'send-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
-
-    const updateCalls = mockQuery.mock.calls.filter(
-      (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('Unsubscribed')
-    );
-    expect(updateCalls.length).toBe(1);
+    expect(failedUpdates()[0][1][0]).toBe('Unsubscribed');
   });
 
-  it('email send record not found → throws', async () => {
+  it('bounced contact → marks failed', async () => {
+    setInsideWindow();
+    setupSendMocks({ contactTags: ['bounced'] });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Contact bounced');
+  });
+
+  it('lender contact → permanent fail, cancels enrollment', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' }, contactType: 'lender' });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Contact is a lender');
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Contact is a lender', true);
+  });
+
+  it('hold-tagged contact → fails non-permanently (enrollment retried)', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' }, contactTags: ['hold'] });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Contact on hold', false);
+  });
+
+  it('internal @tp.finance address bypasses lender/hold checks', async () => {
+    setInsideWindow();
+    setupSendMocks({
+      send: { to_email: 'marcus@tp.finance' },
+      contactType: 'lender',
+      contactTags: ['hold'],
+    });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('internal address is still blocked by suppression', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { to_email: 'someone@go.tp.finance' }, suppressed: true });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Permanently suppressed');
+  });
+
+  it('suppressed email → permanent fail', async () => {
+    setInsideWindow();
+    setupSendMocks({ suppressed: true });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Permanently suppressed');
+  });
+
+  it('press release with NO contact_id is still checked against suppression by to_email', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { contact_id: null, to_email: 'Press@Example.com' }, suppressed: true });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    const supp = sqlCalls('FROM suppressed_emails');
+    expect(supp.length).toBeGreaterThan(0);
+    expect(supp[0][1][0]).toBe('press@example.com');
+  });
+
+  it('press release with no contact_id but a lender contact on that address → blocked', async () => {
+    setInsideWindow();
+    setupSendMocks({
+      send: { contact_id: null },
+      contacts: [{ id: 'c-9', email: 'recipient@example.com', tags: [], contact_type: 'lender' }],
+    });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Contact is a lender');
+  });
+
+  it('suppression domain match only applies to source=manual rows with a domain', async () => {
+    setInsideWindow();
+    setupSendMocks();
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    const supp = sqlCalls('FROM suppressed_emails');
+    expect(supp.length).toBeGreaterThan(0);
+    const sql = supp[0][0] as string;
+    expect(sql).toContain("source = 'manual'");
+    expect(sql).toContain('domain IS NOT NULL');
+    expect(sql).toContain('tenant = $2');
+  });
+
+  it('contact_id not found in this tenant → permanent fail', async () => {
+    setInsideWindow();
+    setupSendMocks({ contacts: [] });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Contact not found in tenant');
+  });
+
+  it('email send record not found → does not send', async () => {
     setInsideWindow();
     setupQueryResponses(mockQuery, {
       'FROM email_sends WHERE id': [],
     });
 
-    await expect(
-      processEmail({ emailSendId: 'nonexistent' })
-    ).rejects.toThrow('not found');
+    await processEmail({ emailSendId: 'nonexistent' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
-  it('email account not found or inactive → throws', async () => {
+  it('email account not found or inactive → fails non-permanently, enrollment retried', async () => {
     setInsideWindow();
-    setupSendMocks({ account: null });
+    setupSendMocks({ send: { enrollment_id: 'enr-1' }, account: null });
 
-    await expect(
-      processEmail({ emailSendId: 'send-1' })
-    ).rejects.toThrow('not found or inactive');
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates()[0][1][0]).toBe('Email account inactive');
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Email account inactive', false);
   });
 });
 
 // ═════════════════════════════════════════════════════════════════════
-// Rate limits
+// Rate limits — skip (stay queued), never fail
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processEmailSend — rate limits', () => {
-  it('daily limit reached → throws', async () => {
+  it('daily limit reached → skips, stays queued', async () => {
     setInsideWindow();
     setupSendMocks({ account: { daily_limit: 80, sends_today: 80 } });
 
-    await expect(
-      processEmail({ emailSendId: 'send-1' })
-    ).rejects.toThrow('Daily limit reached');
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates().length).toBe(0);
   });
 
-  it('hourly limit reached → throws', async () => {
+  it('hourly limit reached → skips, stays queued', async () => {
     setInsideWindow();
     setupSendMocks({ account: { hourly_limit: 15, sends_this_hour: 15 } });
 
-    await expect(
-      processEmail({ emailSendId: 'send-1' })
-    ).rejects.toThrow('Hourly limit reached');
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates().length).toBe(0);
+  });
+
+  it('within send gap → re-adds the job with full payload instead of dropping it', async () => {
+    setInsideWindow();
+    setupSendMocks({ account: { last_send_at: new Date(Date.now() - 30000) } });
+
+    await processEmail({ emailSendId: 'send-1', threadId: 't-1', fromName: 'Marcus' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    const [, data, opts] = mockQueueAdd.mock.calls[0];
+    expect(data).toEqual({ emailSendId: 'send-1', threadId: 't-1', fromName: 'Marcus' });
+    expect(opts.delay).toBeGreaterThan(0);
   });
 });
 
@@ -364,13 +569,12 @@ describe('processEmailSend — rate limits', () => {
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processEmailSend — send + error handling', () => {
-  it('successful send → calls Gmail, updates record, increments counts', async () => {
+  it('successful send → calls Gmail, marks sent, increments counts', async () => {
     setInsideWindow();
     const { account } = setupSendMocks();
 
-    await processEmail({ emailSendId: 'send-1' });
+    await processEmail({ emailSendId: 'send-1', threadId: 'thr-1', fromName: 'Marcus' });
 
-    // Gmail API called
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     expect(mockSendEmail).toHaveBeenCalledWith(
       expect.objectContaining({ id: account!.id }),
@@ -378,35 +582,88 @@ describe('processEmailSend — send + error handling', () => {
         to: 'recipient@example.com',
         from: 'sender@test.com',
         subject: 'Test Subject',
+        threadId: 'thr-1',
+        fromName: 'Marcus',
       })
     );
-
-    // Send counts incremented
     expect(mockIncrementSendCounts).toHaveBeenCalledWith(account!.id);
-
-    // Record updated to 'sent'
-    const updateCalls = mockQuery.mock.calls.filter(
-      (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes("status = 'sent'")
-    );
-    expect(updateCalls.length).toBe(1);
+    expect(sqlCalls("status = 'sent'").length).toBe(1);
+    expect(failedUpdates().length).toBe(0);
   });
 
-  it('Gmail failure → updates to failed and re-throws for BullMQ retry', async () => {
+  it('preCounted → does not increment counters again', async () => {
     setInsideWindow();
     setupSendMocks();
-    mockSendEmail.mockRejectedValue(new Error('Gmail API rate limit'));
+
+    await processEmail({ emailSendId: 'send-1', preCounted: true });
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    expect(mockIncrementSendCounts).not.toHaveBeenCalled();
+  });
+
+  it('sequence send success → schedules next step', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' } });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockScheduleNextStep).toHaveBeenCalledWith('send-1');
+    expect(mockHandleFailedSend).not.toHaveBeenCalled();
+  });
+
+  it('counter increment failure → still sent, never marked failed', async () => {
+    setInsideWindow();
+    setupSendMocks();
+    mockIncrementSendCounts.mockRejectedValue(new Error('db blip'));
+
+    await expect(processEmail({ emailSendId: 'send-1' })).resolves.toBeUndefined();
+
+    expect(sqlCalls("status = 'sent'").length).toBe(1);
+    expect(failedUpdates().length).toBe(0);
+  });
+
+  it('status=sent update failure after Gmail success → row left as sending, not failed', async () => {
+    setInsideWindow();
+    setupSendMocks();
+    const impl = mockQuery.getMockImplementation()!;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql.includes("status = 'sent'")) return Promise.reject(new Error('connection lost'));
+      return impl(sql, params);
+    });
+
+    await expect(processEmail({ emailSendId: 'send-1' })).resolves.toBeUndefined();
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+    expect(failedUpdates().length).toBe(0);
+    expect(mockHandleFailedSend).not.toHaveBeenCalled();
+  });
+
+  it('Gmail failure → marks failed, reschedules enrollment (non-permanent), re-throws', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' } });
+    mockSendEmail.mockRejectedValue(new Error('invalid_grant'));
 
     await expect(
       processEmail({ emailSendId: 'send-1' })
-    ).rejects.toThrow('Gmail API rate limit');
+    ).rejects.toThrow('invalid_grant');
 
-    // Record updated to failed with error message
-    const updateCalls = mockQuery.mock.calls.filter(
-      (c: unknown[]) =>
-        typeof c[0] === 'string' &&
-        (c[0] as string).includes("status = 'failed'") &&
-        (c[0] as string).includes('error_message')
-    );
-    expect(updateCalls.length).toBe(1);
+    const fails = failedUpdates().filter(c => (c[0] as string).includes('error_message'));
+    expect(fails.length).toBe(1);
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'invalid_grant', false);
+    expect(mockScheduleNextStep).not.toHaveBeenCalled();
+  });
+
+  it('thread not found → retries once without threadId', async () => {
+    setInsideWindow();
+    setupSendMocks();
+    mockSendEmail
+      .mockRejectedValueOnce(new Error('Requested entity was not found.'))
+      .mockResolvedValueOnce({ messageId: 'msg-2', threadId: 'thread-2' });
+
+    await processEmail({ emailSendId: 'send-1', threadId: 'old-thread' });
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(2);
+    expect(mockSendEmail.mock.calls[1][1].threadId).toBeUndefined();
+    expect(sqlCalls("status = 'sent'").length).toBe(1);
   });
 });

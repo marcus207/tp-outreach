@@ -186,7 +186,9 @@ cron.schedule('15 * * * *', async () => {
   }
 });
 
-// Every hour at :15: campaign engine tick (controlled by is_active in DB)
+// Every hour at :15: campaign engine tick. tick() no-ops unless
+// campaign_settings.is_active = true (Pause/Resume in campaign-planner) and
+// inside the shared send window (send-gate isWithinSendWindow).
 cron.schedule('15 * * * *', async () => {
   console.log('[Worker Cron] Campaign engine tick...');
   try {
@@ -201,7 +203,8 @@ cron.schedule('15 * * * *', async () => {
   }
 });
 
-// Every 3 minutes: re-queue stuck email_sends that lost their BullMQ jobs
+// Every 3 minutes (*/3): re-queue stuck email_sends that lost their BullMQ jobs
+// (requeue-stuck.ts only picks sends not enqueued in the last 30 minutes)
 cron.schedule('*/3 * * * *', async () => {
   try {
     await requeueStuckSends();
@@ -210,9 +213,10 @@ cron.schedule('*/3 * * * *', async () => {
   }
 });
 
-// Hourly planner: runs at :05 past each hour during the send window (08-17 UTC, 7 days/week).
+// Hourly planner: runs at :05 past each hour on weekdays; the planner itself gates on the
+// shared send window (Mon-Fri 08:00-17:00 Europe/London), so BST/GMT both work.
 // Picks up enrollments whose next_step_due_at <= NOW(), fair-distributes across accounts.
-cron.schedule('5 8-17 * * *', async () => {
+cron.schedule('5 * * * 1-5', async () => {
   console.log(`[Worker Cron] Running hourly planner for ${TENANT}...`);
   try {
     const result = await dailyPlanner.plan();
@@ -222,9 +226,11 @@ cron.schedule('5 8-17 * * *', async () => {
   }
 });
 
-// Broadcast planner: runs at :10 past each hour during the send window (08-17 UTC, 7 days/week).
-// Picks queued broadcast emails and distributes at 15/hr/account, separate from sequence budget.
-cron.schedule('10 8-17 * * *', async () => {
+// Broadcast planner: runs at :10 past every hour; plan() itself no-ops outside the
+// shared send window (Mon-Fri 08:00-17:00 Europe/London, so BST/GMT both work).
+// Distributes queued broadcast emails across @go.tp.finance accounts within
+// BROADCAST_HOURLY_LIMIT and each account's remaining hourly/daily budget.
+cron.schedule('10 * * * *', async () => {
   console.log(`[Worker Cron] Running broadcast planner for ${TENANT}...`);
   try {
     const result = await broadcastPlanner.plan();
@@ -439,6 +445,9 @@ async function autoEnrolTpContacts(): Promise<void> {
        AND NOT ('bounced' = ANY(c.tags))
        AND NOT ('hold' = ANY(c.tags))
        AND c.contact_type <> 'lender'
+       -- Never enrol our own mailboxes (e.g. deliverability_check.py seeds marcus@tp.finance)
+       AND LOWER(c.email) NOT LIKE '%@tp.finance'
+       AND LOWER(c.email) NOT LIKE '%@go.tp.finance'
        AND NOT EXISTS (
          SELECT 1 FROM suppressed_emails se2
          WHERE se2.tenant = 'tp' AND LOWER(se2.email) = LOWER(c.email)

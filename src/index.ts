@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config();
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
@@ -9,7 +9,7 @@ import connectPgSimple from 'connect-pg-simple';
 import cors from 'cors';
 import helmet from 'helmet';
 import { pool, query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from './db/connection';
-import { requireAuth, requireApiKey } from './middleware/auth';
+import { requireAuth } from './middleware/auth';
 import { gmailClient } from './services/gmail-client';
 import { dripifyMonitor } from './services/dripify-monitor';
 import { apolloSyncService } from './services/apollo-sync';
@@ -34,10 +34,91 @@ const PORT = parseInt(process.env.PORT || '3105', 10);
 // Trust nginx proxy so secure cookies work over HTTPS
 app.set('trust proxy', 1);
 
+// ---- Security helpers ----
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Constant-time string comparison (hash both sides so buffers are equal length)
+function safeEqual(provided: unknown, expected: string): boolean {
+  if (typeof provided !== 'string') return false;
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Tiny in-memory fixed-window rate limiter keyed by IP (single process)
+function createRateLimiter(max: number, windowMs: number) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of hits) if (entry.resetAt <= now) hits.delete(key);
+  }, windowMs);
+  sweep.unref();
+  const current = (key: string) => {
+    const entry = hits.get(key);
+    if (!entry || entry.resetAt <= Date.now()) return null;
+    return entry;
+  };
+  return {
+    isBlocked(key: string): boolean {
+      const entry = current(key);
+      return !!entry && entry.count >= max;
+    },
+    hit(key: string): void {
+      const entry = current(key);
+      if (entry) entry.count++;
+      else hits.set(key, { count: 1, resetAt: Date.now() + windowMs });
+    },
+    reset(key: string): void {
+      hits.delete(key);
+    },
+  };
+}
+
+const loginLimiter = createRateLimiter(5, 15 * 60 * 1000);          // 5 failures / 15 min / IP
+const forgotPasswordLimiter = createRateLimiter(3, 60 * 60 * 1000); // 3 requests / hour / IP
+const resetPasswordLimiter = createRateLimiter(10, 60 * 60 * 1000); // 10 attempts / hour / IP
+
+function clientKey(req: Request): string {
+  return req.ip || req.socket.remoteAddress || 'unknown';
+}
+
 // ---- Middleware ----
+// CSP for the React SPA (and srcdoc email/poster previews, which inherit it).
+// /api/* responses are excluded: some authenticated preview pages (e.g. article
+// website preview) load third-party scripts and are framed via src=, not srcdoc.
+const cspMiddleware = helmet.contentSecurityPolicy({
+  useDefaults: false,
+  directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'"],
+    styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+    fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+    imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+    connectSrc: ["'self'"],
+    frameSrc: ["'self'"],
+    objectSrc: ["'none'"],
+    baseUri: ["'self'"],
+    formAction: ["'self'"],
+    frameAncestors: ["'self'"],
+  },
+});
+
 app.use(helmet({
   contentSecurityPolicy: false,
 }));
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path.startsWith('/api/')) { next(); return; }
+  cspMiddleware(req, res, next);
+});
 
 app.use(cors({
   origin: process.env.NODE_ENV === 'production'
@@ -68,6 +149,7 @@ app.use(
     cookie: {
       secure: process.env.NODE_ENV === 'production',
       httpOnly: true,
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
@@ -75,16 +157,27 @@ app.use(
 
 // ---- Auth Routes ----
 app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
   if (!process.env.DASHBOARD_PASSWORD || !process.env.DASHBOARD_EMAIL) {
     res.status(500).json({ error: 'Auth not configured' });
     return;
   }
-  if (email === process.env.DASHBOARD_EMAIL && password === process.env.DASHBOARD_PASSWORD) {
+  const ip = clientKey(req);
+  if (loginLimiter.isBlocked(ip)) {
+    res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
+    return;
+  }
+  // Evaluate both comparisons (no short-circuit) to keep timing uniform
+  const emailOk = safeEqual(email, process.env.DASHBOARD_EMAIL);
+  const passwordOk = safeEqual(password, process.env.DASHBOARD_PASSWORD);
+  if (emailOk && passwordOk) {
+    loginLimiter.reset(ip);
     req.session.authenticated = true;
     req.session.email = email;
     res.json({ success: true, email });
   } else {
+    loginLimiter.hit(ip);
+    console.warn(`[Auth] Failed login from ${ip}`);
     res.status(401).json({ error: 'Invalid email or password' });
   }
 });
@@ -120,10 +213,24 @@ app.get('/api/health/full', requireAuth, async (_req: Request, res: Response) =>
   }
 });
 
-app.post('/api/auth/forgot-password', async (_req: Request, res: Response) => {
+// Same response whatever happens, so the endpoint reveals nothing
+const FORGOT_PASSWORD_RESPONSE = {
+  success: true,
+  message: 'If password reset is configured, a reset link has been emailed to the account owner. It expires in 1 hour.',
+};
+const RESET_TOKEN_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
+  const ip = clientKey(req);
+  if (forgotPasswordLimiter.isBlocked(ip)) {
+    res.status(429).json({ error: 'Too many reset requests. Try again later.' });
+    return;
+  }
+  forgotPasswordLimiter.hit(ip);
+
   try {
     const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_MAX_AGE_MS); // 1 hour
 
     await query(
       `INSERT INTO settings (key, value) VALUES ('pw_reset_token', $1)
@@ -161,20 +268,27 @@ app.post('/api/auth/forgot-password', async (_req: Request, res: Response) => {
       ].join('\n');
       const encoded = Buffer.from(emailBody).toString('base64url');
       await gmail.users.messages.send({ userId: 'me', requestBody: { raw: encoded } });
-      res.json({ success: true, sent: true });
+      console.log(`[Auth] Password reset link emailed to ${BRAND_EMAIL} (requested from ${ip})`);
     } else {
-      // No Gmail connected — return the URL directly (private single-user system)
-      res.json({ success: true, sent: false, reset_url: resetUrl });
+      // Never expose the link in the response. With no Gmail account connected,
+      // the password must be reset server-side (DASHBOARD_PASSWORD in .env).
+      console.warn(`[Auth] Password reset requested from ${ip} but no active Gmail account to send it`);
     }
   } catch (err) {
     console.error('[Auth] Forgot password error:', err);
-    res.status(500).json({ error: 'Failed to generate reset link' });
   }
+  res.json(FORGOT_PASSWORD_RESPONSE);
 });
 
 app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
-  const { token, new_password } = req.body;
-  if (!token || !new_password || new_password.length < 8) {
+  const { token, new_password } = req.body || {};
+  const ip = clientKey(req);
+  if (resetPasswordLimiter.isBlocked(ip)) {
+    res.status(429).json({ error: 'Too many attempts. Try again later.' });
+    return;
+  }
+  resetPasswordLimiter.hit(ip);
+  if (typeof token !== 'string' || typeof new_password !== 'string' || new_password.length < 8 || /[\r\n]/.test(new_password)) {
     res.status(400).json({ error: 'Token and a password of at least 8 characters are required' });
     return;
   }
@@ -191,12 +305,14 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
 
     const { token: storedToken, expires_at } = result.rows[0].value;
 
-    if (token !== storedToken) {
+    if (!storedToken || !safeEqual(token, storedToken)) {
       res.status(400).json({ error: 'Invalid reset token' });
       return;
     }
 
-    if (new Date() > new Date(expires_at)) {
+    // Enforce expiry, and never honour a stored expiry more than 1 hour out
+    const expiresMs = new Date(expires_at).getTime();
+    if (!Number.isFinite(expiresMs) || Date.now() > expiresMs || expiresMs - Date.now() > RESET_TOKEN_MAX_AGE_MS) {
       res.status(400).json({ error: 'Reset link has expired. Please request a new one.' });
       return;
     }
@@ -295,22 +411,47 @@ app.get('/t/:trackingId/open', async (req: Request, res: Response) => {
   res.send(pixel);
 });
 
+const CLICK_FALLBACK_URL = 'https://www.tp.finance';
+
+// Only redirect to http(s) URLs for a known send, and (when the stored body is
+// available) only to hosts that actually appear in that email. Prevents the
+// tracking endpoint being used as an open redirect.
+function isAllowedClickTarget(rawUrl: string, bodyHtml: string | null): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase();
+  if (host === BRAND_DOMAIN.toLowerCase() || host.endsWith(`.${BRAND_DOMAIN.toLowerCase()}`)) return true;
+  if (!bodyHtml) return true; // no stored body to check against: known send + http(s) only
+  return bodyHtml.toLowerCase().includes(`//${host}`);
+}
+
 app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
   const { trackingId } = req.params;
-  const redirectUrl = req.query.url as string;
+  const redirectUrl = typeof req.query.url === 'string' ? req.query.url : '';
+  let target = CLICK_FALLBACK_URL;
 
   try {
-    const sendResult = await query<{ id: string }>(
-      `SELECT id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
+    const sendResult = await query<{ id: string; body_html: string | null }>(
+      `SELECT id, body_html FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
       [trackingId, TENANT]
     );
 
-    if (sendResult.rows[0]) {
+    const send = sendResult.rows[0];
+    if (send) {
+      const allowed = !!redirectUrl && isAllowedClickTarget(redirectUrl, send.body_html);
+      if (allowed) target = redirectUrl;
+      else if (redirectUrl) console.warn(`[Tracking] Blocked click redirect for ${trackingId} to ${redirectUrl.slice(0, 200)}`);
+
       await query(
         `INSERT INTO email_events (email_send_id, event_type, url, ip_address, user_agent)
          VALUES ($1, 'click', $2, $3, $4)`,
         [
-          sendResult.rows[0].id,
+          send.id,
           redirectUrl || null,
           req.ip,
           req.headers['user-agent'] || null,
@@ -321,16 +462,55 @@ app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
     console.error('[Tracking] Error recording click:', err);
   }
 
-  if (redirectUrl) {
-    res.redirect(redirectUrl);
-  } else {
-    res.status(200).send('OK');
-  }
+  res.redirect(target);
 });
+
+// Full unsubscribe for a tracking id: suppress the recipient address (works even
+// when the send has no contact_id, e.g. press releases), tag the contact, cancel
+// enrollments and record the event. Returns false if the tracking id is unknown.
+async function processUnsubscribe(trackingId: string, req: Request): Promise<boolean> {
+  const sendResult = await query<{ id: string; contact_id: string | null; to_email: string | null }>(
+    `SELECT id, contact_id, to_email FROM email_sends WHERE tracking_id = $1 AND tenant = $2 LIMIT 1`,
+    [trackingId, TENANT]
+  );
+  const send = sendResult.rows[0];
+  if (!send) return false;
+
+  const email = (send.to_email || '').trim();
+  if (email) {
+    await query(
+      `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
+       VALUES (LOWER($1), NULL, 'unsubscribed (link)', 'unsubscribe-link', $2)
+       ON CONFLICT DO NOTHING`,
+      [email, TENANT]
+    );
+  }
+
+  // Contact by id if the send has one, otherwise by recipient address
+  await query(
+    `UPDATE contacts SET tags = array_append(COALESCE(tags, '{}'), 'unsubscribed'), updated_at = NOW()
+     WHERE tenant = $1 AND (id = $2 OR LOWER(email) = LOWER(NULLIF($3, '')))
+       AND NOT ('unsubscribed' = ANY(COALESCE(tags, '{}')))`,
+    [TENANT, send.contact_id, email]
+  );
+  await query(
+    `UPDATE sequence_enrollments SET status = 'cancelled', updated_at = NOW()
+     WHERE tenant = $1 AND status IN ('active', 'paused')
+       AND contact_id IN (SELECT id FROM contacts WHERE tenant = $1 AND (id = $2 OR LOWER(email) = LOWER(NULLIF($3, ''))))`,
+    [TENANT, send.contact_id, email]
+  );
+  await query(
+    `INSERT INTO email_events (email_send_id, event_type, ip_address, user_agent, created_at)
+     VALUES ($1, 'unsubscribe', $2, $3, NOW())`,
+    [send.id, req.ip, req.headers['user-agent'] || null]
+  );
+  console.log(`[Tracking] Unsubscribed ${email || '(no address)'} via link ${trackingId}`);
+  return true;
+}
 
 // RFC 8058 one-click unsubscribe (email client UI button)
 app.post('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
-  const { trackingId } = req.params;
+  const trackingId = String(req.params.trackingId);
 
   // RFC 8058 requires body to contain List-Unsubscribe=One-Click
   const body = typeof req.body === 'string' ? req.body : '';
@@ -344,27 +524,7 @@ app.post('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
   }
 
   try {
-    const sendResult = await query<{ contact_id: string }>(
-      `SELECT contact_id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
-      [trackingId, TENANT]
-    );
-    if (sendResult.rows[0]) {
-      await query(
-        `UPDATE contacts SET tags = array_append(tags, 'unsubscribed'), updated_at = NOW()
-         WHERE id = $1 AND NOT ('unsubscribed' = ANY(tags))`,
-        [sendResult.rows[0].contact_id]
-      );
-      await query(
-        `UPDATE sequence_enrollments SET status = 'cancelled', updated_at = NOW()
-         WHERE contact_id = $1 AND status = 'active' AND tenant = $2`,
-        [sendResult.rows[0].contact_id, TENANT]
-      );
-      await query(
-        `INSERT INTO email_events (email_send_id, event_type, ip_address, user_agent)
-         SELECT id, 'unsubscribe', $2, $3 FROM email_sends WHERE tracking_id = $1`,
-        [trackingId, req.ip, req.headers['user-agent'] || null]
-      );
-    }
+    await processUnsubscribe(trackingId, req);
   } catch (err) {
     console.error('[Tracking] Error recording one-click unsubscribe:', err);
   }
@@ -373,13 +533,14 @@ app.post('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
 
 // GET unsubscribe — show confirmation page (prevents bot/scanner false positives)
 app.get('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
-  const { trackingId } = req.params;
+  const trackingId = String(req.params.trackingId);
   const confirmed = req.query.confirm === '1';
+  const brand = escapeHtml(BRAND_NAME);
 
   if (!confirmed) {
-    res.send(`<!DOCTYPE html><html><head><title>Unsubscribe</title></head>
+    res.send(`<!DOCTYPE html><html><head><title>Unsubscribe</title><meta name="robots" content="noindex"></head>
 <body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;">
-<h2>Unsubscribe from ${BRAND_NAME}</h2>
+<h2>Unsubscribe from ${brand}</h2>
 <p>Click the button below to confirm you'd like to stop receiving emails.</p>
 <form method="GET" action="" style="margin-top:24px;">
 <input type="hidden" name="confirm" value="1" />
@@ -390,35 +551,39 @@ app.get('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
   }
 
   try {
-    const sendResult = await query<{ contact_id: string }>(
-      `SELECT contact_id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
-      [trackingId, TENANT]
-    );
-    if (sendResult.rows[0]) {
-      await query(
-        `UPDATE contacts SET tags = array_append(tags, 'unsubscribed'), updated_at = NOW()
-         WHERE id = $1 AND NOT ('unsubscribed' = ANY(tags))`,
-        [sendResult.rows[0].contact_id]
-      );
-      await query(
-        `UPDATE sequence_enrollments SET status = 'cancelled', updated_at = NOW()
-         WHERE contact_id = $1 AND status = 'active' AND tenant = $2`,
-        [sendResult.rows[0].contact_id, TENANT]
-      );
-      await query(
-        `INSERT INTO email_events (email_send_id, event_type, ip_address, user_agent)
-         SELECT id, 'unsubscribe', $2, $3 FROM email_sends WHERE tracking_id = $1`,
-        [trackingId, req.ip, req.headers['user-agent'] || null]
-      );
-    }
+    await processUnsubscribe(trackingId, req);
   } catch (err) {
     console.error('[Tracking] Error recording unsubscribe:', err);
   }
-  res.send(`<!DOCTYPE html><html><head><title>Unsubscribed</title></head><body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;"><h2>You've been unsubscribed</h2><p>You will no longer receive emails from ${BRAND_NAME}.</p></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><title>Unsubscribed</title><meta name="robots" content="noindex"></head><body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;"><h2>You've been unsubscribed</h2><p>You will no longer receive emails from ${brand}.</p></body></html>`);
 });
 
 // ---- Dripify Ingest Endpoint — creates contacts in TP tenant ----
-app.post('/api/dripify/ingest', requireApiKey, async (req: Request, res: Response) => {
+// Key via X-Ingest-Key (preferred) or X-Api-Key header. The ?api_key= query
+// param still works for backward compatibility but is deprecated (nginx logs it).
+let warnedIngestQueryKey = false;
+function requireIngestKey(req: Request, res: Response, next: NextFunction): void {
+  const expectedKey = process.env.DRIPIFY_INGEST_KEY;
+  if (!expectedKey) {
+    res.status(500).json({ error: 'DRIPIFY_INGEST_KEY not configured' });
+    return;
+  }
+  let key = req.get('x-ingest-key') || req.get('x-api-key');
+  if (!key && typeof req.query.api_key === 'string') {
+    key = req.query.api_key;
+    if (!warnedIngestQueryKey) {
+      warnedIngestQueryKey = true;
+      console.warn('[Dripify] DEPRECATED: ingest key passed in query string (?api_key=). Send it in the X-Ingest-Key header instead.');
+    }
+  }
+  if (!safeEqual(key, expectedKey)) {
+    res.status(403).json({ error: 'Invalid API key' });
+    return;
+  }
+  next();
+}
+
+app.post('/api/dripify/ingest', requireIngestKey, async (req: Request, res: Response) => {
   try {
     const payload = req.body || {};
     const snapshotId = await dripifyMonitor.ingestSnapshot(payload);
@@ -536,30 +701,70 @@ app.get('/api/apollo/logs', requireAuth, async (_req: Request, res: Response) =>
 });
 
 // ---- Public Digest Approval (token-based, no login needed) ----
+// GET only renders a confirmation page (email scanners follow GETs); the actual
+// approval happens on POST /api/digest/:id/approve/confirm with the same token.
+function publicMessagePage(title: string, color: string, heading: string, bodyHtml: string): string {
+  return `<!DOCTYPE html><html><head><title>${escapeHtml(title)}</title><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"></head>
+<body style="font-family:-apple-system,sans-serif;text-align:center;padding:80px 20px;color:#333">
+<div style="max-width:500px;margin:0 auto">
+  <h1 style="color:${color};margin:16px 0 8px">${escapeHtml(heading)}</h1>
+  ${bodyHtml}
+</div></body></html>`;
+}
+
+function readDigestIdAndToken(req: Request): [string, string] | null {
+  const id = String(req.params.id || '');
+  const raw = (req.body && typeof req.body.token === 'string') ? req.body.token : req.query.token;
+  const token = typeof raw === 'string' ? raw : '';
+  if (!UUID_RE.test(id) || !UUID_RE.test(token)) return null;
+  return [id, token];
+}
+
+const INVALID_DIGEST_LINK = publicMessagePage('Invalid link', '#dc2626', 'Invalid link', '<p>This link is invalid or incomplete.</p>');
+
 app.get('/api/digest/:id/approve', async (req: Request, res: Response) => {
-  const token = req.query.token as string | undefined;
-  if (!token) {
-    res.status(400).send('<h2>Invalid link</h2>');
+  const parsed = readDigestIdAndToken(req);
+  if (!parsed) {
+    res.status(400).send(INVALID_DIGEST_LINK);
     return;
   }
   try {
-    const digest = await digestService.approve(String(req.params.id), token);
+    const digest = await digestService.get(parsed[0]);
+    if (!digest || !safeEqual(parsed[1], String(digest.approval_token))) {
+      res.status(400).send(INVALID_DIGEST_LINK);
+      return;
+    }
+    const count = (digest.approved_contacts || digest.contacts || []).length;
+    res.send(publicMessagePage('Confirm approval', '#1a1a2e', 'Approve this digest?',
+      `<p style="font-size:18px;color:#555">${escapeHtml(count)} emails will be queued for sending between 9am–5pm UTC.</p>
+  <form method="POST" action="approve/confirm" style="margin-top:24px">
+    <input type="hidden" name="token" value="${escapeHtml(parsed[1])}" />
+    <button type="submit" style="background:#16a34a;color:#fff;border:none;padding:12px 32px;border-radius:6px;font-size:16px;cursor:pointer">Confirm Approve</button>
+  </form>`));
+  } catch (err) {
+    console.error('[Digest] Approve page error:', err);
+    res.status(500).send(publicMessagePage('Error', '#dc2626', 'Error', '<p>Something went wrong. Please try again.</p>'));
+  }
+});
+
+app.post('/api/digest/:id/approve/confirm', async (req: Request, res: Response) => {
+  const parsed = readDigestIdAndToken(req);
+  if (!parsed) {
+    res.status(400).send(INVALID_DIGEST_LINK);
+    return;
+  }
+  try {
+    const digest = await digestService.approve(parsed[0], parsed[1]);
     digestService.executeApproved(digest.id).catch((err: Error) =>
       console.error('[Digest] Execute error:', err.message)
     );
     const count = (digest.approved_contacts || digest.contacts).length;
-    res.send(`<!DOCTYPE html><html><head><title>Approved</title><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="font-family:-apple-system,sans-serif;text-align:center;padding:80px 20px;color:#333">
-<div style="max-width:500px;margin:0 auto">
-  <div style="font-size:48px">✓</div>
-  <h1 style="color:#16a34a;margin:16px 0 8px">Approved!</h1>
-  <p style="font-size:18px;color:#555">${count} emails queued — sending between 9am–5pm UTC today.</p>
-  <p style="margin-top:32px"><a href="/outreach/" style="color:#1a1a2e;text-decoration:none;font-weight:600">Open ${BRAND_NAME} Outreach →</a></p>
-</div></body></html>`);
+    res.send(publicMessagePage('Approved', '#16a34a', 'Approved!',
+      `<p style="font-size:18px;color:#555">${escapeHtml(count)} emails queued — sending between 9am–5pm UTC today.</p>
+  <p style="margin-top:32px"><a href="/outreach/" style="color:#1a1a2e;text-decoration:none;font-weight:600">Open ${escapeHtml(BRAND_NAME)} Outreach →</a></p>`));
   } catch (err) {
     const msg = (err as Error).message;
-    res.status(400).send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:80px 20px">
-<h2 style="color:#dc2626">Error</h2><p>${msg}</p></body></html>`);
+    res.status(400).send(publicMessagePage('Error', '#dc2626', 'Error', `<p>${escapeHtml(msg)}</p>`));
   }
 });
 
@@ -576,19 +781,20 @@ app.use('/api/campaign-planner', requireAuth, campaignPlannerRoutes);
 app.use('/api/articles', requireAuth, articleRoutes);
 app.use('/api/press-releases', requireAuth, pressReleaseRoutes);
 
-// Health check
-app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), tenant: TENANT });
-});
-
 // Serve built React frontend (production)
 const publicDir = path.join(__dirname, '../public');
 app.use(express.static(publicDir));
 // HashRouter handles all client-side routing — just serve index.html for non-API routes
+// Unknown API routes get a JSON 404 instead of hanging
+app.use('/api', (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found' });
+});
 app.get('*', (req: Request, res: Response) => {
-  if (!req.path.startsWith('/api/') && !req.path.startsWith('/t/')) {
-    res.sendFile(path.join(publicDir, 'index.html'));
+  if (req.path.startsWith('/t/')) {
+    res.status(404).send('Not found');
+    return;
   }
+  res.sendFile(path.join(publicDir, 'index.html'));
 });
 
 // ---- Start ----

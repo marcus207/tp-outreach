@@ -7,6 +7,19 @@ import { campaignEngine } from '../services/campaign-engine';
 
 const router = Router();
 
+// Enrollment exclusions (contacts aliased as c). tp outreach must never email
+// lenders, held/unsubscribed/bounced contacts, or anything on the tenant's
+// suppression list (exact email or whole domain).
+const ENROL_EXCLUSIONS = `
+       AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
+       AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
+       AND NOT EXISTS (
+         SELECT 1 FROM suppressed_emails sup
+         WHERE sup.tenant = c.tenant
+           AND (LOWER(sup.email) = LOWER(c.email)
+                OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
+       )`;
+
 // ═══════════════════════════════════════════════════════════════
 // Core CRUD — works for both drip and blast sequences
 // ═══════════════════════════════════════════════════════════════
@@ -437,9 +450,22 @@ router.post('/:id/enroll', async (req: Request, res: Response) => {
       return;
     }
 
-    const results = { enrolled: 0, skipped: 0, errors: 0 };
+    // Drop lenders / held / unsubscribed / bounced / suppressed contacts
+    const eligibleResult = await query<{ id: string }>(
+      `SELECT c.id FROM contacts c
+       WHERE c.tenant = $1 AND c.id = ANY($2::uuid[])
+       ${ENROL_EXCLUSIONS}`,
+      [TENANT, contact_ids.map(String)]
+    );
+    const eligibleIds = new Set(eligibleResult.rows.map(r => r.id));
+
+    const results = { enrolled: 0, skipped: 0, errors: 0, excluded: 0 };
 
     for (const contactId of contact_ids) {
+      if (!eligibleIds.has(String(contactId))) {
+        results.excluded++;
+        continue;
+      }
       try {
         await sequenceEngine.enrollContact(String(id), String(contactId));
         results.enrolled++;
@@ -487,9 +513,10 @@ router.post('/:id/enroll-all', async (req: Request, res: Response) => {
     }
 
     const contactsResult = await query<{ id: string }>(
-      `SELECT id FROM contacts
-       WHERE tenant = $1 AND NOT ('unsubscribed' = ANY(tags))
-       ORDER BY created_at`,
+      `SELECT c.id FROM contacts c
+       WHERE c.tenant = $1
+       ${ENROL_EXCLUSIONS}
+       ORDER BY c.created_at`,
       [TENANT]
     );
 

@@ -16,7 +16,11 @@ interface ApolloContact {
   country: string | null;
   label_names?: string[];
   email_status?: string;
+  updated_at?: string;
 }
+
+// Tags that must survive every sync, whatever Apollo says
+const PROTECTED_TAGS = ['unsubscribed', 'bounced', 'hold'];
 
 interface ApolloSearchResponse {
   contacts: ApolloContact[];
@@ -66,7 +70,8 @@ export class ApolloSyncService {
       return;
     }
     // Disabled Oct 2026: the sync overwrote unsubscribe tags and re-imported lenders.
-    // Opt in explicitly once tag merging and the lender filter are fixed.
+    // Root causes fixed Oct 5 (tags merge, tenant-scoped queries, suppression by
+    // email+domain, new contacts unclassified). Still opt-in explicitly.
     if (process.env.APOLLO_SYNC_ENABLED !== 'true') {
       console.warn('[Apollo Sync] Disabled (APOLLO_SYNC_ENABLED != true), skipping sync');
       return;
@@ -79,6 +84,15 @@ export class ApolloSyncService {
     try {
       console.log(`[Apollo Sync] Starting ${syncType} sync...`);
 
+      // Incremental = contacts Apollo updated since the last successful sync
+      // (minus a 1h overlap). Apollo's contacts/search has no updated-since
+      // filter, so sort newest-updated first and stop paging at the cutoff.
+      let since: Date | null = null;
+      if (syncType === 'incremental') {
+        since = await this.getIncrementalSince(logId);
+        console.log(`[Apollo Sync] Incremental since ${since.toISOString()}`);
+      }
+
       let page = 1;
       let hasMore = true;
 
@@ -89,16 +103,9 @@ export class ApolloSyncService {
           contact_email_status: ['verified', 'guessed', 'unverified'],
         };
 
-        if (syncType === 'incremental') {
-          // Only sync contacts updated in the last N hours
-          const hoursResult = await query<{ value: string }>(
-            `SELECT value FROM settings WHERE key = 'apollo_sync_interval_hours'`
-          );
-          const hours = hoursResult.rows[0]?.value
-            ? parseInt(JSON.parse(hoursResult.rows[0].value), 10)
-            : 6;
-          const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-          params['updated_at_after'] = since.toISOString();
+        if (since) {
+          params['sort_by_field'] = 'contact_updated_at';
+          params['sort_ascending'] = false;
         }
 
         const response = await axios.post<ApolloSearchResponse>(
@@ -120,7 +127,12 @@ export class ApolloSyncService {
           break;
         }
 
+        let reachedCutoff = false;
         for (const apolloContact of contacts) {
+          if (since && apolloContact.updated_at && new Date(apolloContact.updated_at) < since) {
+            reachedCutoff = true;
+            break;
+          }
           const result = await this.upsertContact(apolloContact);
           if (result === 'added') contactsAdded++;
           else if (result === 'updated') contactsUpdated++;
@@ -130,7 +142,7 @@ export class ApolloSyncService {
           `[Apollo Sync] Page ${page}/${pagination.total_pages} - Added: ${contactsAdded}, Updated: ${contactsUpdated}`
         );
 
-        hasMore = page < pagination.total_pages;
+        hasMore = !reachedCutoff && page < pagination.total_pages;
         page++;
 
         // Rate limiting: 100ms between requests
@@ -149,39 +161,76 @@ export class ApolloSyncService {
     }
   }
 
+  /**
+   * Cutoff for an incremental sync: start of the last completed sync (1h
+   * overlap), falling back to apollo_sync_interval_hours (default 6h).
+   * NOTE: apollo_sync_log has no tenant column, so this is shared across tenants.
+   */
+  private async getIncrementalSince(currentLogId: string): Promise<Date> {
+    const last = await query<{ started_at: Date }>(
+      `SELECT started_at FROM apollo_sync_log
+       WHERE status = 'completed' AND id <> $1
+       ORDER BY started_at DESC LIMIT 1`,
+      [currentLogId]
+    );
+    if (last.rows[0]?.started_at) {
+      return new Date(new Date(last.rows[0].started_at).getTime() - 60 * 60 * 1000);
+    }
+    const hoursResult = await query<{ value: string }>(
+      `SELECT value FROM settings WHERE key = 'apollo_sync_interval_hours'`
+    );
+    const hours = hoursResult.rows[0]?.value
+      ? parseInt(JSON.parse(hoursResult.rows[0].value), 10)
+      : 6;
+    return new Date(Date.now() - hours * 60 * 60 * 1000);
+  }
+
   private async upsertContact(apolloContact: ApolloContact): Promise<'added' | 'updated' | 'skipped'> {
     if (!apolloContact.email) return 'skipped';
 
     const email = apolloContact.email.toLowerCase().trim();
+    const domain = (email.split('@')[1] || '').toLowerCase();
     const phone =
       apolloContact.phone_numbers && apolloContact.phone_numbers.length > 0
         ? apolloContact.phone_numbers[0].raw_number
         : null;
-    const tags = apolloContact.label_names || [];
+    // Apollo labels are only ever ADDED to existing tags (never replace them)
+    const apolloTags = (apolloContact.label_names || []).filter(t => !!t);
     const emailVerified = apolloContact.email_status === 'verified';
 
     try {
+      // Suppressed (exact email or whole domain) — never insert or update
       const suppressed = await query<{ id: string }>(
-        `SELECT id FROM suppressed_emails WHERE LOWER(email) = $1 AND tenant = $2 LIMIT 1`,
-        [email, TENANT]
+        `SELECT id FROM suppressed_emails
+         WHERE tenant = $2 AND (LOWER(email) = $1 OR LOWER(domain) = $3)
+         LIMIT 1`,
+        [email, TENANT, domain]
       );
       if (suppressed.rows.length > 0) {
         return 'skipped';
       }
 
-      const existing = await query<{ id: string }>(
-        `SELECT id FROM contacts WHERE LOWER(email) = $1`,
-        [email]
+      const existing = await query<{ id: string; tags: string[] | null }>(
+        `SELECT id, tags FROM contacts WHERE tenant = $1 AND LOWER(email) = $2`,
+        [TENANT, email]
       );
 
       if (existing.rows.length > 0) {
-        await query(
+        // Union of existing tags and Apollo labels; protected tags can't be dropped
+        const current = existing.rows[0].tags || [];
+        const merged = Array.from(new Set([...current, ...apolloTags]));
+        for (const t of PROTECTED_TAGS) {
+          if (current.includes(t) && !merged.includes(t)) merged.push(t);
+        }
+
+        // contact_type / subsector / tenant / list membership are never touched here
+        const upd = await query(
           `UPDATE contacts SET
             apollo_id = COALESCE(
               CASE WHEN $1::text IS NOT NULL
                    AND NOT EXISTS (
                      SELECT 1 FROM contacts c2
-                     WHERE c2.apollo_id = $1 AND LOWER(c2.email) <> $13
+                     WHERE c2.apollo_id = $1 AND c2.id <> $14
                    )
                    THEN $1::text ELSE NULL END,
               apollo_id),
@@ -194,11 +243,11 @@ export class ApolloSyncService {
             phone = COALESCE($8, phone),
             city = COALESCE($9, city),
             country = COALESCE($10, country),
-            tags = $11,
+            tags = ARRAY(SELECT DISTINCT t FROM unnest(COALESCE(tags, '{}'::text[]) || $11::text[]) AS t),
             email_verified = $12,
             last_synced_at = NOW(),
             updated_at = NOW()
-          WHERE LOWER(email) = $13`,
+          WHERE id = $14 AND tenant = $13`,
           [
             apolloContact.id,
             apolloContact.first_name,
@@ -210,20 +259,24 @@ export class ApolloSyncService {
             phone,
             apolloContact.city,
             apolloContact.country,
-            tags,
+            merged,
             emailVerified,
-            email,
+            TENANT,
+            existing.rows[0].id,
           ]
         );
-        return 'updated';
+        return (upd.rowCount || 0) > 0 ? 'updated' : 'skipped';
       } else {
-        await query(
+        // New contacts: contact_type left NULL so the classifier decides
+        // (lenders get classified out); never auto-added to any list.
+        const ins = await query<{ id: string }>(
           `INSERT INTO contacts (
             apollo_id, email, first_name, last_name, title, company,
             company_domain, linkedin_url, phone, city, country, tags,
-            email_verified, source, last_synced_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'apollo', NOW())
-          ON CONFLICT (apollo_id) DO NOTHING`,
+            email_verified, source, last_synced_at, tenant, contact_type
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'apollo', NOW(), $14, NULL)
+          ON CONFLICT DO NOTHING
+          RETURNING id`,
           [
             apolloContact.id,
             email,
@@ -236,11 +289,12 @@ export class ApolloSyncService {
             phone,
             apolloContact.city,
             apolloContact.country,
-            tags,
+            apolloTags,
             emailVerified,
+            TENANT,
           ]
         );
-        return 'added';
+        return ins.rows.length > 0 ? 'added' : 'skipped';
       }
     } catch (err) {
       const error = err as Error;

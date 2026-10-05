@@ -2,10 +2,24 @@ import { Queue } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { gmailClient } from './gmail-client';
 import { templateEngine } from './template-engine';
+import { isWithinSendWindow, nextSendWindowStart, isSuppressed, isInternalAddress } from './send-gate';
 import { Sequence, SequenceStep, SequenceEnrollment, Contact, Template, EmailAccount } from '../types';
 import { SequenceStepJobData } from '../types';
 
 const SEQUENCE_QUEUE_NAME = 'sequence-steps';
+
+/**
+ * Thrown when a contact must not be enrolled (lender, hold, unsubscribed,
+ * bounced, suppressed, wrong tenant). Callers treat it like any other
+ * enrolment error; check `instanceof EnrollmentRefusedError` to count it as
+ * a skip rather than an error.
+ */
+export class EnrollmentRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EnrollmentRefusedError';
+  }
+}
 
 function getRedisConnection() {
   const url = process.env.REDIS_URL || 'redis://localhost:6379';
@@ -34,27 +48,47 @@ export class SequenceEngine {
   async enrollContact(sequenceId: string, contactId: string): Promise<string> {
     console.log(`[Sequence Engine] Enrolling contact ${contactId} in sequence ${sequenceId}`);
 
-    // Check if contact has unsubscribed (only within this tenant)
-    const contactCheck = await query<{ tags: string[]; email: string }>(
-      `SELECT tags, email FROM contacts WHERE id = $1 AND tenant = $2`,
-      [contactId, TENANT]
+    // Sequence must belong to this tenant
+    const seqCheck = await query<{ id: string }>(
+      `SELECT id FROM sequences WHERE id = $1 AND tenant = $2`,
+      [sequenceId, TENANT]
     );
-    if (contactCheck.rows[0]?.tags?.includes('unsubscribed')) {
-      throw new Error('Contact has unsubscribed');
-    }
-    if (contactCheck.rows[0]?.tags?.includes('bounced')) {
-      throw new Error('Contact email has bounced');
+    if (!seqCheck.rows[0]) {
+      throw new EnrollmentRefusedError('Sequence not found in this tenant');
     }
 
-    // Check permanent suppression list
-    if (contactCheck.rows[0]?.email) {
-      const suppressed = await query<{ id: string }>(
-        `SELECT id FROM suppressed_emails WHERE LOWER(email) = LOWER($1) AND tenant = $2 LIMIT 1`,
-        [contactCheck.rows[0].email, TENANT]
-      );
-      if (suppressed.rows.length > 0) {
-        throw new Error('Email is permanently suppressed');
+    // Contact must exist AND belong to this tenant
+    const contactCheck = await query<{ tags: string[] | null; email: string; contact_type: string | null; tenant: string }>(
+      `SELECT tags, email, contact_type, tenant FROM contacts WHERE id = $1`,
+      [contactId]
+    );
+    const contact = contactCheck.rows[0];
+    if (!contact) {
+      throw new EnrollmentRefusedError('Contact not found');
+    }
+    if (contact.tenant !== TENANT) {
+      throw new EnrollmentRefusedError('Contact belongs to another tenant');
+    }
+    const tags = contact.tags || [];
+    if (tags.includes('unsubscribed')) {
+      throw new EnrollmentRefusedError('Contact has unsubscribed');
+    }
+    if (tags.includes('bounced')) {
+      throw new EnrollmentRefusedError('Contact email has bounced');
+    }
+    if (!isInternalAddress(contact.email)) {
+      // tp outreach never emails lenders
+      if ((contact.contact_type || '').toLowerCase() === 'lender') {
+        throw new EnrollmentRefusedError('Contact is a lender');
       }
+      if (tags.includes('hold')) {
+        throw new EnrollmentRefusedError('Contact is on hold');
+      }
+    }
+
+    // Check permanent suppression list (exact email, or manual domain block)
+    if (await isSuppressed(contact.email)) {
+      throw new EnrollmentRefusedError('Email is permanently suppressed');
     }
 
     // Check if already enrolled (within this tenant)
@@ -137,8 +171,8 @@ export class SequenceEngine {
     const sequence = seqResult.rows[0];
 
     // Check if we're within the send window — if not, reschedule
-    if (!this.isWithinSendWindow(sequence)) {
-      const nextOpen = this.adjustForWindow(new Date(), sequence);
+    if (!isWithinSendWindow(new Date())) {
+      const nextOpen = nextSendWindowStart(new Date());
       const delayMs = nextOpen.getTime() - Date.now();
       console.log(`[Sequence Engine] Outside send window for enrollment ${enrollmentId}, rescheduling step ${stepNumber} in ${Math.round(delayMs / 60000)}m`);
       await this.scheduleStep(enrollmentId, stepNumber, Math.max(0, delayMs));
@@ -176,7 +210,23 @@ export class SequenceEngine {
       return;
     }
 
-    const contact = contactResult.rows[0];
+    const contact = contactResult.rows[0] as Contact & { contact_type?: string | null };
+
+    // Never email lenders / hold / unsubscribed / bounced / suppressed contacts
+    const internal = isInternalAddress(contact.email);
+    if (
+      (!internal && (contact.contact_type || '').toLowerCase() === 'lender') ||
+      contact.tags?.includes('unsubscribed') ||
+      contact.tags?.includes('bounced') ||
+      await isSuppressed(contact.email)
+    ) {
+      await this.cancelEnrollment(enrollmentId, 'recipient blocked (lender/unsubscribed/bounced/suppressed)');
+      return;
+    }
+    if (!internal && contact.tags?.includes('hold')) {
+      console.log(`[Sequence Engine] Contact ${contact.email} on hold, skipping step ${stepNumber} for enrollment ${enrollmentId}`);
+      return;
+    }
 
     // Sunset policy: skip contacts with 4+ sends and zero opens
     if (stepNumber > 1) {
@@ -319,10 +369,7 @@ export class SequenceEngine {
       const delayMs =
         (nextStep.delay_days * 24 * 60 * 60 * 1000) +
         (nextStep.delay_hours * 60 * 60 * 1000);
-      const scheduledTime = this.adjustForWindow(
-        new Date(Date.now() + delayMs),
-        sequence
-      );
+      const scheduledTime = nextSendWindowStart(new Date(Date.now() + delayMs));
       const adjustedDelayMs = scheduledTime.getTime() - Date.now();
       await this.scheduleStep(enrollmentId, stepNumber + 1, Math.max(0, adjustedDelayMs));
     }
@@ -371,73 +418,6 @@ export class SequenceEngine {
     console.log(
       `[Sequence Engine] Scheduled step ${stepNumber} for enrollment ${enrollmentId} (delay: ${Math.round(delayMs / 1000)}s)`
     );
-  }
-
-  /**
-   * Check if the current time is within the sequence's send window.
-   */
-  private isWithinSendWindow(sequence: Sequence): boolean {
-    const now = new Date();
-    const dayOfWeek = now.getUTCDay();
-
-    if (sequence.skip_weekends && (dayOfWeek === 0 || dayOfWeek === 6)) {
-      return false;
-    }
-
-    const [startH, startM] = (sequence.send_window_start || '09:00').split(':').map(Number);
-    const [endH, endM] = (sequence.send_window_end || '17:00').split(':').map(Number);
-    const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
-    const windowStart = startH * 60 + startM;
-    const windowEnd = endH * 60 + endM;
-
-    return currentMinutes >= windowStart && currentMinutes < windowEnd;
-  }
-
-  /**
-   * Adjust a scheduled time to fall within the sequence's send window.
-   * Respects skip_weekends and send_window_start/end (treated as UTC).
-   */
-  private adjustForWindow(scheduledTime: Date, sequence: Sequence): Date {
-    let dt = new Date(scheduledTime);
-
-    const [startH, startM] = (sequence.send_window_start || '09:00').split(':').map(Number);
-    const [endH, endM] = (sequence.send_window_end || '17:00').split(':').map(Number);
-
-    const windowStartMinutes = startH * 60 + startM;
-    const windowEndMinutes = endH * 60 + endM;
-
-    // Try up to 7 iterations to find a valid window slot
-    for (let i = 0; i < 7; i++) {
-      const dayOfWeek = dt.getUTCDay(); // 0=Sun, 6=Sat
-
-      // Skip weekends
-      if (sequence.skip_weekends && (dayOfWeek === 0 || dayOfWeek === 6)) {
-        // Move to Monday 9am UTC
-        const daysToAdd = dayOfWeek === 6 ? 2 : 1;
-        dt = new Date(dt);
-        dt.setUTCDate(dt.getUTCDate() + daysToAdd);
-        dt.setUTCHours(startH, startM, 0, 0);
-        continue;
-      }
-
-      const currentMinutes = dt.getUTCHours() * 60 + dt.getUTCMinutes();
-
-      if (currentMinutes < windowStartMinutes) {
-        // Before window: move to window start
-        dt.setUTCHours(startH, startM, 0, 0);
-        break;
-      } else if (currentMinutes >= windowEndMinutes) {
-        // After window: move to next day window start
-        dt.setUTCDate(dt.getUTCDate() + 1);
-        dt.setUTCHours(startH, startM, 0, 0);
-        continue;
-      } else {
-        // Within window
-        break;
-      }
-    }
-
-    return dt;
   }
 
   async close(): Promise<void> {

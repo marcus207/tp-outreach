@@ -1,6 +1,9 @@
 import { query, TENANT, BRAND_NAME } from '../db/connection';
-import { sendQueue } from './send-queue';
-import { buildArticleEmailHtml } from '../routes/articles';
+import {
+  buildArticleEmailHtml,
+  BROADCAST_RECIPIENT_EXCLUSIONS,
+  getBroadcastPlaceholderAccount,
+} from '../routes/articles';
 import * as crypto from 'crypto';
 
 const STRAPI_URL = process.env.STRAPI_URL || 'http://localhost:1337';
@@ -59,7 +62,7 @@ export async function processScheduledArticles(): Promise<void> {
             excerpt: article.excerpt,
             content: article.content,
             sector: article.sector,
-            author: article.author || 'Turning Point Capital',
+            author: article.author || 'Turning Point Capital Advisory',
             publishDate,
           },
         }),
@@ -117,8 +120,16 @@ export async function processScheduledArticles(): Promise<void> {
         `SELECT c.id, c.email, c.first_name, c.company
          FROM contacts c
          WHERE c.subsector = ANY($1) AND c.tenant = $2
-           AND NOT ('unsubscribed' = ANY(c.tags))`,
-        [subsectors, TENANT]
+         ${BROADCAST_RECIPIENT_EXCLUSIONS}
+           -- Exclude contacts who already received (or are queued for) THIS article
+           AND NOT EXISTS (
+             SELECT 1 FROM email_sends es
+             JOIN article_broadcasts ab ON ab.id = es.broadcast_id
+             WHERE es.contact_id = c.id
+               AND ab.article_id = $3
+               AND es.status IN ('queued', 'sent')
+           )`,
+        [subsectors, TENANT, article.id]
       );
 
       if (contactsResult.rows.length === 0) {
@@ -126,13 +137,14 @@ export async function processScheduledArticles(): Promise<void> {
         continue;
       }
 
-      const accountRes = await query<{ id: string; email: string }>(
-        `SELECT id, email FROM email_accounts WHERE is_active = true AND tenant = $1 ORDER BY broadcast_sends_this_hour ASC, email`,
-        [TENANT]
-      );
-      if (accountRes.rows.length === 0) continue;
+      // Placeholder sender only; broadcast-planner assigns the real
+      // @go.tp.finance account within budgets and the send window.
+      const placeholder = await getBroadcastPlaceholderAccount();
+      if (!placeholder) {
+        console.error(`[ArticleScheduler] No @go.tp.finance account configured — skipping broadcast ${article.id}`);
+        continue;
+      }
 
-      const allAccounts = accountRes.rows;
       const subject = `${article.title} - ${BRAND_NAME}`;
 
       const recentRes = await query(
@@ -144,27 +156,24 @@ export async function processScheduledArticles(): Promise<void> {
 
       const broadcastRes = await query<{ id: string }>(
         `INSERT INTO article_broadcasts (article_id, subsectors, contact_type, total_contacts, total_sent, status, sent_at)
-         VALUES ($1, $2, 'lender', $3, 0, 'queuing', NOW()) RETURNING id`,
+         VALUES ($1, $2, NULL, $3, 0, 'queuing', NOW()) RETURNING id`,
         [article.id, subsectors, contactsResult.rows.length]
       );
       const broadcastId = broadcastRes.rows[0].id;
 
       console.log(`[ArticleScheduler] Queuing broadcast: ${article.title} → ${contactsResult.rows.length} contacts`);
 
+      // Insert as 'queued' with broadcast_id; broadcast-planner enqueues them
       let queued = 0;
-      for (let i = 0; i < contactsResult.rows.length; i++) {
-        const contact = contactsResult.rows[i];
-        const account = allAccounts[i % allAccounts.length];
+      for (const contact of contactsResult.rows) {
         const trackingId = crypto.randomUUID();
         const renderedHtml = buildArticleEmailHtml(article, contact, trackingId, recentRes.rows as any[]);
 
-        const sendRes = await query<{ id: string }>(
-          `INSERT INTO email_sends (to_email, from_email, subject, body_html, tracking_id, email_account_id, contact_id, status, tenant)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8) RETURNING id`,
-          [contact.email, account.email, subject, renderedHtml, trackingId, account.id, contact.id, TENANT]
+        await query(
+          `INSERT INTO email_sends (to_email, from_email, subject, body_html, tracking_id, email_account_id, contact_id, status, tenant, broadcast_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9)`,
+          [contact.email, placeholder.email, subject, renderedHtml, trackingId, placeholder.id, contact.id, TENANT, broadcastId]
         );
-
-        await sendQueue.add({ emailSendId: sendRes.rows[0].id });
         queued++;
       }
 

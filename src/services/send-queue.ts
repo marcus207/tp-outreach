@@ -101,9 +101,11 @@ export class SendQueue {
     if (decision.action === 'fail') {
       console.log(`[Send Queue] ${emailSendId} failed gate: ${decision.reason}`);
       await query(
-        `UPDATE email_sends SET status = 'failed', error_message = $1 WHERE id = $2`,
-        [decision.reason, emailSendId]
+        `UPDATE email_sends SET status = 'failed', error_message = $1
+         WHERE id = $2 AND tenant = $3 AND status = 'queued'`,
+        [decision.reason, emailSendId, TENANT]
       );
+      await this.handleEnrollmentAfterFailure(emailSendId, decision.reason, decision.permanent === true);
       return;
     }
 
@@ -117,13 +119,24 @@ export class SendQueue {
       `SELECT * FROM email_sends WHERE id = $1 AND tenant = $2`,
       [emailSendId, TENANT]
     );
-    const send = sendResult.rows[0]!;
+    const send = sendResult.rows[0];
+    if (!send) return;
 
     const accountResult = await query<EmailAccount>(
       `SELECT * FROM email_accounts WHERE id = $1 AND is_active = true AND tenant = $2`,
       [send.email_account_id, TENANT]
     );
-    const account = accountResult.rows[0]!;
+    const account = accountResult.rows[0];
+    if (!account) {
+      // Deactivated between gate and now — transient for the enrollment
+      await query(
+        `UPDATE email_sends SET status = 'failed', error_message = 'Email account inactive'
+         WHERE id = $1 AND tenant = $2 AND status = 'queued'`,
+        [emailSendId, TENANT]
+      );
+      await this.handleEnrollmentAfterFailure(emailSendId, 'Email account inactive', false);
+      return;
+    }
 
     // Enforce minimum gap between sends per account (sequence emails only).
     // Broadcast emails are already rate-limited by the broadcast planner at 15/hr/account.
@@ -137,14 +150,37 @@ export class SendQueue {
       if (account.last_send_at) {
         const elapsed = Date.now() - new Date(account.last_send_at).getTime();
         if (elapsed < gapMs) {
+          // Too soon after this account's last send — push the job back rather
+          // than dropping it (which left it for the re-queue cron).
+          const retryDelay = gapMs - elapsed + Math.floor(Math.random() * 60000) + 30000;
+          await this.add(data, retryDelay);
+          await query(
+            `UPDATE email_sends SET last_enqueued_at = NOW() + ($1::int * INTERVAL '1 millisecond') WHERE id = $2`,
+            [retryDelay, emailSendId]
+          );
           return;
         }
       }
     }
 
+    // Claim the row atomically BEFORE calling Gmail. If we crash after Gmail
+    // accepts the message, the row stays 'sending' and is never re-sent
+    // (requeueStuckSends marks old 'sending' rows failed: unknown outcome).
+    // last_enqueued_at doubles as the claim timestamp for that check.
+    const claim = await query<{ id: string }>(
+      `UPDATE email_sends SET status = 'sending', last_enqueued_at = NOW()
+       WHERE id = $1 AND tenant = $2 AND status = 'queued'
+       RETURNING id`,
+      [emailSendId, TENANT]
+    );
+    if (claim.rows.length === 0) {
+      console.log(`[Send Queue] ${emailSendId} already claimed by another job, skipping`);
+      return;
+    }
+
+    let result: { messageId: string; threadId: string };
     try {
-      let sendThreadId = threadId;
-      let result;
+      const sendThreadId = threadId;
       try {
         result = await gmailClient.sendEmail(account, {
           to: send.to_email,
@@ -171,42 +207,65 @@ export class SendQueue {
           throw threadErr;
         }
       }
-
-      // Update success
-      await query(
-        `UPDATE email_sends
-         SET status = 'sent', gmail_message_id = $1, gmail_thread_id = $2,
-             sent_at = NOW()
-         WHERE id = $3`,
-        [result.messageId, result.threadId, emailSendId]
-      );
-
-      // Increment send counts — unless the sequence engine already reserved
-      // the slot atomically at queue time (avoids double-counting the cap).
-      if (!data.preCounted) {
-        await gmailClient.incrementSendCounts(account.id);
-      }
-
-      console.log(`[Send Queue] Email sent successfully: ${send.to_email} via ${send.from_email}`);
-
-      // Schedule next step on the enrollment (DB-based, replaces BullMQ step scheduling)
-      if (send.enrollment_id) {
-        try {
-          await dailyPlanner.scheduleNextStep(emailSendId);
-        } catch (nextErr) {
-          console.error(`[Send Queue] Error scheduling next step for ${emailSendId}:`, (nextErr as Error).message);
-        }
-      }
     } catch (err) {
+      // Gmail did NOT accept the message — safe to mark failed and retry later
       const error = err as Error;
       console.error(`[Send Queue] Failed to send email ${emailSendId}:`, error.message);
 
       await query(
-        `UPDATE email_sends SET status = 'failed', error_message = $1 WHERE id = $2`,
-        [error.message, emailSendId]
+        `UPDATE email_sends SET status = 'failed', error_message = $1 WHERE id = $2 AND tenant = $3`,
+        [error.message, emailSendId, TENANT]
       );
+      // Gmail/auth/transient errors: enrollment retried in ~1 day
+      await this.handleEnrollmentAfterFailure(emailSendId, error.message, false);
 
-      throw err; // Re-throw so BullMQ handles retries
+      throw err; // Re-throw so BullMQ logs it (a retry is a no-op: status is no longer 'queued')
+    }
+
+    // ── Gmail accepted the message. Nothing below may flip it to 'failed'. ──
+
+    try {
+      await query(
+        `UPDATE email_sends
+         SET status = 'sent', gmail_message_id = $1, gmail_thread_id = $2,
+             sent_at = NOW()
+         WHERE id = $3 AND tenant = $4`,
+        [result.messageId, result.threadId, emailSendId, TENANT]
+      );
+    } catch (err) {
+      // Row stays 'sending' → never re-sent; the re-queue cron resolves it.
+      console.error(`[Send Queue] CRITICAL: ${emailSendId} delivered (gmail ${result.messageId}) but status update failed:`, (err as Error).message);
+      return;
+    }
+
+    // Increment send counts — unless the sequence engine already reserved
+    // the slot atomically at queue time (avoids double-counting the cap).
+    if (!data.preCounted) {
+      try {
+        await gmailClient.incrementSendCounts(account.id);
+      } catch (err) {
+        console.error(`[Send Queue] Sent ${emailSendId} but failed to increment counters for ${account.email}:`, (err as Error).message);
+      }
+    }
+
+    console.log(`[Send Queue] Email sent successfully: ${send.to_email} via ${send.from_email}`);
+
+    // Schedule next step on the enrollment (DB-based, replaces BullMQ step scheduling)
+    if (send.enrollment_id) {
+      try {
+        await dailyPlanner.scheduleNextStep(emailSendId);
+      } catch (nextErr) {
+        console.error(`[Send Queue] Error scheduling next step for ${emailSendId}:`, (nextErr as Error).message);
+      }
+    }
+  }
+
+  /** Never let enrollment bookkeeping errors mask the send outcome. */
+  private async handleEnrollmentAfterFailure(emailSendId: string, reason: string, permanent: boolean): Promise<void> {
+    try {
+      await dailyPlanner.handleFailedSend(emailSendId, reason, permanent);
+    } catch (err) {
+      console.error(`[Send Queue] Error updating enrollment after failed send ${emailSendId}:`, (err as Error).message);
     }
   }
 

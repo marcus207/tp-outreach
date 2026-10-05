@@ -1238,13 +1238,20 @@ Return JSON only (no markdown fences):
     if (!['awaiting_approval', 'drafting'].includes(draft.status)) {
       throw new Error(`Draft is already ${draft.status}`);
     }
+    // Emailed approval links expire: refuse anything older than 72 hours
+    if (Date.now() - new Date(draft.created_at).getTime() > 72 * 60 * 60 * 1000) {
+      throw new Error('This approval link has expired (older than 72 hours). Approve from the platform instead.');
+    }
 
+    // Atomic transition: only one caller can move a pending draft to approved
     const updated = await query<DraftReview>(
       `UPDATE template_draft_reviews
        SET status = 'approved', approved_at = NOW()
-       WHERE id = $1 RETURNING *`,
-      [draftId]
+       WHERE id = $1 AND tenant = $2 AND status IN ('awaiting_approval', 'drafting')
+       RETURNING *`,
+      [draftId, TENANT]
     );
+    if (!updated.rows[0]) throw new Error('Draft is no longer awaiting approval');
 
     return updated.rows[0];
   }
@@ -1258,10 +1265,14 @@ Return JSON only (no markdown fences):
     if (!draft) throw new Error('Draft not found');
     if (draft.skip_token !== token) throw new Error('Invalid skip token');
 
-    await query(
-      `UPDATE template_draft_reviews SET status = 'skipped' WHERE id = $1`,
-      [draftId]
+    // Atomic transition: only skip a draft that is still pending
+    const updated = await query<{ id: string }>(
+      `UPDATE template_draft_reviews SET status = 'skipped'
+       WHERE id = $1 AND tenant = $2 AND status IN ('awaiting_approval', 'drafting')
+       RETURNING id`,
+      [draftId, TENANT]
     );
+    if (!updated.rows[0]) throw new Error(`Draft is already ${draft.status}`);
   }
 
   async executeDraftSend(draftId: string): Promise<number> {
@@ -1341,7 +1352,7 @@ Return JSON only (no markdown fences):
           [sequenceResult.rows[0].id, templateId]
         );
 
-        await engine.enrollContact(contact.id, sequenceResult.rows[0].id);
+        await engine.enrollContact(sequenceResult.rows[0].id, contact.id);
         sent++;
       } catch (err) {
         console.error(`[DraftReview] Failed to enroll contact ${contact.id}:`, (err as Error).message);

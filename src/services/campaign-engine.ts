@@ -5,7 +5,8 @@
  * Each blast sequence has sequence_steps with sector, subject_line, body_copy, etc.
  *
  * Flow:
- * 1. tick() is called hourly by worker.ts (or manually via API)
+ * 1. tick() is called hourly by worker.ts (or manually via API); no-op unless
+ *    campaign_settings.is_active = true and inside the shared send window
  * 2. Finds blast sequences WHERE status = 'active'
  * 3. Finds steps where calculated send_date <= today AND blast_status = 'approved'
  * 4. For each due step, finds eligible contacts in that sector
@@ -13,11 +14,25 @@
  */
 
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
-import { gmailClient } from './gmail-client';
 import { templateEngine } from './template-engine';
 import { sendQueue } from './send-queue';
-import { checkSendWindow } from './send-gate';
-import { Contact, Template } from '../types';
+import { isWithinSendWindow, COLD_SENDER_DOMAIN } from './send-gate';
+import { Contact, Template, EmailAccount } from '../types';
+
+// Recipient exclusions for blast sends (contacts aliased as c). tp outreach must
+// never email lenders, held/unsubscribed/bounced contacts, or anything on the
+// tenant's suppression list (exact email or whole domain).
+const BLAST_RECIPIENT_EXCLUSIONS = `
+         AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
+         AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
+         AND NOT EXISTS (
+           SELECT 1 FROM suppressed_emails sup
+           WHERE sup.tenant = c.tenant
+             AND (LOWER(sup.email) = LOWER(c.email)
+                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
+         )`;
+
+const BLAST_BATCH_SIZE = 50;
 
 // Introducer sector names — contacts in these sectors use the introducer template
 const INTRODUCER_SECTORS = new Set([
@@ -73,11 +88,22 @@ export class CampaignEngine {
     const result: TickResult = { ran: true, due_entries: 0, contacts_queued: 0, contacts_skipped: 0, errors: [] };
 
     try {
-      // Window guard — don't create or queue blast emails outside business hours
-      const outsideWindow = checkSendWindow('09:00', '17:00', true);
-      if (outsideWindow && outsideWindow.action !== 'send') {
+      // Pause switch — campaign_settings.is_active is written by the planner's
+      // Pause/Resume buttons. No row (or is_active = false) means paused.
+      const settings = await query<{ is_active: boolean }>(
+        `SELECT is_active FROM campaign_settings WHERE tenant = $1`,
+        [TENANT]
+      );
+      if (!settings.rows[0]?.is_active) {
         result.ran = false;
-        result.reason = outsideWindow.reason;
+        result.reason = 'Campaign paused (campaign_settings.is_active = false)';
+        return result;
+      }
+
+      // Window guard — shared cold-send window (Mon-Fri 08:00-17:00 Europe/London)
+      if (!isWithinSendWindow()) {
+        result.ran = false;
+        result.reason = 'Outside send window';
         return result;
       }
 
@@ -203,12 +229,12 @@ export class CampaignEngine {
            SELECT 1 FROM email_sends es
            WHERE es.sequence_step_id = $3 AND es.contact_id = c.id
          )
-         AND NOT ('unsubscribed' = ANY(c.tags))
+         ${BLAST_RECIPIENT_EXCLUSIONS}
          AND c.email IS NOT NULL
          AND c.email != ''
        ORDER BY c.created_at
-       LIMIT 50`,
-      [TENANT, step.sector, step.id]
+       LIMIT $4`,
+      [TENANT, step.sector, step.id, BLAST_BATCH_SIZE]
     );
 
     if (contacts.rows.length === 0) {
@@ -228,10 +254,14 @@ export class CampaignEngine {
 
     console.log(`[Campaign Engine] ${step.sector} step ${step.step_number}: ${contacts.rows.length} contacts eligible`);
 
-    const account = await gmailClient.getBestSendingAccount([]);
-    if (!account) {
+    // Spread the batch across every active account with nonzero limits,
+    // respecting each account's remaining hourly AND daily budget.
+    const budgets = await this.getAccountBudgets();
+    const totalBudget = budgets.reduce((sum, b) => sum + b.remaining, 0);
+    if (totalBudget <= 0) {
       throw new Error('No sending account available (all at limit)');
     }
+    let cursor = 0;
 
     for (const contact of contacts.rows) {
       try {
@@ -239,6 +269,20 @@ export class CampaignEngine {
           skipped++;
           continue;
         }
+
+        // Round-robin to the next account with budget left; leave the rest
+        // of the batch for a later tick once budgets are exhausted.
+        let account: EmailAccount | null = null;
+        for (let i = 0; i < budgets.length; i++) {
+          const candidate = budgets[(cursor + i) % budgets.length];
+          if (candidate.remaining > 0) {
+            candidate.remaining--;
+            account = candidate.account;
+            cursor = (cursor + i + 1) % budgets.length;
+            break;
+          }
+        }
+        if (!account) break;
 
         const { subject, bodyHtml } = this.buildBlastEmail(step, contact, baseTemplate);
 
@@ -262,6 +306,11 @@ export class CampaignEngine {
         );
 
         await sendQueue.add({ emailSendId: sendResult.rows[0].id, fromName: account.display_name || undefined });
+        // Mark as enqueued so requeueStuckSends doesn't add a duplicate job
+        await query(
+          `UPDATE email_sends SET last_enqueued_at = NOW() WHERE id = $1`,
+          [sendResult.rows[0].id]
+        );
         queued++;
       } catch (err) {
         console.error(`[Campaign Engine] Failed to queue for ${contact.email}: ${(err as Error).message}`);
@@ -282,7 +331,9 @@ export class CampaignEngine {
            SELECT 1 FROM email_sends es
            WHERE es.sequence_step_id = $3 AND es.contact_id = c.id
          )
-         AND NOT ('unsubscribed' = ANY(c.tags))`,
+         ${BLAST_RECIPIENT_EXCLUSIONS}
+         AND c.email IS NOT NULL
+         AND c.email != ''`,
       [TENANT, step.sector, step.id]
     );
 
@@ -295,6 +346,35 @@ export class CampaignEngine {
     }
 
     return { queued, skipped };
+  }
+
+  /**
+   * Active accounts with nonzero limits and their remaining send budget:
+   * min(daily remaining, hourly remaining) minus sends already queued on the
+   * account but not yet sent (so a tick can't over-commit an account).
+   */
+  private async getAccountBudgets(): Promise<{ account: EmailAccount; remaining: number }[]> {
+    const accounts = await query<EmailAccount & { pending: string }>(
+      `SELECT ea.*,
+              (SELECT COUNT(*) FROM email_sends es
+               WHERE es.email_account_id = ea.id AND es.tenant = ea.tenant
+                 AND es.status = 'queued') AS pending
+       FROM email_accounts ea
+       WHERE ea.tenant = $1 AND ea.is_active = true
+         AND ea.daily_limit > 0 AND ea.hourly_limit > 0
+         AND LOWER(ea.email) LIKE $2
+       ORDER BY ea.email`,
+      [TENANT, '%@' + COLD_SENDER_DOMAIN]
+    );
+    return accounts.rows
+      .map(a => ({
+        account: a as EmailAccount,
+        remaining: Math.max(0, Math.min(
+          a.daily_limit - a.sends_today,
+          a.hourly_limit - a.sends_this_hour,
+        ) - parseInt(a.pending || '0', 10)),
+      }))
+      .filter(b => b.remaining > 0);
   }
 
   /**
@@ -336,7 +416,7 @@ export class CampaignEngine {
 <table width="580" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;">
 <tr><td style="background:#0f1a2e;padding:16px 28px;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital</span></td>
+<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital Advisory</span></td>
 </tr></table>
 </td></tr>
 <tr><td style="height:3px;background:linear-gradient(90deg,#4db8a4,#74DFF6);font-size:0;">&nbsp;</td></tr>

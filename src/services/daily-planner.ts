@@ -1,13 +1,19 @@
 /**
- * Hourly planner: runs each hour during the send window (09-16 UTC).
+ * Hourly planner: runs each hour, but only plans inside the single send window
+ * (Mon-Fri 08:00-17:00 Europe/London, see send-gate.ts).
  * Picks up enrollments whose next_step_due_at <= NOW(), fair-distributes
- * across accounts respecting hourly_limit, creates email_sends + BullMQ jobs.
+ * across accounts respecting hourly_limit AND daily_limit, creates
+ * email_sends + BullMQ jobs.
  *
  * Replaces the thundering-herd-prone processStep → getBestSendingAccount flow.
  */
 import { Queue } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { templateEngine } from './template-engine';
+import {
+  isWithinSendWindow, nextSendWindowStart, msUntilSendWindowCloses,
+  isSuppressed, isInternalAddress, COLD_SENDER_DOMAIN,
+} from './send-gate';
 import { EmailAccount, Sequence, SequenceStep, Contact, Template } from '../types';
 
 function getRedisConnection() {
@@ -19,6 +25,12 @@ function getRedisConnection() {
     password: parsed.password || undefined,
   };
 }
+
+/** Max failed attempts at one step before the enrollment is cancelled. */
+const MAX_FAILED_ATTEMPTS_PER_STEP = 5;
+
+/** Queued sends older than this are treated as lost and no longer block planning. */
+const STALE_QUEUED_INTERVAL = '2 days';
 
 interface DueEnrollment {
   id: string;
@@ -47,6 +59,12 @@ export class DailyPlanner {
       distribution: {},
     };
 
+    // 0. Never plan outside the send window (weekends / out of hours)
+    if (!isWithinSendWindow(new Date())) {
+      console.log(`[Planner] Outside send window (Mon-Fri 08:00-17:00 Europe/London) for ${TENANT}, not planning`);
+      return result;
+    }
+
     // 1. Get due enrollments
     const due = await query<DueEnrollment>(
       `SELECT id, sequence_id, contact_id, current_step, next_step_number, next_step_due_at
@@ -69,9 +87,9 @@ export class DailyPlanner {
     // 2. Get healthy accounts for this tenant
     const accounts = await query<EmailAccount>(
       `SELECT * FROM email_accounts
-       WHERE tenant = $1 AND is_active = true
+       WHERE tenant = $1 AND is_active = true AND LOWER(email) LIKE $2
        ORDER BY email`,
-      [TENANT]
+      [TENANT, '%@' + COLD_SENDER_DOMAIN]
     );
 
     if (accounts.rows.length === 0) {
@@ -79,13 +97,24 @@ export class DailyPlanner {
       return result;
     }
 
-    // 3. Build per-account budget for this hour
+    // 3. Build per-account budget for this hour: min(remaining hourly, remaining daily).
+    // Accounts with a 0 limit get no budget.
     const budget: Map<string, number> = new Map();
     for (const acct of accounts.rows) {
-      const remaining = Math.max(0, acct.hourly_limit - acct.sends_this_hour);
-      budget.set(acct.id, remaining);
+      const hourlyLimit = Number(acct.hourly_limit) || 0;
+      const dailyLimit = Number(acct.daily_limit) || 0;
+      if (hourlyLimit <= 0 || dailyLimit <= 0) {
+        budget.set(acct.id, 0);
+        continue;
+      }
+      const remainingHour = Math.max(0, hourlyLimit - (Number(acct.sends_this_hour) || 0));
+      const remainingDay = Math.max(0, dailyLimit - (Number(acct.sends_today) || 0));
+      budget.set(acct.id, Math.min(remainingHour, remainingDay));
       result.distribution[acct.email] = 0;
     }
+
+    // Jitter spreads sends across the hour, but never past the window close
+    const maxJitterMs = Math.max(60000, Math.min(3300000, msUntilSendWindowCloses(new Date()) - 60000));
 
     // 4. Cache sequences + steps to avoid repeated queries
     const seqCache = new Map<string, Sequence>();
@@ -164,11 +193,24 @@ export class DailyPlanner {
             stepCache.set(stepKey, step);
           }
 
-          // Guard: if this enrollment has ANY queued send (for any step), skip —
-          // the send queue will process it and the post-send hook schedules next.
+          // Queued sends older than 2 days are lost (no job will ever send them).
+          // Retire them so they neither block planning nor get re-sent later
+          // alongside the replacement we're about to create.
+          await query(
+            `UPDATE email_sends SET status = 'failed', error_message = 'superseded (stale queued)'
+             WHERE enrollment_id = $1 AND tenant = $2 AND status = 'queued'
+               AND created_at < NOW() - INTERVAL '${STALE_QUEUED_INTERVAL}'`,
+            [enrollment.id, TENANT]
+          );
+
+          // Guard: if this enrollment has a recent queued (or in-flight) send for any
+          // step, skip — the send queue will process it and the post-send hook
+          // schedules next.
           const pendingSend = await query<{ id: string }>(
             `SELECT id FROM email_sends
-             WHERE enrollment_id = $1 AND tenant = $2 AND status = 'queued'
+             WHERE enrollment_id = $1 AND tenant = $2
+               AND (status = 'sending'
+                    OR (status = 'queued' AND created_at >= NOW() - INTERVAL '${STALE_QUEUED_INTERVAL}'))
              LIMIT 1`,
             [enrollment.id, TENANT]
           );
@@ -177,27 +219,52 @@ export class DailyPlanner {
             continue;
           }
 
-          // Idempotency: check if email already exists for this specific step
+          // Idempotency: check if email already sent for this specific step
           const existing = await query<{ id: string; status: string }>(
             `SELECT id, status FROM email_sends
              WHERE enrollment_id = $1 AND sequence_step_id = $2 AND tenant = $3
+               AND status = 'sent'
              LIMIT 1`,
             [enrollment.id, step.id, TENANT]
           );
 
           if (existing.rows.length > 0) {
-            const s = existing.rows[0].status;
-            if (s === 'sent') {
-              // Already sent — schedule next step instead.
-              result.alreadySent++;
-              await this.scheduleNextStepOnEnrollment(enrollment.id, step, sequence);
-              continue;
-            }
-            if (s === 'queued') {
-              result.alreadySent++;
-              continue;
-            }
-            // 'failed' — we'll re-attempt with a new email_send below
+            // Already sent — schedule next step instead.
+            result.alreadySent++;
+            await this.scheduleNextStepOnEnrollment(enrollment.id, step);
+            continue;
+          }
+          // Only 'failed' rows (or none) — create a new email_send below
+
+          // Check contact is valid BEFORE taking a budget slot
+          const contactResult = await query<Contact & { contact_type?: string | null }>(
+            `SELECT * FROM contacts WHERE id = $1 AND tenant = $2`,
+            [enrollment.contact_id, TENANT]
+          );
+          const contact = contactResult.rows[0];
+          if (!contact) {
+            result.skipped++;
+            await this.clearEnrollmentSchedule(enrollment.id);
+            continue;
+          }
+          const internal = isInternalAddress(contact.email);
+          const isLender = !internal && (contact.contact_type || '').toLowerCase() === 'lender';
+          if (
+            isLender ||
+            contact.tags?.includes('unsubscribed') ||
+            contact.tags?.includes('bounced') ||
+            // Skip suppressed emails BEFORE creating a send — otherwise the
+            // send-gate rejects it and it burns a budget slot.
+            await isSuppressed(contact.email)
+          ) {
+            await this.cancelEnrollment(enrollment.id);
+            result.skipped++;
+            continue;
+          }
+          if (!internal && contact.tags?.includes('hold')) {
+            // On hold: leave next_step_due_at as-is, re-checked next run
+            result.skipped++;
+            continue;
           }
 
           // Find an account with budget (round-robin across eligible)
@@ -216,46 +283,6 @@ export class DailyPlanner {
           if (!assigned) {
             // All accounts at capacity for this hour — overflow
             result.overflow++;
-            continue;
-          }
-
-          // Check contact is valid
-          const contactResult = await query<Contact>(
-            `SELECT * FROM contacts WHERE id = $1 AND tenant = $2`,
-            [enrollment.contact_id, TENANT]
-          );
-          const contact = contactResult.rows[0];
-          if (!contact) {
-            result.skipped++;
-            await this.clearEnrollmentSchedule(enrollment.id);
-            continue;
-          }
-          if (contact.tags?.includes('unsubscribed') || contact.tags?.includes('bounced')) {
-            await query(
-              `UPDATE sequence_enrollments
-               SET status = 'cancelled', updated_at = NOW(),
-                   next_step_due_at = NULL, next_step_number = NULL
-               WHERE id = $1`,
-              [enrollment.id]
-            );
-            result.skipped++;
-            continue;
-          }
-          // Skip suppressed emails (unsubscribed / bounced / manual) BEFORE creating a
-          // send — otherwise the send-gate rejects it and it burns a daily-budget slot.
-          const supp = await query<{ id: string }>(
-            `SELECT id FROM suppressed_emails WHERE LOWER(email) = LOWER($1) AND tenant = $2 LIMIT 1`,
-            [contact.email, TENANT]
-          );
-          if (supp.rows.length > 0) {
-            await query(
-              `UPDATE sequence_enrollments
-               SET status = 'cancelled', updated_at = NOW(),
-                   next_step_due_at = NULL, next_step_number = NULL
-               WHERE id = $1`,
-              [enrollment.id]
-            );
-            result.skipped++;
             continue;
           }
 
@@ -327,12 +354,18 @@ export class DailyPlanner {
             [enrollment.next_step_number, enrollment.id]
           );
 
-          // Enqueue with jitter (spread across the hour: 0-3300s = 0-55min)
-          const jitterMs = Math.floor(Math.random() * 3300000);
+          // Enqueue with jitter (spread across the hour: 0-55min, capped at window close)
+          const jitterMs = Math.floor(Math.random() * maxJitterMs);
           await sendQueue.add(
             'send-email',
-            { emailSendId, threadId, fromName: assigned.display_name || undefined },
+            buildSendJobData(emailSendId, threadId, assigned.display_name),
             { delay: jitterMs }
+          );
+          // last_enqueued_at = when the job is due to fire (enqueue time + delay),
+          // so requeueStuckSends only treats it as lost well after that time.
+          await query(
+            `UPDATE email_sends SET last_enqueued_at = NOW() + ($1::int * INTERVAL '1 millisecond') WHERE id = $2`,
+            [jitterMs, emailSendId]
           );
 
           result.distribution[assigned.email] = (result.distribution[assigned.email] || 0) + 1;
@@ -381,48 +414,20 @@ export class DailyPlanner {
     const send = sendResult.rows[0];
     if (!send?.enrollment_id) return;
 
-    // Get current step number
-    const stepResult = await query<{ step_number: number; sequence_id: string }>(
-      `SELECT step_number, sequence_id FROM sequence_steps WHERE id = $1`,
+    // Current (just-sent) step. scheduleNextStepOnEnrollment looks up step+1
+    // itself — previously this passed the NEXT step, which skipped a step.
+    const stepResult = await query<SequenceStep>(
+      `SELECT * FROM sequence_steps WHERE id = $1`,
       [send.sequence_step_id]
     );
     if (!stepResult.rows[0]) return;
-    const { step_number, sequence_id } = stepResult.rows[0];
 
-    // Get next step
-    const nextStep = await query<SequenceStep>(
-      `SELECT * FROM sequence_steps WHERE sequence_id = $1 AND step_number = $2`,
-      [sequence_id, step_number + 1]
-    );
-
-    if (!nextStep.rows[0]) {
-      // No more steps — complete enrollment
-      await query(
-        `UPDATE sequence_enrollments
-         SET status = 'completed', completed_at = NOW(),
-             next_step_due_at = NULL, next_step_number = NULL,
-             updated_at = NOW()
-         WHERE id = $1`,
-        [send.enrollment_id]
-      );
-      return;
-    }
-
-    // Get sequence for window adjustment
-    const seqResult = await query<Sequence>(
-      `SELECT * FROM sequences WHERE id = $1`,
-      [sequence_id]
-    );
-    const sequence = seqResult.rows[0];
-    if (!sequence) return;
-
-    await this.scheduleNextStepOnEnrollment(send.enrollment_id, nextStep.rows[0], sequence);
+    await this.scheduleNextStepOnEnrollment(send.enrollment_id, stepResult.rows[0]);
   }
 
   private async scheduleNextStepOnEnrollment(
     enrollmentId: string,
     currentStep: SequenceStep,
-    sequence: Sequence,
   ): Promise<void> {
     const nextStepResult = await query<SequenceStep>(
       `SELECT * FROM sequence_steps WHERE sequence_id = $1 AND step_number = $2`,
@@ -444,7 +449,7 @@ export class DailyPlanner {
     const nextStep = nextStepResult.rows[0];
     const delayMs = (nextStep.delay_days * 86400000) + (nextStep.delay_hours * 3600000);
     const rawDue = new Date(Date.now() + delayMs);
-    const adjustedDue = this.adjustForWindow(rawDue, sequence);
+    const adjustedDue = nextSendWindowStart(rawDue);
 
     await query(
       `UPDATE sequence_enrollments
@@ -454,34 +459,64 @@ export class DailyPlanner {
     );
   }
 
-  private adjustForWindow(scheduledTime: Date, sequence: Sequence): Date {
-    let dt = new Date(scheduledTime);
-    const [startH, startM] = (sequence.send_window_start || '09:00').split(':').map(Number);
-    const [endH, endM] = (sequence.send_window_end || '17:00').split(':').map(Number);
-    const windowStartMin = startH * 60 + startM;
-    const windowEndMin = endH * 60 + endM;
+  /**
+   * A sequence send ended 'failed'. Called by the send worker and the re-queue
+   * cron so the enrollment is never left stranded with next_step_due_at = NULL
+   * (the planner clears it when it queues a send).
+   *
+   *   permanent=true  → recipient must not be emailed: cancel the enrollment.
+   *   permanent=false → transient (Gmail/auth/account/etc): retry the same step
+   *                     in ~1 day (inside the send window). After
+   *                     MAX_FAILED_ATTEMPTS_PER_STEP failures the enrollment is cancelled.
+   */
+  async handleFailedSend(emailSendId: string, reason: string, permanent: boolean): Promise<void> {
+    const r = await query<{ enrollment_id: string | null; sequence_step_id: string | null; step_number: number | null }>(
+      `SELECT es.enrollment_id, es.sequence_step_id, ss.step_number
+       FROM email_sends es
+       LEFT JOIN sequence_steps ss ON ss.id = es.sequence_step_id
+       WHERE es.id = $1 AND es.tenant = $2`,
+      [emailSendId, TENANT]
+    );
+    const send = r.rows[0];
+    if (!send?.enrollment_id) return;
 
-    for (let i = 0; i < 7; i++) {
-      const dow = dt.getUTCDay();
-      if (sequence.skip_weekends && (dow === 0 || dow === 6)) {
-        const daysToAdd = dow === 6 ? 2 : 1;
-        dt.setUTCDate(dt.getUTCDate() + daysToAdd);
-        dt.setUTCHours(startH, startM, 0, 0);
-        continue;
-      }
-      const curMin = dt.getUTCHours() * 60 + dt.getUTCMinutes();
-      if (curMin < windowStartMin) {
-        dt.setUTCHours(startH, startM, 0, 0);
-        break;
-      } else if (curMin >= windowEndMin) {
-        dt.setUTCDate(dt.getUTCDate() + 1);
-        dt.setUTCHours(startH, startM, 0, 0);
-        continue;
-      } else {
-        break;
+    if (permanent) {
+      console.log(`[Planner] Cancelling enrollment ${send.enrollment_id} after permanent failure: ${reason}`);
+      await this.cancelEnrollment(send.enrollment_id);
+      return;
+    }
+
+    if (send.sequence_step_id) {
+      const attempts = await query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM email_sends
+         WHERE enrollment_id = $1 AND sequence_step_id = $2 AND tenant = $3 AND status = 'failed'`,
+        [send.enrollment_id, send.sequence_step_id, TENANT]
+      );
+      if (parseInt(attempts.rows[0]?.count || '0', 10) >= MAX_FAILED_ATTEMPTS_PER_STEP) {
+        console.log(`[Planner] Cancelling enrollment ${send.enrollment_id}: ${MAX_FAILED_ATTEMPTS_PER_STEP}+ failed attempts at this step (last: ${reason})`);
+        await this.cancelEnrollment(send.enrollment_id);
+        return;
       }
     }
-    return dt;
+
+    const retryAt = nextSendWindowStart(new Date(Date.now() + 86400000));
+    await query(
+      `UPDATE sequence_enrollments
+       SET next_step_number = COALESCE($1, next_step_number, current_step),
+           next_step_due_at = $2, updated_at = NOW()
+       WHERE id = $3 AND tenant = $4 AND status = 'active' AND next_step_due_at IS NULL`,
+      [send.step_number, retryAt, send.enrollment_id, TENANT]
+    );
+  }
+
+  private async cancelEnrollment(enrollmentId: string): Promise<void> {
+    await query(
+      `UPDATE sequence_enrollments
+       SET status = 'cancelled', updated_at = NOW(),
+           next_step_due_at = NULL, next_step_number = NULL
+       WHERE id = $1 AND tenant = $2 AND status = 'active'`,
+      [enrollmentId, TENANT]
+    );
   }
 
   private async clearEnrollmentSchedule(enrollmentId: string): Promise<void> {
@@ -492,6 +527,22 @@ export class DailyPlanner {
       [enrollmentId]
     );
   }
+}
+
+/**
+ * Job payload for the email-sends queue. The planner and requeueStuckSends both
+ * build it here so re-queued jobs keep threading + display name.
+ */
+export function buildSendJobData(
+  emailSendId: string,
+  threadId: string | null | undefined,
+  displayName: string | null | undefined,
+): { emailSendId: string; threadId?: string; fromName?: string } {
+  return {
+    emailSendId,
+    threadId: threadId || undefined,
+    fromName: displayName || undefined,
+  };
 }
 
 export const dailyPlanner = new DailyPlanner();

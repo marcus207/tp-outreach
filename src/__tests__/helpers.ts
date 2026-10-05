@@ -108,7 +108,7 @@ export function makeTemplate(overrides: Partial<Template> = {}): Template {
 export function makeAccount(overrides: Partial<EmailAccount> = {}): EmailAccount {
   return {
     id: 'acct-1',
-    email: 'support@test.com',
+    email: 'outreach@go.tp.finance',
     display_name: 'Test Support',
     oauth_tokens: { access_token: 'x', refresh_token: 'y' },
     daily_limit: 80,
@@ -162,12 +162,15 @@ export function setUTCTime(
   return d;
 }
 
-/** Wednesday 14:30 UTC — inside the default 09:00-17:00 window */
+// The send window is Mon-Fri 08:00-17:00 Europe/London (send-gate.ts).
+// April 2026 dates below are in BST (UTC+1).
+
+/** Wednesday 14:30 UTC (15:30 BST) — inside the window */
 export function setInsideWindow(): Date {
   return setUTCTime(2026, 4, 15, 14, 30); // Wed Apr 15
 }
 
-/** Tuesday 22:00 UTC — outside the default window */
+/** Tuesday 22:00 UTC (23:00 BST) — outside the window */
 export function setOutsideWindow(): Date {
   return setUTCTime(2026, 4, 14, 22, 0); // Tue Apr 14
 }

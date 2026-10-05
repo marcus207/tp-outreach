@@ -228,8 +228,8 @@ export class GmailScanner {
 
     // Check if already exists as a contact
     const existing = await query<{ id: string }>(
-      `SELECT id FROM contacts WHERE LOWER(email) = $1`,
-      [email]
+      `SELECT id FROM contacts WHERE LOWER(email) = $1 AND tenant = $2`,
+      [email, TENANT]
     );
 
     if (existing.rows[0]) {
@@ -241,12 +241,23 @@ export class GmailScanner {
     const onList = await query<{ id: string }>(
       `SELECT c.id FROM contacts c
        JOIN contact_list_members clm ON clm.contact_id = c.id
-       WHERE LOWER(c.email) = $1
+       WHERE LOWER(c.email) = $1 AND c.tenant = $2
        LIMIT 1`,
-      [email]
+      [email, TENANT]
     );
 
     if (onList.rows[0]) {
+      return false;
+    }
+
+    // Never re-create suppressed (incl. user-deleted) addresses or domains
+    const suppressed = await query<{ id: string }>(
+      `SELECT id FROM suppressed_emails
+       WHERE tenant = $1 AND (LOWER(email) = $2 OR LOWER(domain) = $3)
+       LIMIT 1`,
+      [TENANT, email, domain.toLowerCase()]
+    );
+    if (suppressed.rows[0]) {
       return false;
     }
 
@@ -259,13 +270,15 @@ export class GmailScanner {
     const personalDomains = ['gmail.com', 'outlook.com', 'hotmail.com', 'yahoo.com', 'icloud.com', 'me.com', 'live.com'];
     const companyDomain = personalDomains.includes(domain) ? null : domain;
 
-    await query(
+    const inserted = await query<{ id: string }>(
       `INSERT INTO contacts (
          email, first_name, last_name, company_domain, source, tenant, created_at, updated_at
        ) VALUES ($1, $2, $3, $4, 'gmail', $5, NOW(), NOW())
-       ON CONFLICT (LOWER(email)) DO NOTHING`,
+       ON CONFLICT (tenant, (lower(email::text))) DO NOTHING
+       RETURNING id`,
       [email, firstName, lastName, companyDomain, TENANT]
     );
+    if (!inserted.rows[0]) return false;
 
     console.log(`[Gmail Scanner] New contact from ${direction}: ${email}${companyDomain ? ` (${companyDomain})` : ''}`);
     return true;

@@ -3,7 +3,6 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
-import { sendQueue } from '../services/send-queue';
 import { gmailClient } from '../services/gmail-client';
 import { requireAuth } from '../middleware/auth';
 
@@ -13,6 +12,42 @@ router.use(requireAuth);
 const BLOG_ARTICLES_PATH = TENANT === 'loan-intel'
   ? '/root/platform_v2/frontend/src/data/blog-articles.json'
   : '/root/tp_website_dev/frontend/src/data/articles.json';
+
+// ── Broadcast recipient + sender rules (shared with article-scheduler) ───────
+
+// Recipient exclusions (contacts aliased as c). Broadcasts must never go to
+// lenders, held/unsubscribed/bounced contacts, or anything on the tenant's
+// suppression list (exact email or whole domain).
+export const BROADCAST_RECIPIENT_EXCLUSIONS = `
+         AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
+         AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
+         AND NOT EXISTS (
+           SELECT 1 FROM suppressed_emails sup
+           WHERE sup.tenant = c.tenant
+             AND (LOWER(sup.email) = LOWER(c.email)
+                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
+         )`;
+
+// Broadcasts only ever send from the cold-outreach subdomain. marcus@tp.finance
+// is reply-scan only.
+export const BROADCAST_SENDER_DOMAIN = '@go.tp.finance';
+
+/**
+ * Placeholder sender for newly inserted broadcast rows (email_account_id is
+ * NOT NULL). broadcast-planner reassigns each row to an active
+ * @go.tp.finance account with budget at schedule time. Prefers an active
+ * account; returns null if no @go.tp.finance account exists at all.
+ */
+export async function getBroadcastPlaceholderAccount(): Promise<{ id: string; email: string } | null> {
+  const res = await query<{ id: string; email: string }>(
+    `SELECT id, email FROM email_accounts
+     WHERE tenant = $1 AND LOWER(email) LIKE $2
+     ORDER BY is_active DESC, email
+     LIMIT 1`,
+    [TENANT, `%${BROADCAST_SENDER_DOMAIN}`]
+  );
+  return res.rows[0] || null;
+}
 
 // ── Email HTML template for article broadcasts ───────────────────────────────
 
@@ -77,7 +112,7 @@ ${article.content || ''}
 <tr><td align="center" style="padding:24px 16px;">
 <table width="600" cellpadding="0" cellspacing="0" border="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;">
 <tr><td style="background:#0f1a2e;padding:16px 28px;">
-<span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital</span>
+<span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital Advisory</span>
 </td></tr>
 <tr><td style="height:3px;background:linear-gradient(90deg,#1993C5,#74DFF6);font-size:0;">&nbsp;</td></tr>
 <tr><td style="padding:0;font-size:0;"><img src="${article.hero_image}" width="600" alt="${article.title}" style="display:block;width:100%;max-width:600px;height:auto;"/></td></tr>
@@ -111,7 +146,7 @@ ${article.content || ''}
 <table width="580" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;">
 <tr><td style="background:#0f1a2e;padding:16px 28px;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital</span></td>
+<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital Advisory</span></td>
 </tr></table>
 </td></tr>
 <tr><td style="height:3px;background:linear-gradient(90deg,#4db8a4,#74DFF6);font-size:0;">&nbsp;</td></tr>
@@ -403,7 +438,7 @@ function buildWebsitePreviewHtml(article: any, mode: 'cards' | 'article'): strin
   const slug = article.slug;
   const heroImage = getWebsiteArticleImage(article.sector, slug);
   const sectorLabel = websiteSectorLabels[article.sector] || article.sector;
-  const author = article.author || 'Turning Point Capital';
+  const author = article.author || 'Turning Point Capital Advisory';
   const aInfo = websiteAuthorInfo[author];
   const publishDateShort = article.publish_date
     ? new Date(article.publish_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
@@ -691,7 +726,7 @@ router.post('/:id/publish', async (req: Request, res: Response) => {
         excerpt: article.excerpt,
         content: article.content,
         sector: article.sector,
-        author: article.author || 'Turning Point Capital',
+        author: article.author || 'Turning Point Capital Advisory',
         publishDate,
       },
     };
@@ -774,6 +809,13 @@ router.post('/:id/broadcast-test', async (req: Request, res: Response) => {
       return;
     }
 
+    // Test sends bypass the queue, so only allow internal addresses
+    const testTo = String(email).trim().toLowerCase();
+    if (!/^[^@\s]+@(go\.)?tp\.finance$/.test(testTo)) {
+      res.status(400).json({ error: 'Test emails can only be sent to @tp.finance or @go.tp.finance addresses' });
+      return;
+    }
+
     const articleResult = await query(
       `SELECT * FROM article_drafts WHERE id = $1 AND tenant = '${TENANT}'`,
       [id]
@@ -817,21 +859,23 @@ router.post('/:id/broadcast-test', async (req: Request, res: Response) => {
     // Send directly via Gmail API — bypass queue and send window
     const accountRecord = accountRes.rows[0] as any;
     await gmailClient.sendEmail(accountRecord, {
-      to: email,
+      to: testTo,
       from: account.email,
       subject,
       htmlBody: renderedHtml,
     });
 
-    console.log(`[Articles] Test broadcast sent to ${email} for article ${id}`);
-    res.json({ success: true, message: `Test email sent to ${email}` });
+    console.log(`[Articles] Test broadcast sent to ${testTo} for article ${id}`);
+    res.json({ success: true, message: `Test email sent to ${testTo}` });
   } catch (err) {
     console.error('[Articles] Error sending test broadcast:', err);
     res.status(500).json({ error: 'Failed to send test email' });
   }
 });
 
-// ── 6. POST /api/articles/:id/broadcast — Send article as email to lender contacts ─
+// ── 6. POST /api/articles/:id/broadcast — Queue article email to subsector contacts ─
+// Rows are inserted as 'queued' with broadcast_id set; broadcast-planner
+// schedules them within account budgets and the shared send window.
 
 router.post('/:id/broadcast', async (req: Request, res: Response) => {
   try {
@@ -855,7 +899,7 @@ router.post('/:id/broadcast', async (req: Request, res: Response) => {
 
     const article = articleResult.rows[0] as any;
 
-    // LI contacts are lenders — filter by subsector
+    // Subsector contacts, excluding lenders / held / unsubscribed / bounced / suppressed
     const contactsResult = await query<{
       id: string;
       email: string;
@@ -866,14 +910,14 @@ router.post('/:id/broadcast', async (req: Request, res: Response) => {
        FROM contacts c
        WHERE c.subsector = ANY($1)
          AND c.tenant = '${TENANT}'
-         AND NOT ('unsubscribed' = ANY(c.tags))
-         -- Exclude contacts who already received THIS article in a prior broadcast
+         ${BROADCAST_RECIPIENT_EXCLUSIONS}
+         -- Exclude contacts who already received (or are queued for) THIS article
          AND NOT EXISTS (
            SELECT 1 FROM email_sends es
            JOIN article_broadcasts ab ON ab.id = es.broadcast_id
            WHERE es.contact_id = c.id
              AND ab.article_id = $2
-             AND es.status = 'sent'
+             AND es.status IN ('queued', 'sent')
          )`,
       [subsectors, id]
     );
@@ -885,34 +929,30 @@ router.post('/:id/broadcast', async (req: Request, res: Response) => {
       return;
     }
 
-    const accountRes = await query<{ id: string; email: string }>(
-      `SELECT id, email FROM email_accounts WHERE is_active = true AND tenant = '${TENANT}' ORDER BY broadcast_sends_this_hour ASC, email`
-    );
-
-    if (accountRes.rows.length === 0) {
-      res.status(400).json({ error: 'No active email account available for sending' });
+    const placeholder = await getBroadcastPlaceholderAccount();
+    if (!placeholder) {
+      res.status(409).json({ error: `No ${BROADCAST_SENDER_DOMAIN} sending account configured for broadcasts` });
       return;
     }
 
-    const allAccounts = accountRes.rows;
     const subject = `${article.title} - ${BRAND_NAME}`;
 
     const broadcastRes = await query<{ id: string }>(
       `INSERT INTO article_broadcasts (article_id, subsectors, contact_type, total_contacts, total_sent, status, sent_at)
-       VALUES ($1, $2, 'lender', $3, 0, 'queuing', NOW()) RETURNING id`,
+       VALUES ($1, $2, NULL, $3, 0, 'queuing', NOW()) RETURNING id`,
       [id, subsectors, contacts.length]
     );
     const broadcastId = broadcastRes.rows[0].id;
 
-    console.log(`[Articles] Broadcast ${broadcastId}: queuing ${contacts.length} contacts across ${allAccounts.length} accounts for article ${id}`);
+    console.log(`[Articles] Broadcast ${broadcastId}: queuing ${contacts.length} contacts for article ${id}`);
     res.json({
       success: true,
       contacts_queued: contacts.length,
       subsectors,
-      message: `Queuing ${contacts.length} emails across ${allAccounts.length} accounts — they will send during the next send window (09:00–17:00 UTC)`,
+      message: `Queued ${contacts.length} emails. The broadcast planner sends them from ${BROADCAST_SENDER_DOMAIN} accounts within account limits during the send window (Mon-Fri 08:00-17:00 UK time)`,
     });
 
-    // Background: render and queue each email
+    // Background: render and insert each email as 'queued' (no direct enqueue)
     (async () => {
       try {
         const recentRes = await query<RecentArticle>(
@@ -924,19 +964,15 @@ router.post('/:id/broadcast', async (req: Request, res: Response) => {
         const recentArticles = recentRes.rows;
         let queued = 0;
 
-        for (let i = 0; i < contacts.length; i++) {
-          const contact = contacts[i];
-          const account = allAccounts[i % allAccounts.length];
+        for (const contact of contacts) {
           const trackingId = crypto.randomUUID();
           const renderedHtml = buildArticleEmailHtml(article, contact, trackingId, recentArticles);
 
-          const sendRes = await query<{ id: string }>(
+          await query(
             `INSERT INTO email_sends (to_email, from_email, subject, body_html, tracking_id, email_account_id, contact_id, status, tenant, broadcast_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', '${TENANT}', $8) RETURNING id`,
-            [contact.email, account.email, subject, renderedHtml, trackingId, account.id, contact.id, broadcastId]
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', '${TENANT}', $8)`,
+            [contact.email, placeholder.email, subject, renderedHtml, trackingId, placeholder.id, contact.id, broadcastId]
           );
-
-          await sendQueue.add({ emailSendId: sendRes.rows[0].id });
           queued++;
         }
 

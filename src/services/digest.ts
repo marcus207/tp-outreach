@@ -19,6 +19,9 @@ interface DigestContact {
   scheduled_delay_ms: number;
 }
 
+// Public approval links are refused once the digest is older than this
+const APPROVAL_MAX_AGE_MS = 72 * 60 * 60 * 1000;
+
 interface DigestRecord {
   id: string;
   digest_date: string;
@@ -377,16 +380,22 @@ class DigestService {
     if (!digest) throw new Error('Digest not found');
     if (digest.approval_token !== token) throw new Error('Invalid approval token');
     if (digest.status !== 'pending') throw new Error(`Digest is already ${digest.status}`);
+    // Approval links expire: refuse anything older than 72 hours
+    if (Date.now() - new Date(digest.created_at).getTime() > APPROVAL_MAX_AGE_MS) {
+      throw new Error('This approval link has expired (older than 72 hours)');
+    }
 
+    // Atomic transition: only one caller can move pending -> approved
     const updated = await query<DigestRecord>(
       `UPDATE daily_digest
        SET status = 'approved',
            approved_contacts = $1,
            approved_at = NOW()
-       WHERE id = $2
+       WHERE id = $2 AND status = 'pending'
        RETURNING *`,
       [overrideContacts ? JSON.stringify(overrideContacts) : null, digestId]
     );
+    if (!updated.rows[0]) throw new Error('Digest is no longer pending');
 
     return updated.rows[0];
   }

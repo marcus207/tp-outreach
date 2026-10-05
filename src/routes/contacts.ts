@@ -11,6 +11,27 @@ const router = Router();
 // Runs in the background — does not block the response.
 async function autoEnrollInIntroSeries(contactId: string): Promise<void> {
   try {
+    // tp auto-enrol is paused unless explicitly enabled (same switch as worker.ts)
+    if (TENANT === 'tp' && process.env.TP_AUTO_ENROL_ENABLED !== 'true') return;
+
+    // Never auto-enrol lenders, held/unsubscribed/bounced, suppressed, or our own mailboxes
+    const eligible = await query<{ id: string }>(
+      `SELECT c.id FROM contacts c
+       WHERE c.id = $1 AND c.tenant = $2
+         AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
+         AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
+         AND LOWER(c.email) NOT LIKE '%@tp.finance'
+         AND LOWER(c.email) NOT LIKE '%@go.tp.finance'
+         AND NOT EXISTS (
+           SELECT 1 FROM suppressed_emails sup
+           WHERE sup.tenant = c.tenant
+             AND (LOWER(sup.email) = LOWER(c.email)
+                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
+         )`,
+      [contactId, TENANT]
+    );
+    if (!eligible.rows[0]) return;
+
     const seqResult = await query<{ id: string }>(
       `SELECT id FROM sequences WHERE tenant = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1`,
       [TENANT]
@@ -163,12 +184,11 @@ router.post('/', async (req: Request, res: Response) => {
         email, first_name, last_name, title, company, company_domain,
         linkedin_url, phone, city, country, tags, custom_fields, source, tenant
       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-      ON CONFLICT (LOWER(email)) DO UPDATE SET
+      ON CONFLICT (tenant, (lower(email::text))) DO UPDATE SET
         first_name = EXCLUDED.first_name,
         last_name = EXCLUDED.last_name,
         title = EXCLUDED.title,
         company = EXCLUDED.company,
-        tenant = EXCLUDED.tenant,
         updated_at = NOW()
       RETURNING *`,
       [
@@ -830,10 +850,23 @@ router.delete('/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
 
     // Check contact exists
-    const check = await query(`SELECT id FROM contacts WHERE id = $1 AND tenant = $2`, [id, TENANT]);
+    const check = await query<{ id: string; email: string }>(
+      `SELECT id, email FROM contacts WHERE id = $1 AND tenant = $2`,
+      [id, TENANT]
+    );
     if (!check.rows[0]) {
       res.status(404).json({ error: 'Contact not found' });
       return;
+    }
+
+    // Suppress the address first so Apollo/Dripify/imports can't re-add it
+    if (check.rows[0].email) {
+      await query(
+        `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
+         VALUES (LOWER($1), NULL, 'deleted by user', 'manual-delete', $2)
+         ON CONFLICT (lower(email), tenant) DO NOTHING`,
+        [check.rows[0].email, TENANT]
+      );
     }
 
     // Clean up FK references

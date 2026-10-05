@@ -3,9 +3,9 @@
  *
  * Every bug that shipped in production is captured here so it can
  * never regress:
- *   - Emails sent outside the 09:00-17:00 send window
- *   - All emails blasting at once instead of staggering
+ *   - Emails sent outside the send window (Mon-Fri 08:00-17:00 Europe/London)
  *   - Duplicate emails from BullMQ job collisions
+ *   - Lenders / hold / suppressed / cross-tenant contacts being enrolled
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
@@ -40,11 +40,12 @@ vi.mock('bullmq', () => ({
 vi.mock('../db/connection', () => ({
   query: mockQuery,
   TENANT: 'test-tenant',
+  BULL_PREFIX: 'bull-test-tenant',
 }));
 
 vi.mock('../services/gmail-client', () => ({
   gmailClient: {
-    getBestSendingAccount: vi.fn(),
+    reserveSendingAccount: vi.fn(),
   },
 }));
 
@@ -60,7 +61,7 @@ vi.mock('../services/template-engine', () => ({
 
 // ── Imports (after mocks) ────────────────────────────────────────────
 
-import { SequenceEngine } from '../services/sequence-engine';
+import { SequenceEngine, EnrollmentRefusedError } from '../services/sequence-engine';
 import { gmailClient } from '../services/gmail-client';
 
 // ── Setup / teardown ─────────────────────────────────────────────────
@@ -87,7 +88,6 @@ function setupFullProcessStep(overrides: {
   contact?: Partial<ReturnType<typeof makeContact>>;
   template?: Partial<ReturnType<typeof makeTemplate>>;
   account?: Partial<ReturnType<typeof makeAccount>>;
-  queuedCount?: number;
   hasNextStep?: boolean;
 } = {}) {
   const enrollment = makeEnrollment(overrides.enrollment);
@@ -97,7 +97,7 @@ function setupFullProcessStep(overrides: {
   const template = makeTemplate(overrides.template);
   const account = makeAccount(overrides.account);
 
-  (gmailClient.getBestSendingAccount as ReturnType<typeof vi.fn>)
+  (gmailClient.reserveSendingAccount as ReturnType<typeof vi.fn>)
     .mockResolvedValue(account);
 
   setupQueryResponses(mockQuery, {
@@ -111,7 +111,6 @@ function setupFullProcessStep(overrides: {
     'gmail_thread_id FROM email_sends': [],  // no previous thread
     'INSERT INTO email_sends': [{ id: 'send-1' }],
     'UPDATE sequence_enrollments SET current_step': [],
-    'COUNT(*) as count FROM email_sends': [{ count: String(overrides.queuedCount ?? 0) }],
   });
 
   // Override step query to handle both current and next step lookups
@@ -142,22 +141,20 @@ function setupFullProcessStep(overrides: {
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processStep — send window enforcement', () => {
-  it('outside window (22:00 UTC) → reschedules, does NOT create email_sends', async () => {
+  it('outside window (22:00 UTC / 23:00 BST) → reschedules, does NOT create email_sends', async () => {
     setOutsideWindow(); // Tue 22:00 UTC
 
     const { enrollment } = setupFullProcessStep();
 
     await engine.processStep(enrollment.id, 1);
 
-    // Should schedule a retry (reschedule to tomorrow 09:00)
+    // Should schedule a retry (reschedule to tomorrow 08:00 London = 07:00 UTC)
     const stepQueueCalls = mockQueueAdd.mock.calls.filter(
       (c) => c[0] === 'process-step'
     );
     expect(stepQueueCalls.length).toBe(1);
     const [, , opts] = stepQueueCalls[0];
-    // Delay should be roughly 11 hours (22:00 → 09:00 next day)
-    expect(opts.delay).toBeGreaterThan(10 * 60 * 60 * 1000);
-    expect(opts.delay).toBeLessThan(12 * 60 * 60 * 1000);
+    expect(opts.delay).toBe(9 * 60 * 60 * 1000);
 
     // Should NOT have created an email_sends record
     const insertCalls = mockQuery.mock.calls.filter(
@@ -166,19 +163,17 @@ describe('processStep — send window enforcement', () => {
     expect(insertCalls.length).toBe(0);
   });
 
-  it('Saturday with skip_weekends=true → reschedules to Monday 09:00', async () => {
+  it('Saturday → reschedules to Monday 08:00 London (even if sequence skip_weekends=false)', async () => {
     setWeekend(); // Sat 10:00 UTC
 
-    setupFullProcessStep({ sequence: { skip_weekends: true } });
+    setupFullProcessStep({ sequence: { skip_weekends: false } });
 
     await engine.processStep('enr-1', 1);
 
     const stepCalls = mockQueueAdd.mock.calls.filter(c => c[0] === 'process-step');
     expect(stepCalls.length).toBe(1);
-    const delayMs = stepCalls[0][2].delay;
-    // Sat 10:00 → Mon 09:00 = 47 hours
-    expect(delayMs).toBeGreaterThan(46 * 60 * 60 * 1000);
-    expect(delayMs).toBeLessThan(48 * 60 * 60 * 1000);
+    // Sat 10:00 UTC → Mon 07:00 UTC (08:00 BST) = 45 hours
+    expect(stepCalls[0][2].delay).toBe(45 * 60 * 60 * 1000);
 
     // No email created
     const insertCalls = mockQuery.mock.calls.filter(
@@ -207,8 +202,8 @@ describe('processStep — send window enforcement', () => {
     expect(sendQueueCalls.length).toBe(1);
   });
 
-  it('08:59 UTC → outside window (before start)', async () => {
-    setUTCTime(2026, 4, 15, 8, 59); // Wed 08:59
+  it('06:59 UTC (07:59 BST) → outside window (before start)', async () => {
+    setUTCTime(2026, 4, 15, 6, 59); // Wed
 
     setupFullProcessStep();
     await engine.processStep('enr-1', 1);
@@ -220,8 +215,8 @@ describe('processStep — send window enforcement', () => {
     expect(insertCalls.length).toBe(0);
   });
 
-  it('17:00 UTC → outside window (at boundary, window uses <)', async () => {
-    setUTCTime(2026, 4, 15, 17, 0); // Wed 17:00
+  it('16:00 UTC (17:00 BST) → outside window (at boundary, window uses <)', async () => {
+    setUTCTime(2026, 4, 15, 16, 0); // Wed
 
     setupFullProcessStep();
     await engine.processStep('enr-1', 1);
@@ -232,8 +227,8 @@ describe('processStep — send window enforcement', () => {
     expect(insertCalls.length).toBe(0);
   });
 
-  it('09:00 UTC → inside window (at boundary)', async () => {
-    setUTCTime(2026, 4, 15, 9, 0); // Wed 09:00
+  it('07:00 UTC (08:00 BST) → inside window (at boundary)', async () => {
+    setUTCTime(2026, 4, 15, 7, 0); // Wed
 
     setupFullProcessStep({ hasNextStep: false });
     await engine.processStep('enr-1', 1);
@@ -249,46 +244,75 @@ describe('processStep — send window enforcement', () => {
 // processStep — Stagger
 // ═════════════════════════════════════════════════════════════════════
 
-describe('processStep — stagger delays', () => {
-  it('first email (0 queued) → delay is 30-90s jitter only', async () => {
+describe('processStep — send job', () => {
+  it('queues the send with a 5-20s delay, threadId/fromName and preCounted', async () => {
     setInsideWindow();
 
-    setupFullProcessStep({ queuedCount: 0, hasNextStep: false });
+    setupFullProcessStep({ hasNextStep: false });
     await engine.processStep('enr-1', 1);
 
     const sendCalls = mockQueueAdd.mock.calls.filter(c => c[0] === 'send-email');
     expect(sendCalls.length).toBe(1);
-    const delay = sendCalls[0][2].delay;
-    // 0 * 4min + 30-90s jitter = 30000-90000ms
-    expect(delay).toBeGreaterThanOrEqual(30000);
-    expect(delay).toBeLessThanOrEqual(91000);
+    const [, data, opts] = sendCalls[0];
+    expect(data).toEqual({ emailSendId: 'send-1', threadId: undefined, fromName: 'Test Support', preCounted: true });
+    expect(opts.delay).toBeGreaterThanOrEqual(5000);
+    expect(opts.delay).toBeLessThanOrEqual(20000);
   });
 
-  it('10 already queued → delay is ~40min + jitter', async () => {
-    setInsideWindow();
+  it('next step is scheduled inside the send window', async () => {
+    setUTCTime(2026, 4, 17, 15, 0); // Fri 16:00 BST; next step +7 days = Fri 16:00 BST (inside)
 
-    setupFullProcessStep({ queuedCount: 10, hasNextStep: false });
+    setupFullProcessStep({ hasNextStep: true });
     await engine.processStep('enr-1', 1);
 
-    const sendCalls = mockQueueAdd.mock.calls.filter(c => c[0] === 'send-email');
-    expect(sendCalls.length).toBe(1);
-    const delay = sendCalls[0][2].delay;
-    // 10 * 4min = 40min = 2400000ms, + 30-90s jitter
-    expect(delay).toBeGreaterThanOrEqual(2400000 + 30000);
-    expect(delay).toBeLessThanOrEqual(2400000 + 91000);
+    const stepCalls = mockQueueAdd.mock.calls.filter(c => c[0] === 'process-step');
+    expect(stepCalls.length).toBe(1);
+    expect(stepCalls[0][2].delay).toBe(7 * 24 * 60 * 60 * 1000);
+  });
+});
+
+describe('processStep — recipient guards', () => {
+  function insertCount() {
+    return mockQuery.mock.calls.filter(
+      c => typeof c[0] === 'string' && c[0].includes('INSERT INTO email_sends')
+    ).length;
+  }
+
+  it('lender contact → cancels enrollment, no email', async () => {
+    setInsideWindow();
+    setupFullProcessStep({ contact: { contact_type: 'lender' } as any, hasNextStep: false });
+    await engine.processStep('enr-1', 1);
+
+    expect(insertCount()).toBe(0);
+    const cancel = mockQuery.mock.calls.filter(
+      c => typeof c[0] === 'string' && c[0].includes('UPDATE sequence_enrollments') && (c[1] as unknown[])?.[0] === 'cancelled'
+    );
+    expect(cancel.length).toBe(1);
   });
 
-  it('15 already queued → delay is ~60min + jitter (fills the hour)', async () => {
+  it('hold-tagged contact → no email, enrollment not cancelled', async () => {
     setInsideWindow();
-
-    setupFullProcessStep({ queuedCount: 15, hasNextStep: false });
+    setupFullProcessStep({ contact: { tags: ['hold'] }, hasNextStep: false });
     await engine.processStep('enr-1', 1);
 
-    const sendCalls = mockQueueAdd.mock.calls.filter(c => c[0] === 'send-email');
-    const delay = sendCalls[0][2].delay;
-    // 15 * 4min = 60min = 3600000ms
-    expect(delay).toBeGreaterThanOrEqual(3600000 + 30000);
-    expect(delay).toBeLessThanOrEqual(3600000 + 91000);
+    expect(insertCount()).toBe(0);
+    const cancel = mockQuery.mock.calls.filter(
+      c => typeof c[0] === 'string' && (c[1] as unknown[])?.[0] === 'cancelled'
+    );
+    expect(cancel.length).toBe(0);
+  });
+
+  it('suppressed contact → no email', async () => {
+    setInsideWindow();
+    setupFullProcessStep({ hasNextStep: false });
+    const impl = mockQuery.getMockImplementation()!;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql.includes('FROM suppressed_emails')) return Promise.resolve({ rows: [{ id: 's' }], rowCount: 1 });
+      return impl(sql, params);
+    });
+    await engine.processStep('enr-1', 1);
+
+    expect(insertCount()).toBe(0);
   });
 });
 
@@ -417,7 +441,7 @@ describe('processStep — guard clauses', () => {
   it('no sending account available → reschedules in 1 hour', async () => {
     setInsideWindow();
 
-    (gmailClient.getBestSendingAccount as ReturnType<typeof vi.fn>)
+    (gmailClient.reserveSendingAccount as ReturnType<typeof vi.fn>)
       .mockResolvedValue(null);
 
     setupQueryResponses(mockQuery, {
@@ -441,24 +465,88 @@ describe('processStep — guard clauses', () => {
 // ═════════════════════════════════════════════════════════════════════
 
 describe('enrollContact — guards', () => {
-  it('bounced contact → throws', async () => {
+  function setupEnroll(opts: {
+    contact?: Record<string, unknown> | null;
+    sequence?: boolean;
+    suppressed?: boolean;
+    existing?: { id: string; status: string }[];
+  } = {}) {
+    const contact = opts.contact === null
+      ? []
+      : [{ ...makeContact(), contact_type: 'developer', tenant: 'test-tenant', ...(opts.contact || {}) }];
     setupQueryResponses(mockQuery, {
-      'FROM contacts WHERE id': [makeContact({ tags: ['bounced'] })],
+      'FROM sequences WHERE id': opts.sequence === false ? [] : [makeSequence()],
+      'FROM contacts WHERE id': contact,
+      'FROM suppressed_emails': opts.suppressed ? [{ id: 'supp-1' }] : [],
+      'FROM sequence_enrollments WHERE sequence_id': opts.existing || [],
+      'INSERT INTO sequence_enrollments': [{ id: 'enr-new' }],
     });
+  }
 
-    await expect(
-      engine.enrollContact('seq-1', 'contact-1')
-    ).rejects.toThrow('Contact email has bounced');
+  function insertedEnrollments() {
+    return mockQuery.mock.calls.filter(
+      c => typeof c[0] === 'string' && c[0].includes('INSERT INTO sequence_enrollments')
+    );
+  }
+
+  it('bounced contact → throws', async () => {
+    setupEnroll({ contact: { tags: ['bounced'] } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Contact email has bounced');
   });
 
   it('unsubscribed contact → throws', async () => {
-    setupQueryResponses(mockQuery, {
-      'FROM contacts WHERE id': [makeContact({ tags: ['unsubscribed'] })],
-    });
+    setupEnroll({ contact: { tags: ['unsubscribed'] } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Contact has unsubscribed');
+  });
 
-    await expect(
-      engine.enrollContact('seq-1', 'contact-1')
-    ).rejects.toThrow('Contact has unsubscribed');
+  it('lender → refused with EnrollmentRefusedError', async () => {
+    setupEnroll({ contact: { contact_type: 'lender' } });
+    const p = engine.enrollContact('seq-1', 'contact-1');
+    await expect(p).rejects.toThrow('Contact is a lender');
+    await expect(p).rejects.toBeInstanceOf(EnrollmentRefusedError);
+    expect(insertedEnrollments().length).toBe(0);
+  });
+
+  it('hold-tagged → refused', async () => {
+    setupEnroll({ contact: { tags: ['hold'] } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Contact is on hold');
+  });
+
+  it('internal @tp.finance lender/hold → allowed', async () => {
+    setupEnroll({ contact: { email: 'marcus@tp.finance', contact_type: 'lender', tags: ['hold'] } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).resolves.toBe('enr-new');
+  });
+
+  it('suppressed email → refused', async () => {
+    setupEnroll({ suppressed: true });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Email is permanently suppressed');
+  });
+
+  it('contact in another tenant → refused', async () => {
+    setupEnroll({ contact: { tenant: 'loan-intel' } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Contact belongs to another tenant');
+    expect(insertedEnrollments().length).toBe(0);
+  });
+
+  it('contact not found → refused', async () => {
+    setupEnroll({ contact: null });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Contact not found');
+  });
+
+  it('sequence not in this tenant → refused', async () => {
+    setupEnroll({ sequence: false });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Sequence not found in this tenant');
+  });
+
+  it('already actively enrolled → throws the existing error', async () => {
+    setupEnroll({ existing: [{ id: 'enr-1', status: 'active' }] });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('already actively enrolled');
+  });
+
+  it('eligible contact → creates enrollment', async () => {
+    setupEnroll();
+    await expect(engine.enrollContact('seq-1', 'contact-1')).resolves.toBe('enr-new');
+    expect(insertedEnrollments().length).toBe(1);
   });
 });
 

@@ -8,7 +8,7 @@ interface ForgotPasswordProps {
 export default function ForgotPassword({ onBack }: ForgotPasswordProps) {
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
-  const [resetUrl, setResetUrl] = useState('');
+  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
   const handleRequest = async () => {
@@ -16,15 +16,14 @@ export default function ForgotPassword({ onBack }: ForgotPasswordProps) {
     setError('');
     try {
       const res = await axios.post('/outreach/api/auth/forgot-password');
-      if (res.data.sent) {
-        setSent(true);
-      } else if (res.data.reset_url) {
-        // No Gmail connected — show the link directly
-        setResetUrl(res.data.reset_url);
-        setSent(true);
+      setMessage(res.data?.message || '');
+      setSent(true);
+    } catch (err) {
+      if (axios.isAxiosError(err) && err.response?.status === 429) {
+        setError('Too many reset requests. Please try again later.');
+      } else {
+        setError('Failed to request a reset link. Please try again.');
       }
-    } catch {
-      setError('Failed to generate reset link. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -64,23 +63,9 @@ export default function ForgotPassword({ onBack }: ForgotPasswordProps) {
             </>
           ) : (
             <div className="mb-4">
-              {resetUrl ? (
-                <>
-                  <p className="text-[#6B7E8F] text-sm mb-3">
-                    No Gmail account connected yet — use this link directly (valid for 1 hour):
-                  </p>
-                  <a
-                    href={resetUrl}
-                    className="block text-[#74DFF6] text-sm break-all hover:underline bg-[#0A131E] border border-[#1A2A3D] rounded-lg px-3 py-2"
-                  >
-                    {resetUrl}
-                  </a>
-                </>
-              ) : (
-                <p className="text-green-400 text-sm">
-                  Reset link sent to marcus@tp.finance. Check your inbox — it expires in 1 hour.
-                </p>
-              )}
+              <p className="text-green-400 text-sm">
+                {message || 'If password reset is configured, a reset link has been emailed to the account owner. It expires in 1 hour.'}
+              </p>
             </div>
           )}
 

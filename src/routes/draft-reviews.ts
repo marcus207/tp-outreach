@@ -210,73 +210,135 @@ router.post('/:id/skip-direct', requireAuth, async (req: Request, res: Response)
   }
 });
 
-// GET /api/draft-reviews/:id/approve?token= — public (no auth), linked from email
-router.get('/:id/approve', async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id as string;
-    const token = req.query.token as string;
-    if (!token) { res.status(400).send('Missing token'); return; }
+// ---- Public approve/skip (token-validated, linked from email) ----
+// GET only shows a confirmation page; the action happens on POST so that email
+// link scanners (which follow GETs) cannot trigger sends.
 
-    const draft = await draftReviewService.approveDraft(id, token);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Returns [id, token] if both are UUID-shaped, otherwise null
+function readIdAndToken(req: Request): [string, string] | null {
+  const id = String(req.params.id || '');
+  const raw = (req.body && typeof req.body.token === 'string') ? req.body.token : req.query.token;
+  const token = typeof raw === 'string' ? raw : '';
+  if (!UUID_RE.test(id) || !UUID_RE.test(token)) return null;
+  return [id, token];
+}
+
+function publicPage(title: string, accent: string, icon: string, heading: string, bodyHtml: string): string {
+  return `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>${escapeHtml(title)} — TP Outreach</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f4f8;margin:0;padding:40px 20px;text-align:center}
+.card{background:#fff;border-radius:12px;padding:40px;max-width:480px;margin:0 auto;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h1{color:${accent};margin:0 0 12px}p{color:#6b7280;margin:0 0 24px}
+a,button{display:inline-block;background:${accent};color:#fff;padding:11px 28px;border-radius:6px;text-decoration:none;font-weight:500;border:none;font-size:15px;cursor:pointer}</style>
+</head>
+<body>
+<div class="card">
+  <div style="font-size:48px;margin-bottom:16px">${escapeHtml(icon)}</div>
+  <h1>${escapeHtml(heading)}</h1>
+  ${bodyHtml}
+</div>
+</body>
+</html>`;
+}
+
+function invalidLinkPage(): string {
+  return publicPage('Invalid link', '#dc2626', '!', 'Invalid link', '<p>This link is invalid or incomplete.</p>');
+}
+
+function errorPage(message: string): string {
+  return publicPage('Error', '#dc2626', '!', 'Could not complete', `<p>${escapeHtml(message)}</p>`);
+}
+
+function confirmPage(action: 'approve' | 'skip', token: string, theme: string): string {
+  const isApprove = action === 'approve';
+  return publicPage(
+    isApprove ? 'Confirm approval' : 'Confirm skip',
+    isApprove ? '#0F2744' : '#374151',
+    isApprove ? '?' : '—',
+    isApprove ? 'Approve this outreach?' : 'Skip this week?',
+    `<p>${isApprove
+      ? `Confirm to approve the <strong>${escapeHtml(theme)}</strong> campaign and queue the emails.`
+      : `Confirm to skip the <strong>${escapeHtml(theme)}</strong> outreach for this week.`}</p>
+  <form method="POST" action="">
+    <input type="hidden" name="token" value="${escapeHtml(token)}" />
+    <button type="submit">${isApprove ? 'Confirm Approve' : 'Confirm Skip'}</button>
+  </form>`
+  );
+}
+
+// GET /api/draft-reviews/:id/approve?token= — public, shows confirmation page only
+router.get('/:id/approve', async (req: Request, res: Response) => {
+  const parsed = readIdAndToken(req);
+  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  try {
+    const draft = await draftReviewService.get(parsed[0]);
+    if (!draft || draft.approval_token !== parsed[1]) { res.status(400).send(invalidLinkPage()); return; }
+    res.send(confirmPage('approve', parsed[1], draft.theme));
+  } catch (err) {
+    console.error('[DraftReviews] Approve page error:', err);
+    res.status(500).send(errorPage('Something went wrong. Please try again.'));
+  }
+});
+
+// POST /api/draft-reviews/:id/approve — public (token-validated), performs the approval
+router.post('/:id/approve', async (req: Request, res: Response) => {
+  const parsed = readIdAndToken(req);
+  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  try {
+    const draft = await draftReviewService.approveDraft(parsed[0], parsed[1]);
 
     // Execute send asynchronously
     draftReviewService.executeDraftSend(draft.id).catch(err =>
       console.error('[DraftReviews] Error executing send:', err)
     );
 
-    const sent = draft.emails_sent || 0;
-    res.send(`<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Approved — TP Outreach</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f4f8;margin:0;padding:40px 20px;text-align:center}
-.card{background:#fff;border-radius:12px;padding:40px;max-width:480px;margin:0 auto;box-shadow:0 2px 12px rgba(0,0,0,.08)}
-h1{color:#0F2744;margin:0 0 12px}p{color:#6b7280;margin:0 0 24px}
-a{display:inline-block;background:#0F2744;color:#fff;padding:11px 28px;border-radius:6px;text-decoration:none;font-weight:500}</style>
-</head>
-<body>
-<div class="card">
-  <div style="font-size:48px;margin-bottom:16px">✓</div>
-  <h1>Outreach Approved</h1>
-  <p>The <strong>${draft.theme}</strong> campaign has been approved. Emails are being queued and will send from 9am UTC tomorrow.</p>
-  <a href="https://tp.finance/outreach/#/drafts">View in Platform</a>
-</div>
-</body>
-</html>`);
+    res.send(publicPage('Approved', '#0F2744', '✓', 'Outreach Approved',
+      `<p>The <strong>${escapeHtml(draft.theme)}</strong> campaign has been approved. Emails are being queued and will send from 9am UTC tomorrow.</p>
+  <a href="https://tp.finance/outreach/#/drafts">View in Platform</a>`));
   } catch (err) {
-    res.status(400).send(`<p style="font-family:sans-serif;padding:40px;color:#dc2626">${(err as Error).message}</p>`);
+    res.status(400).send(errorPage((err as Error).message));
   }
 });
 
-// GET /api/draft-reviews/:id/skip?token= — public, linked from email
+// GET /api/draft-reviews/:id/skip?token= — public, shows confirmation page only
 router.get('/:id/skip', async (req: Request, res: Response) => {
+  const parsed = readIdAndToken(req);
+  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
   try {
-    const id = req.params.id as string;
-    const token = req.query.token as string;
-    if (!token) { res.status(400).send('Missing token'); return; }
-
-    await draftReviewService.skipDraft(id, token);
-
-    res.send(`<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Skipped — TP Outreach</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f4f8;margin:0;padding:40px 20px;text-align:center}
-.card{background:#fff;border-radius:12px;padding:40px;max-width:480px;margin:0 auto;box-shadow:0 2px 12px rgba(0,0,0,.08)}
-h1{color:#374151;margin:0 0 12px}p{color:#6b7280;margin:0 0 24px}
-a{display:inline-block;background:#6b7280;color:#fff;padding:11px 28px;border-radius:6px;text-decoration:none;font-weight:500}</style>
-</head>
-<body>
-<div class="card">
-  <div style="font-size:48px;margin-bottom:16px">—</div>
-  <h1>Week Skipped</h1>
-  <p>This week's outreach has been skipped. The next draft will be generated automatically in two weeks.</p>
-  <a href="https://tp.finance/outreach/#/drafts">Back to Platform</a>
-</div>
-</body>
-</html>`);
+    const draft = await draftReviewService.get(parsed[0]);
+    if (!draft || draft.skip_token !== parsed[1]) { res.status(400).send(invalidLinkPage()); return; }
+    res.send(confirmPage('skip', parsed[1], draft.theme));
   } catch (err) {
-    res.status(400).send(`<p style="font-family:sans-serif;padding:40px;color:#dc2626">${(err as Error).message}</p>`);
+    console.error('[DraftReviews] Skip page error:', err);
+    res.status(500).send(errorPage('Something went wrong. Please try again.'));
+  }
+});
+
+// POST /api/draft-reviews/:id/skip — public (token-validated), performs the skip
+router.post('/:id/skip', async (req: Request, res: Response) => {
+  const parsed = readIdAndToken(req);
+  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  try {
+    await draftReviewService.skipDraft(parsed[0], parsed[1]);
+    res.send(publicPage('Skipped', '#374151', '—', 'Week Skipped',
+      `<p>This week's outreach has been skipped. The next draft will be generated automatically in two weeks.</p>
+  <a href="https://tp.finance/outreach/#/drafts" style="background:#6b7280">Back to Platform</a>`));
+  } catch (err) {
+    res.status(400).send(errorPage((err as Error).message));
   }
 });
 

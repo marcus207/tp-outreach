@@ -22,6 +22,100 @@ const AUTO_REPLY_PREFIXES = [
 
 const PRIMARY_EMAIL = BRAND_EMAIL;
 
+/** Cap on Gmail messages processed per account per poll (paged 100 at a time). */
+const MAX_MESSAGES_PER_POLL = 500;
+
+/** Left-company phrases only count on a short reply (or an auto/system message). */
+const LEFT_COMPANY_MAX_WORDS = 60;
+
+const LEFT_COMPANY_PHRASES = [
+  'no longer with', 'no longer works', 'no longer at', 'no longer employed',
+  'left the company', 'left the organisation', 'left the organization',
+  'left the business', 'left the firm', 'has left', 'have left',
+  'moved on from', 'no longer an employee', 'is no longer here',
+  'no longer available at this address', 'this mailbox is no longer',
+  'this email address is no longer', 'this account has been disabled',
+  'mailbox not found', 'address rejected', 'user unknown',
+  'does not exist', 'invalid recipient', 'recipient rejected',
+  'no such user', 'account has been deactivated', 'account disabled',
+  'no longer a member', 'departed', 'position has been filled',
+];
+
+export type DsnKind = 'hard' | 'soft';
+
+/**
+ * Remove quoted text from a reply body: '>'-prefixed lines and everything after
+ * a common reply separator ("On ... wrote:", "-----Original Message-----",
+ * an Outlook "From: ... Sent: ..." header block, or a Gmail forward marker).
+ */
+export function stripQuotedText(body: string): string {
+  if (!body) return '';
+  let text = body.replace(/\r\n/g, '\n');
+  // Not line-anchored: HTML-only bodies arrive whitespace-collapsed onto one line.
+  const separators: RegExp[] = [
+    /(^|\s)On\s[\s\S]{0,300}?\swrote:/i, // "On <date>, <name> <addr> wrote:" (may wrap)
+    /-{2,}\s*Original Message\s*-{2,}/i,
+    /-{2,}\s*Forwarded message\s*-{2,}/i,
+    /(^|\s)\*?From:\*?\s[\s\S]{0,300}?\s\*?(Sent|Date):\*?\s/i, // Outlook header block
+    /^\s*_{10,}\s*$/m, // Outlook divider
+  ];
+  for (const re of separators) {
+    const m = re.exec(text);
+    if (m) text = text.slice(0, m.index);
+  }
+  return text
+    .split('\n')
+    .filter(line => !/^\s*>/.test(line))
+    .join('\n')
+    .trim();
+}
+
+export function isLeftCompanyText(text: string): boolean {
+  const t = (text || '').toLowerCase();
+  return LEFT_COMPANY_PHRASES.some(p => t.includes(p));
+}
+
+/**
+ * Classify a mailer-daemon DSN. Structured delivery-status fields win, then
+ * SMTP reply codes, then wording. Anything not clearly permanent is treated as
+ * soft (log only) so a transient failure never suppresses a contact.
+ */
+export function classifyDsn(text: string): DsnKind {
+  const t = (text || '').toLowerCase();
+  if (/^\s*action:\s*failed\b/m.test(t) || /^\s*status:\s*5\.\d{1,3}\.\d{1,3}/m.test(t)) return 'hard';
+  if (/^\s*action:\s*delayed\b/m.test(t) || /^\s*status:\s*4\.\d{1,3}\.\d{1,3}/m.test(t)) return 'soft';
+  if (/(^|[\s(\[#])55[0-4][\s-]/m.test(t) || /(^|[\s(\[#])5\.[1-7]\.\d{1,3}\b/m.test(t)) return 'hard';
+  if (/(^|[\s(\[#])4[25]\d[\s-]/m.test(t) || /(^|[\s(\[#])4\.[1-7]\.\d{1,3}\b/m.test(t)) return 'soft';
+  if (/delayed|will retry|will be retried|temporar(y|ily)|try again later/.test(t)) return 'soft';
+  if (/address not found|user unknown|no such user|mailbox not found|mailbox unavailable|does not exist|recipient rejected|address rejected|permanent(ly)? fail/.test(t)) return 'hard';
+  return 'soft';
+}
+
+type GmailPart = {
+  mimeType?: string | null;
+  body?: { data?: string | null } | null;
+  parts?: GmailPart[] | null;
+};
+
+/** Concatenate all inline text parts (incl. message/delivery-status) of a Gmail payload. */
+export function collectPayloadText(payload: GmailPart | null | undefined): string {
+  if (!payload) return '';
+  const out: string[] = [];
+  const walk = (part: GmailPart) => {
+    const mime = (part.mimeType || '').toLowerCase();
+    if (part.body?.data && (mime.startsWith('text/') || mime.startsWith('message/') || !mime)) {
+      try {
+        let txt = Buffer.from(part.body.data, 'base64url').toString('utf-8');
+        if (mime === 'text/html') txt = txt.replace(/<[^>]+>/g, ' ');
+        out.push(txt);
+      } catch { /* ignore decode errors */ }
+    }
+    for (const child of part.parts || []) walk(child);
+  };
+  walk(payload);
+  return out.join('\n');
+}
+
 export class ReplyWatcher {
   async pollAllAccounts(): Promise<void> {
     console.log('[Reply Watcher] Polling all active accounts for replies and bounces...');
@@ -49,22 +143,32 @@ export class ReplyWatcher {
       const gmail = google.gmail({ version: 'v1', auth });
 
       const oneDayAgo = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
-      const res = await gmail.users.messages.list({
-        userId: 'me',
-        q: `from:mailer-daemon after:${oneDayAgo}`,
-        maxResults: 50,
-      });
+      const messages: Array<{ id?: string | null; threadId?: string | null }> = [];
+      let pageToken: string | undefined;
+      do {
+        const res = await gmail.users.messages.list({
+          userId: 'me',
+          q: `from:mailer-daemon after:${oneDayAgo}`,
+          maxResults: 100,
+          pageToken,
+        });
+        messages.push(...(res.data.messages || []));
+        pageToken = res.data.nextPageToken || undefined;
+      } while (pageToken && messages.length < MAX_MESSAGES_PER_POLL);
 
-      const messages = res.data.messages || [];
       if (messages.length === 0) return;
 
       console.log(`[Reply Watcher] Found ${messages.length} bounce messages for ${account.email}`);
 
-      for (const msg of messages) {
+      for (const msg of messages.slice(0, MAX_MESSAGES_PER_POLL)) {
         if (!msg.id || !msg.threadId) continue;
         try {
-          await this.processBounce(msg.threadId);
-          await this.trashThread(gmail, msg.threadId);
+          const kind = await this.processBounce(gmail, msg.id, msg.threadId);
+          // Soft bounces (delayed / will retry) are left in place so the final
+          // DSN on the same thread is still visible to a later poll.
+          if (kind !== 'soft') {
+            await this.trashThread(gmail, msg.threadId);
+          }
         } catch (err) {
           console.error(`[Reply Watcher] Error processing bounce ${msg.id}:`, err);
         }
@@ -74,7 +178,11 @@ export class ReplyWatcher {
     }
   }
 
-  private async processBounce(threadId: string): Promise<void> {
+  private async processBounce(
+    gmail: ReturnType<typeof google.gmail>,
+    messageId: string,
+    threadId: string,
+  ): Promise<DsnKind | 'unmatched'> {
     const sendResult = await query<{
       id: string; contact_id: string; enrollment_id: string | null; to_email: string;
     }>(
@@ -85,16 +193,27 @@ export class ReplyWatcher {
       [threadId, TENANT]
     );
 
-    if (!sendResult.rows[0]) return;
+    if (!sendResult.rows[0]) return 'unmatched';
     const send = sendResult.rows[0];
+
+    const msg = await gmail.users.messages.get({ userId: 'me', id: messageId, format: 'full' });
+    const subject = (msg.data.payload?.headers || [])
+      .find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+    const dsnText = subject + '\n' + collectPayloadText(msg.data.payload);
+    const kind = classifyDsn(dsnText);
+
+    if (kind === 'soft') {
+      console.log(`[Reply Watcher] Soft bounce (delayed/retrying) for ${send.to_email} (thread ${threadId}) — no action`);
+      return 'soft';
+    }
 
     const existing = await query<{ id: string }>(
       `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'bounce'`,
       [send.id]
     );
-    if (existing.rows.length > 0) return;
+    if (existing.rows.length > 0) return 'hard';
 
-    console.log(`[Reply Watcher] Bounce detected: ${send.to_email} (thread ${threadId})`);
+    console.log(`[Reply Watcher] Hard bounce detected: ${send.to_email} (thread ${threadId})`);
 
     await query(
       `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'bounce')`,
@@ -102,15 +221,14 @@ export class ReplyWatcher {
     );
 
     await query(
-      `UPDATE email_sends SET status = 'bounced' WHERE id = $1`,
-      [send.id]
+      `UPDATE email_sends SET status = 'bounced' WHERE id = $1 AND tenant = $2`,
+      [send.id, TENANT]
     );
 
-    if (send.enrollment_id) {
-      await sequenceEngine.cancelEnrollment(send.enrollment_id, 'bounced');
-    }
-
-    await this.deleteContact(send.contact_id, send.to_email);
+    await this.suppressEmail(send.to_email, 'bounce');
+    await this.tagContact(send.contact_id, 'bounced');
+    await this.cancelContactEnrollments(send.contact_id, 'bounced');
+    return 'hard';
   }
 
   private async pollAccount(account: EmailAccount): Promise<void> {
@@ -171,17 +289,22 @@ export class ReplyWatcher {
       );
     }
 
+    // Suppression + enrollment cancellation are idempotent, so they run on every
+    // matching message regardless of earlier events on the same send (e.g. an
+    // unsubscribe arriving after an OOO was already logged). Only the event row
+    // and the forward are de-duplicated.
     if (replyType === 'unsubscribe') {
-      if (firstTime) {
-        console.log(`[Reply Watcher] Unsubscribe request from ${match.contactEmail} — suppressing contact`);
-        await this.deleteContact(match.contactId, match.contactEmail);
-      }
+      if (!firstTime) await this.recordEventOnce(match.emailSendId, 'unsubscribe');
+      console.log(`[Reply Watcher] Unsubscribe request from ${match.contactEmail} — suppressing contact`);
+      await this.suppressEmail(match.contactEmail, 'unsubscribed (reply)');
+      await this.tagContact(match.contactId, 'unsubscribed');
+      await this.cancelContactEnrollments(match.contactId, 'unsubscribed');
       await this.archiveThread(account, threadId);
     } else if (replyType === 'left_company') {
-      if (firstTime) {
-        console.log(`[Reply Watcher] Left company / undeliverable: ${match.contactEmail} — removing from sequencing`);
-        await this.deleteContact(match.contactId, match.contactEmail);
-      }
+      if (!firstTime) await this.recordEventOnce(match.emailSendId, 'left_company');
+      console.log(`[Reply Watcher] Left company / undeliverable: ${match.contactEmail} — removing from sequencing`);
+      await this.suppressEmail(match.contactEmail, 'left company');
+      await this.cancelContactEnrollments(match.contactId, 'left_company');
       await this.archiveThread(account, threadId);
     } else if (replyType === 'ooo') {
       if (firstTime) console.log(`[Reply Watcher] Out of office from ${match.contactEmail} on thread ${threadId}`);
@@ -190,12 +313,81 @@ export class ReplyWatcher {
       if (firstTime) console.log(`[Reply Watcher] Auto-reply from ${match.contactEmail} on thread ${threadId}`);
       await this.archiveThread(account, threadId);
     } else {
-      // Genuine human reply — notify marcus@ when the conversation belongs to one of
-      // the *other* sending accounts. Decision is based on the SENDING account, not
-      // the inbox the reply landed in: Reply-To routes most replies to marcus@, so
-      // keying off the polling account missed them.
+      // Genuine human reply. Marcus handles replies personally, so the contact is
+      // taken out of ALL automation (every active/paused enrollment cancelled and
+      // the address suppressed). Then notify marcus@ when the conversation belongs
+      // to one of the *other* sending accounts. Decision is based on the SENDING
+      // account, not the inbox the reply landed in: Reply-To routes most replies to
+      // marcus@, so keying off the polling account missed them.
+      if (!firstTime) await this.recordEventOnce(match.emailSendId, 'reply');
       if (firstTime) console.log(`[Reply Watcher] Genuine reply from ${match.contactEmail} on thread ${threadId}`);
+      await this.cancelContactEnrollments(match.contactId, 'replied', match.enrollmentId);
+      await this.suppressEmail(match.contactEmail, 'replied - removed from automation');
       await this.maybeForwardReply(account, messageId, match);
+    }
+  }
+
+  /** Insert an event of this exact type for the send if one does not already exist. */
+  private async recordEventOnce(emailSendId: string, eventType: string): Promise<void> {
+    const existing = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = $2`,
+      [emailSendId, eventType]
+    );
+    if (existing.rows.length > 0) return;
+    await query(
+      `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, $2)`,
+      [emailSendId, eventType]
+    );
+  }
+
+  /**
+   * Suppress the exact email only. Do NOT store the domain here: the send-gate
+   * matches suppression on email OR domain, so writing the domain for a single
+   * contact would block every address at that domain. Domain-level blocks are
+   * reserved for deliberate manual entries.
+   */
+  private async suppressEmail(email: string, reason: string): Promise<void> {
+    if (!email) return;
+    await query(
+      `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
+       VALUES (LOWER($1), NULL, $2, 'reply-watcher', $3)
+       ON CONFLICT (LOWER(email), tenant) DO NOTHING`,
+      [email, reason, TENANT]
+    );
+  }
+
+  /** Add a tag to the contact if it is not already present. Never deletes anything. */
+  private async tagContact(contactId: string, tag: string): Promise<void> {
+    if (!contactId) return;
+    await query(
+      `UPDATE contacts
+       SET tags = array_append(COALESCE(tags, '{}'), $1::text), updated_at = NOW()
+       WHERE id = $2 AND tenant = $3
+         AND NOT ($1::text = ANY(COALESCE(tags, '{}')))`,
+      [tag, contactId, TENANT]
+    );
+  }
+
+  /**
+   * Stop every active/paused enrollment for the contact in this tenant. Uses
+   * sequenceEngine.cancelEnrollment so pending BullMQ step jobs are removed too.
+   * For a human reply, the enrollment the reply belongs to is marked 'replied'
+   * (keeps reply analytics); all others are 'cancelled'.
+   */
+  private async cancelContactEnrollments(
+    contactId: string,
+    reason: string,
+    repliedEnrollmentId: string | null = null,
+  ): Promise<void> {
+    if (!contactId) return;
+    const result = await query<{ id: string }>(
+      `SELECT id FROM sequence_enrollments
+       WHERE contact_id = $1 AND tenant = $2 AND status IN ('active', 'paused')`,
+      [contactId, TENANT]
+    );
+    for (const row of result.rows) {
+      const why = reason === 'replied' && row.id !== repliedEnrollmentId ? 'replied (other sequence)' : reason;
+      await sequenceEngine.cancelEnrollment(row.id, why);
     }
   }
 
@@ -289,20 +481,14 @@ export class ReplyWatcher {
 
       const combined = (subject + ' ' + bodyText).toLowerCase();
 
-      const leftCompanyPhrases = [
-        'no longer with', 'no longer works', 'no longer at', 'no longer employed',
-        'left the company', 'left the organisation', 'left the organization',
-        'left the business', 'left the firm', 'has left', 'have left',
-        'moved on from', 'no longer an employee', 'is no longer here',
-        'no longer available at this address', 'this mailbox is no longer',
-        'this email address is no longer', 'this account has been disabled',
-        'mailbox not found', 'address rejected', 'user unknown',
-        'does not exist', 'invalid recipient', 'recipient rejected',
-        'no such user', 'account has been deactivated', 'account disabled',
-        'no longer a member', 'departed', 'position has been filled',
-      ];
+      // Only the new text the sender wrote counts; the quoted original (our own
+      // outreach) must never trigger left-company or unsubscribe handling.
+      const freshBody = stripQuotedText(bodyText)
+        .toLowerCase().replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const freshWords = freshBody ? freshBody.split(/\s+/).length : 0;
+      const isAutoLike = !!isAutoHeader || autoSubjects.some(p => subject.includes(p));
 
-      if (leftCompanyPhrases.some(p => combined.includes(p))) {
+      if (isLeftCompanyText(subject + ' ' + freshBody) && (isAutoLike || freshWords <= LEFT_COMPANY_MAX_WORDS)) {
         return 'left_company';
       }
 
@@ -329,9 +515,7 @@ export class ReplyWatcher {
         'please remove', 'stop contacting', 'cease and desist',
       ];
 
-      const bodyTrimmed = bodyText.toLowerCase().replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      const bodyWords = bodyTrimmed.split(/\s+/).length;
-      if (bodyWords <= 30 && unsubscribePhrases.some(p => bodyTrimmed.includes(p))) {
+      if (freshWords <= 30 && unsubscribePhrases.some(p => freshBody.includes(p))) {
         return 'unsubscribe';
       }
 
@@ -433,26 +617,6 @@ export class ReplyWatcher {
     } catch (err) {
       console.error(`[Reply Watcher] Failed to trash thread ${threadId}:`, err);
     }
-  }
-
-  private async deleteContact(contactId: string, email: string): Promise<void> {
-    // Suppress the exact email only. Do NOT store the domain here: the send-gate
-    // matches suppression on email OR domain, so writing the domain for a single
-    // bounce would block every address at that domain. Domain-level blocks are
-    // reserved for deliberate manual entries.
-    await query(
-      `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
-       VALUES (LOWER($1), NULL, 'bounce', 'reply-watcher', $2)
-       ON CONFLICT (LOWER(email), tenant) DO NOTHING`,
-      [email, TENANT]
-    );
-    await query(`DELETE FROM email_events WHERE email_send_id IN (SELECT id FROM email_sends WHERE contact_id = $1 AND tenant = $2)`, [contactId, TENANT]);
-    await query(`DELETE FROM email_sends WHERE contact_id = $1 AND tenant = $2`, [contactId, TENANT]);
-    await query(`DELETE FROM campaign_sends WHERE contact_id = $1`, [contactId]);
-    await query(`DELETE FROM sequence_enrollments WHERE contact_id = $1 AND tenant = $2`, [contactId, TENANT]);
-    await query(`DELETE FROM contact_list_members WHERE contact_id = $1`, [contactId]);
-    await query(`DELETE FROM contacts WHERE id = $1 AND tenant = $2`, [contactId, TENANT]);
-    console.log(`[Reply Watcher] Bounced contact suppressed + deleted: ${email}`);
   }
 
   private async getLastPollTime(accountId: string): Promise<Date | null> {
