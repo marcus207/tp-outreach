@@ -65,6 +65,12 @@ export class ApolloSyncService {
       console.warn('[Apollo Sync] No API key configured, skipping sync');
       return;
     }
+    // Disabled Oct 2026: the sync overwrote unsubscribe tags and re-imported lenders.
+    // Opt in explicitly once tag merging and the lender filter are fixed.
+    if (process.env.APOLLO_SYNC_ENABLED !== 'true') {
+      console.warn('[Apollo Sync] Disabled (APOLLO_SYNC_ENABLED != true), skipping sync');
+      return;
+    }
 
     const logId = await this.startSync(syncType);
     let contactsAdded = 0;

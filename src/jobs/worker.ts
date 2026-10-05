@@ -415,6 +415,8 @@ const TP_SEQUENCE_MAP: Record<string, Record<string, string>> = {
 
 async function autoEnrolTpContacts(): Promise<void> {
   if (TENANT !== 'tp') return;
+  // Paused Oct 2026 pending outreach fixes (stop-on-reply, suppression, lender checks)
+  if (process.env.TP_AUTO_ENROL_ENABLED !== 'true') return;
 
   // Only enrol into sequences that are active — draft sequences are skipped
   const activeSeqs = await query<{ id: string }>(
@@ -435,6 +437,12 @@ async function autoEnrolTpContacts(): Promise<void> {
        AND c.subsector IS NOT NULL
        AND NOT ('unsubscribed' = ANY(c.tags))
        AND NOT ('bounced' = ANY(c.tags))
+       AND NOT ('hold' = ANY(c.tags))
+       AND c.contact_type <> 'lender'
+       AND NOT EXISTS (
+         SELECT 1 FROM suppressed_emails se2
+         WHERE se2.tenant = 'tp' AND LOWER(se2.email) = LOWER(c.email)
+       )
        -- Never sequence lenders from tp.finance (even if also tagged introducer/developer)
        AND NOT EXISTS (
          SELECT 1 FROM contact_list_members clm

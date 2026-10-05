@@ -307,14 +307,14 @@ Respond with a JSON object only — no markdown fences, no explanation outside t
 
 async function ensureListExists(listName: string): Promise<string> {
   const existing = await query<{ id: string }>(
-    `SELECT id FROM contact_lists WHERE name = $1 LIMIT 1`,
-    [listName]
+    `SELECT id FROM contact_lists WHERE name = $1 AND tenant = $2 LIMIT 1`,
+    [listName, TENANT]
   );
   if (existing.rows[0]) return existing.rows[0].id;
 
   const created = await query<{ id: string }>(
-    `INSERT INTO contact_lists (name) VALUES ($1) RETURNING id`,
-    [listName]
+    `INSERT INTO contact_lists (name, tenant) VALUES ($1, $2) RETURNING id`,
+    [listName, TENANT]
   );
   return created.rows[0].id;
 }
