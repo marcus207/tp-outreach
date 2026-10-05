@@ -239,8 +239,10 @@ app.get('/api/auth/gmail/callback', requireAuth, async (req: Request, res: Respo
     const { tokens, email, name } = await gmailClient.exchangeCode(code);
 
     await query(
-      `INSERT INTO email_accounts (email, display_name, oauth_tokens, tenant)
-       VALUES ($1, $2, $3, $4)
+      // New mailboxes start with zero limits: they must be warmed up deliberately,
+      // never inherit the 2000/day column default.
+      `INSERT INTO email_accounts (email, display_name, oauth_tokens, tenant, daily_limit, hourly_limit)
+       VALUES ($1, $2, $3, $4, 0, 0)
        ON CONFLICT (email) DO UPDATE SET
          oauth_tokens = $3,
          display_name = COALESCE($2, email_accounts.display_name),
