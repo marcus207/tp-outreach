@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { query } from '../db/connection';
+import { query, TENANT } from '../db/connection';
 import { Contact } from '../types';
 
 interface ApolloContact {
@@ -155,6 +155,14 @@ export class ApolloSyncService {
     const emailVerified = apolloContact.email_status === 'verified';
 
     try {
+      const suppressed = await query<{ id: string }>(
+        `SELECT id FROM suppressed_emails WHERE LOWER(email) = $1 AND tenant = $2 LIMIT 1`,
+        [email, TENANT]
+      );
+      if (suppressed.rows.length > 0) {
+        return 'skipped';
+      }
+
       const existing = await query<{ id: string }>(
         `SELECT id FROM contacts WHERE LOWER(email) = $1`,
         [email]
@@ -163,7 +171,14 @@ export class ApolloSyncService {
       if (existing.rows.length > 0) {
         await query(
           `UPDATE contacts SET
-            apollo_id = COALESCE($1, apollo_id),
+            apollo_id = COALESCE(
+              CASE WHEN $1::text IS NOT NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM contacts c2
+                     WHERE c2.apollo_id = $1 AND LOWER(c2.email) <> $13
+                   )
+                   THEN $1::text ELSE NULL END,
+              apollo_id),
             first_name = COALESCE($2, first_name),
             last_name = COALESCE($3, last_name),
             title = COALESCE($4, title),
@@ -201,7 +216,8 @@ export class ApolloSyncService {
             apollo_id, email, first_name, last_name, title, company,
             company_domain, linkedin_url, phone, city, country, tags,
             email_verified, source, last_synced_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'apollo', NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'apollo', NOW())
+          ON CONFLICT (apollo_id) DO NOTHING`,
           [
             apolloContact.id,
             email,

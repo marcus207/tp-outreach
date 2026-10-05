@@ -232,7 +232,7 @@ export default function CampaignDetail() {
 
   const { data: templates } = useQuery({
     queryKey: ['templates'],
-    queryFn: () => templatesApi.list().then((r) => r.data),
+    queryFn: () => templatesApi.list().then((r) => r.data.templates),
   });
 
   const statusMutation = useMutation({

@@ -57,9 +57,9 @@ export class TemplateEngine {
   render(template: string, data: MergeData): string {
     return template.replace(TemplateEngine.MERGE_FIELD_REGEX, (_match, field: string) => {
       const key = field.trim();
+      if (key === 'unsubscribe_url') return _match;
       const value = data[key];
       if (value === undefined || value === null || value === '') {
-        // Return a fallback or empty string
         return '';
       }
       return value;

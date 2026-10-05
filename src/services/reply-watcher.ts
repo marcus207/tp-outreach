@@ -1,4 +1,5 @@
-import { query } from '../db/connection';
+import { google } from 'googleapis';
+import { query, TENANT, BRAND_EMAIL } from '../db/connection';
 import { gmailClient } from './gmail-client';
 import { sequenceEngine } from './sequence-engine';
 import { EmailAccount } from '../types';
@@ -7,12 +8,23 @@ interface ReplyMatch {
   emailSendId: string;
   enrollmentId: string | null;
   sequenceId: string | null;
-  stopOnReply: boolean;
+  contactId: string;
+  contactEmail: string;
+  contactName: string;
+  sendingAccount: string | null;
 }
+
+const AUTO_REPLY_PREFIXES = [
+  'automatic reply:', 'auto-reply:', 'auto reply:', 'autoreply:',
+  'out of office:', 'out of office re:', 'abwesend:',
+  're:', 'fw:', 'fwd:',
+];
+
+const PRIMARY_EMAIL = BRAND_EMAIL;
 
 export class ReplyWatcher {
   async pollAllAccounts(): Promise<void> {
-    console.log('[Reply Watcher] Polling all active accounts for replies...');
+    console.log('[Reply Watcher] Polling all active accounts for replies and bounces...');
 
     const accounts = await gmailClient.getActiveAccounts();
 
@@ -24,16 +36,90 @@ export class ReplyWatcher {
     for (const account of accounts) {
       try {
         await this.pollAccount(account);
+        await this.pollBounces(account);
       } catch (err) {
         console.error(`[Reply Watcher] Error polling account ${account.email}:`, err);
       }
     }
   }
 
+  private async pollBounces(account: EmailAccount): Promise<void> {
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+
+      const oneDayAgo = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
+      const res = await gmail.users.messages.list({
+        userId: 'me',
+        q: `from:mailer-daemon after:${oneDayAgo}`,
+        maxResults: 50,
+      });
+
+      const messages = res.data.messages || [];
+      if (messages.length === 0) return;
+
+      console.log(`[Reply Watcher] Found ${messages.length} bounce messages for ${account.email}`);
+
+      for (const msg of messages) {
+        if (!msg.id || !msg.threadId) continue;
+        try {
+          await this.processBounce(msg.threadId);
+          await this.trashThread(gmail, msg.threadId);
+        } catch (err) {
+          console.error(`[Reply Watcher] Error processing bounce ${msg.id}:`, err);
+        }
+      }
+    } catch (err) {
+      console.error(`[Reply Watcher] Error polling bounces for ${account.email}:`, err);
+    }
+  }
+
+  private async processBounce(threadId: string): Promise<void> {
+    const sendResult = await query<{
+      id: string; contact_id: string; enrollment_id: string | null; to_email: string;
+    }>(
+      `SELECT es.id, es.contact_id, es.enrollment_id, es.to_email
+       FROM email_sends es
+       WHERE es.gmail_thread_id = $1 AND es.tenant = $2 AND es.status = 'sent'
+       LIMIT 1`,
+      [threadId, TENANT]
+    );
+
+    if (!sendResult.rows[0]) return;
+    const send = sendResult.rows[0];
+
+    const existing = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'bounce'`,
+      [send.id]
+    );
+    if (existing.rows.length > 0) return;
+
+    console.log(`[Reply Watcher] Bounce detected: ${send.to_email} (thread ${threadId})`);
+
+    await query(
+      `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'bounce')`,
+      [send.id]
+    );
+
+    await query(
+      `UPDATE email_sends SET status = 'bounced' WHERE id = $1`,
+      [send.id]
+    );
+
+    if (send.enrollment_id) {
+      await sequenceEngine.cancelEnrollment(send.enrollment_id, 'bounced');
+    }
+
+    await this.deleteContact(send.contact_id, send.to_email);
+  }
+
   private async pollAccount(account: EmailAccount): Promise<void> {
-    // Poll for messages in the last 10 minutes
-    const since = new Date(Date.now() - 10 * 60 * 1000);
+    const lastPoll = await this.getLastPollTime(account.id);
+    const since = lastPoll
+      ? new Date(lastPoll.getTime() - 2 * 60 * 1000)
+      : new Date(Date.now() - 24 * 60 * 60 * 1000);
     const messages = await gmailClient.checkForReplies(account, since);
+    await this.setLastPollTime(account.id);
 
     if (messages.length === 0) return;
 
@@ -41,71 +127,455 @@ export class ReplyWatcher {
 
     for (const message of messages) {
       try {
-        await this.processMessage(message.id, message.threadId);
+        await this.processMessage(account, message.id, message.threadId, message.payload);
       } catch (err) {
         console.error(`[Reply Watcher] Error processing message ${message.id}:`, err);
       }
     }
   }
 
-  private async processMessage(messageId: string, threadId: string): Promise<void> {
-    // Check if we've already processed this exact message
+  private async processMessage(
+    account: EmailAccount,
+    messageId: string,
+    threadId: string,
+    payload?: { headers?: Array<{ name: string; value: string }> }
+  ): Promise<void> {
+    let match = await this.matchReply(threadId, messageId);
+
+    if (!match && payload) {
+      const headers = payload.headers || [];
+      const fromHeader = headers.find((h: { name: string; value: string }) => h.name?.toLowerCase() === 'from')?.value || '';
+      const subjectHeader = headers.find((h: { name: string; value: string }) => h.name?.toLowerCase() === 'subject')?.value || '';
+      match = await this.matchReplyBySubject(fromHeader, subjectHeader);
+      if (match) {
+        console.log(`[Reply Watcher] Fallback match by subject for ${match.contactEmail}: "${subjectHeader}"`);
+      }
+    }
+
+    if (!match) return;
+
+    const replyType = await this.classifyReply(account, messageId);
+
     const existing = await query<{ id: string }>(
       `SELECT id FROM email_events
-       WHERE event_type = 'reply'
-         AND email_send_id IN (
-           SELECT id FROM email_sends WHERE gmail_thread_id = $1
-         )`,
-      [threadId]
-    );
-
-    // Find the outbound send for this thread
-    const match = await this.matchReply(threadId, messageId);
-
-    if (!match) {
-      // Not a thread we're tracking
-      return;
-    }
-
-    // Skip if already logged
-    if (existing.rows.length > 0) {
-      return;
-    }
-
-    // Record reply event
-    await query(
-      `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'reply')`,
+       WHERE event_type IN ('reply', 'auto_reply', 'left_company', 'ooo', 'unsubscribe')
+         AND email_send_id = $1`,
       [match.emailSendId]
     );
+    const firstTime = existing.rows.length === 0;
 
-    console.log(`[Reply Watcher] Reply detected on thread ${threadId} -> send ${match.emailSendId}`);
+    if (firstTime) {
+      await query(
+        `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, $2)`,
+        [match.emailSendId, replyType]
+      );
+    }
 
-    // Cancel enrollment if configured
-    if (match.enrollmentId && match.stopOnReply) {
-      await sequenceEngine.cancelEnrollment(match.enrollmentId, 'replied');
-      console.log(`[Reply Watcher] Cancelled enrollment ${match.enrollmentId} due to reply`);
+    if (replyType === 'unsubscribe') {
+      if (firstTime) {
+        console.log(`[Reply Watcher] Unsubscribe request from ${match.contactEmail} — suppressing contact`);
+        await this.deleteContact(match.contactId, match.contactEmail);
+      }
+      await this.archiveThread(account, threadId);
+    } else if (replyType === 'left_company') {
+      if (firstTime) {
+        console.log(`[Reply Watcher] Left company / undeliverable: ${match.contactEmail} — removing from sequencing`);
+        await this.deleteContact(match.contactId, match.contactEmail);
+      }
+      await this.archiveThread(account, threadId);
+    } else if (replyType === 'ooo') {
+      if (firstTime) console.log(`[Reply Watcher] Out of office from ${match.contactEmail} on thread ${threadId}`);
+      await this.archiveThread(account, threadId);
+    } else if (replyType === 'auto_reply') {
+      if (firstTime) console.log(`[Reply Watcher] Auto-reply from ${match.contactEmail} on thread ${threadId}`);
+      await this.archiveThread(account, threadId);
+    } else {
+      // Genuine human reply — notify marcus@ when the conversation belongs to one of
+      // the *other* sending accounts. Decision is based on the SENDING account, not
+      // the inbox the reply landed in: Reply-To routes most replies to marcus@, so
+      // keying off the polling account missed them.
+      if (firstTime) console.log(`[Reply Watcher] Genuine reply from ${match.contactEmail} on thread ${threadId}`);
+      await this.maybeForwardReply(account, messageId, match);
+    }
+  }
+
+  private async maybeForwardReply(account: EmailAccount, messageId: string, match: ReplyMatch): Promise<void> {
+    const sender = (match.sendingAccount || '').toLowerCase();
+    // Only notify for replies to the OTHER addresses. Replies to marcus@'s own
+    // outreach already arrive directly in his inbox, so no notification needed.
+    if (!sender || sender === PRIMARY_EMAIL.toLowerCase()) return;
+
+    // Idempotent: forward each reply to marcus@ at most once.
+    const already = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'reply_fwd'`,
+      [match.emailSendId]
+    );
+    if (already.rows.length > 0) return;
+
+    const ok = await this.forwardReply(account, messageId, match);
+    if (ok) {
+      await query(
+        `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'reply_fwd')`,
+        [match.emailSendId]
+      );
+    }
+  }
+
+  private async classifyReply(account: EmailAccount, messageId: string): Promise<'reply' | 'auto_reply' | 'ooo' | 'left_company' | 'unsubscribe'> {
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+      const msg = await gmail.users.messages.get({
+        userId: 'me',
+        id: messageId,
+        format: 'full',
+        metadataHeaders: [
+          'Auto-Submitted', 'X-Autoreply', 'X-Auto-Response-Suppress',
+          'X-Autorespond', 'Precedence', 'X-MS-Exchange-Organization-AutoForwarded',
+          'Subject',
+        ],
+      });
+
+      const headers = msg.data.payload?.headers || [];
+      const getHeader = (name: string) =>
+        headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value || '';
+
+      const isAutoHeader =
+        (getHeader('Auto-Submitted') && getHeader('Auto-Submitted') !== 'no') ||
+        !!getHeader('X-Autoreply') ||
+        !!getHeader('X-Autorespond') ||
+        getHeader('Precedence').toLowerCase() === 'auto_reply' ||
+        getHeader('Precedence').toLowerCase() === 'bulk' ||
+        !!getHeader('X-MS-Exchange-Organization-AutoForwarded');
+
+      const subject = getHeader('Subject').toLowerCase();
+
+      const oooSubjects = [
+        'out of office', 'on vacation', 'on holiday', 'away from',
+        'i am currently out', 'abwesend', 'absence', 'not in the office',
+      ];
+
+      const deliveryFailSubjects = [
+        'delivery status', 'undeliverable', 'mail delivery failed',
+        'delivery failure', 'returned mail', 'not delivered',
+      ];
+
+      const autoSubjects = [
+        'automatic reply', 'auto-reply', 'auto reply', 'autoreply',
+      ];
+
+      // Extract body text for "left company" detection
+      let bodyText = '';
+      try {
+        const parts = msg.data.payload?.parts || [];
+        if (parts.length > 0) {
+          for (const part of parts) {
+            if (part.mimeType === 'text/plain' && part.body?.data) {
+              bodyText = Buffer.from(part.body.data, 'base64url').toString('utf-8');
+              break;
+            }
+            if (part.mimeType === 'text/html' && part.body?.data && !bodyText) {
+              bodyText = Buffer.from(part.body.data, 'base64url').toString('utf-8')
+                .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+            }
+          }
+        } else if (msg.data.payload?.body?.data) {
+          bodyText = Buffer.from(msg.data.payload.body.data, 'base64url').toString('utf-8');
+          if (msg.data.payload.mimeType === 'text/html') {
+            bodyText = bodyText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+          }
+        }
+      } catch { /* ignore decode errors */ }
+
+      const combined = (subject + ' ' + bodyText).toLowerCase();
+
+      const leftCompanyPhrases = [
+        'no longer with', 'no longer works', 'no longer at', 'no longer employed',
+        'left the company', 'left the organisation', 'left the organization',
+        'left the business', 'left the firm', 'has left', 'have left',
+        'moved on from', 'no longer an employee', 'is no longer here',
+        'no longer available at this address', 'this mailbox is no longer',
+        'this email address is no longer', 'this account has been disabled',
+        'mailbox not found', 'address rejected', 'user unknown',
+        'does not exist', 'invalid recipient', 'recipient rejected',
+        'no such user', 'account has been deactivated', 'account disabled',
+        'no longer a member', 'departed', 'position has been filled',
+      ];
+
+      if (leftCompanyPhrases.some(p => combined.includes(p))) {
+        return 'left_company';
+      }
+
+      if (isAutoHeader || autoSubjects.some(p => subject.includes(p))) {
+        if (oooSubjects.some(p => subject.includes(p)) || oooSubjects.some(p => combined.includes(p))) {
+          return 'ooo';
+        }
+        if (deliveryFailSubjects.some(p => subject.includes(p))) {
+          return 'left_company';
+        }
+        return 'auto_reply';
+      }
+
+      if (oooSubjects.some(p => subject.includes(p))) {
+        return 'ooo';
+      }
+
+      const unsubscribePhrases = [
+        'unsubscribe', 'remove me', 'stop emailing', 'stop sending',
+        'opt out', 'opt-out', 'take me off', 'remove from list',
+        'remove from your list', 'remove my email', 'don\'t email',
+        'do not email', 'do not contact', 'don\'t contact',
+        'no longer interested', 'not interested',
+        'please remove', 'stop contacting', 'cease and desist',
+      ];
+
+      const bodyTrimmed = bodyText.toLowerCase().replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const bodyWords = bodyTrimmed.split(/\s+/).length;
+      if (bodyWords <= 30 && unsubscribePhrases.some(p => bodyTrimmed.includes(p))) {
+        return 'unsubscribe';
+      }
+
+      return 'reply';
+    } catch (err) {
+      console.error(`[Reply Watcher] Error classifying reply for ${messageId}:`, err);
+      return 'reply';
+    }
+  }
+
+  private async forwardReply(account: EmailAccount, messageId: string, match: ReplyMatch): Promise<boolean> {
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+
+      const msg = await gmail.users.messages.get({
+        userId: 'me',
+        id: messageId,
+        format: 'full',
+      });
+
+      const headers = msg.data.payload?.headers || [];
+      const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '(no subject)';
+      const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || match.contactEmail;
+
+      let bodyHtml = '';
+      let bodyText = '';
+      const parts = msg.data.payload?.parts || [];
+
+      if (parts.length > 0) {
+        for (const part of parts) {
+          if (part.mimeType === 'text/html' && part.body?.data) {
+            bodyHtml = Buffer.from(part.body.data, 'base64url').toString('utf-8');
+          } else if (part.mimeType === 'text/plain' && part.body?.data) {
+            bodyText = Buffer.from(part.body.data, 'base64url').toString('utf-8');
+          }
+        }
+      } else if (msg.data.payload?.body?.data) {
+        const decoded = Buffer.from(msg.data.payload.body.data, 'base64url').toString('utf-8');
+        if (msg.data.payload.mimeType === 'text/html') {
+          bodyHtml = decoded;
+        } else {
+          bodyText = decoded;
+        }
+      }
+
+      const content = bodyHtml || `<pre>${bodyText}</pre>`;
+      const contactName = match.contactName || match.contactEmail;
+
+      const forwardHtml = `
+        <div style="font-family:Arial,sans-serif;font-size:14px;color:#333;">
+          <p style="background:#f0f7ff;border-left:4px solid #1993C5;padding:12px 16px;margin:0 0 16px;">
+            <strong>New reply</strong> to outreach sent from <strong>${match.sendingAccount || account.email}</strong><br>
+            From: ${from}<br>
+            Contact: ${contactName}
+          </p>
+          <div style="border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-top:8px;">
+            ${content}
+          </div>
+        </div>`;
+
+      const cleanSubject = subject.replace(/^(re:|fwd:|fw:)\s*/i, '');
+      const fwdSubject = `New reply (${match.sendingAccount || account.email}): ${cleanSubject}`;
+
+      const messageParts = [
+        `From: ${account.email}`,
+        `To: ${PRIMARY_EMAIL}`,
+        `Subject: ${fwdSubject}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/html; charset=UTF-8',
+        '',
+        forwardHtml,
+      ];
+
+      const rawMessage = messageParts.join('\r\n');
+      const encodedMessage = Buffer.from(rawMessage)
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: { raw: encodedMessage },
+      });
+
+      console.log(`[Reply Watcher] Forwarded reply from ${match.contactEmail} (sent from ${match.sendingAccount}, found in ${account.email}) to ${PRIMARY_EMAIL}`);
+      return true;
+    } catch (err) {
+      console.error(`[Reply Watcher] Failed to forward reply to ${PRIMARY_EMAIL}:`, err);
+      return false;
+    }
+  }
+
+  private async trashThread(gmail: ReturnType<typeof google.gmail>, threadId: string): Promise<void> {
+    try {
+      await gmail.users.threads.trash({ userId: 'me', id: threadId });
+      console.log(`[Reply Watcher] Trashed bounce thread ${threadId} from inbox`);
+    } catch (err) {
+      console.error(`[Reply Watcher] Failed to trash thread ${threadId}:`, err);
+    }
+  }
+
+  private async deleteContact(contactId: string, email: string): Promise<void> {
+    // Suppress the exact email only. Do NOT store the domain here: the send-gate
+    // matches suppression on email OR domain, so writing the domain for a single
+    // bounce would block every address at that domain. Domain-level blocks are
+    // reserved for deliberate manual entries.
+    await query(
+      `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
+       VALUES (LOWER($1), NULL, 'bounce', 'reply-watcher', $2)
+       ON CONFLICT (LOWER(email), tenant) DO NOTHING`,
+      [email, TENANT]
+    );
+    await query(`DELETE FROM email_events WHERE email_send_id IN (SELECT id FROM email_sends WHERE contact_id = $1 AND tenant = $2)`, [contactId, TENANT]);
+    await query(`DELETE FROM email_sends WHERE contact_id = $1 AND tenant = $2`, [contactId, TENANT]);
+    await query(`DELETE FROM campaign_sends WHERE contact_id = $1`, [contactId]);
+    await query(`DELETE FROM sequence_enrollments WHERE contact_id = $1 AND tenant = $2`, [contactId, TENANT]);
+    await query(`DELETE FROM contact_list_members WHERE contact_id = $1`, [contactId]);
+    await query(`DELETE FROM contacts WHERE id = $1 AND tenant = $2`, [contactId, TENANT]);
+    console.log(`[Reply Watcher] Bounced contact suppressed + deleted: ${email}`);
+  }
+
+  private async getLastPollTime(accountId: string): Promise<Date | null> {
+    const result = await query<{ last_poll: Date }>(
+      `SELECT value::timestamptz AS last_poll FROM kv_store WHERE key = $1`,
+      [`reply_poll_${accountId}`]
+    );
+    return result.rows[0]?.last_poll || null;
+  }
+
+  private async setLastPollTime(accountId: string): Promise<void> {
+    await query(
+      `INSERT INTO kv_store (key, value) VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = $2`,
+      [`reply_poll_${accountId}`, new Date().toISOString()]
+    );
+  }
+
+  private async matchReplyBySubject(fromHeader: string, subject: string): Promise<ReplyMatch | null> {
+    const emailMatch = fromHeader.match(/<([^>]+)>/) || fromHeader.match(/([^\s<]+@[^\s>]+)/);
+    const senderEmail = emailMatch ? emailMatch[1].toLowerCase() : '';
+    if (!senderEmail) return null;
+
+    let cleanSubject = subject.toLowerCase().trim();
+    let stripped = true;
+    while (stripped) {
+      stripped = false;
+      for (const prefix of AUTO_REPLY_PREFIXES) {
+        if (cleanSubject.startsWith(prefix)) {
+          cleanSubject = cleanSubject.slice(prefix.length).trim();
+          stripped = true;
+        }
+      }
+    }
+
+    if (!cleanSubject) return null;
+
+    const result = await query<{
+      id: string;
+      contact_id: string;
+      enrollment_id: string | null;
+      sequence_id: string | null;
+      contact_email: string;
+      contact_name: string;
+      sending_account: string | null;
+    }>(
+      `SELECT
+         es.id,
+         es.contact_id,
+         es.enrollment_id,
+         se.sequence_id,
+         es.to_email AS contact_email,
+         COALESCE(c.first_name || ' ' || c.last_name, c.first_name, es.to_email) AS contact_name,
+         ea.email AS sending_account
+       FROM email_sends es
+       LEFT JOIN sequence_enrollments se ON se.id = es.enrollment_id
+       LEFT JOIN contacts c ON c.id = es.contact_id
+       LEFT JOIN email_accounts ea ON ea.id = es.email_account_id
+       WHERE LOWER(es.to_email) = $1
+         AND LOWER(es.subject) = $2
+         AND es.tenant = $3
+         AND es.status = 'sent'
+       ORDER BY es.sent_at DESC
+       LIMIT 1`,
+      [senderEmail, cleanSubject, TENANT]
+    );
+
+    if (!result.rows[0]) return null;
+    const row = result.rows[0];
+    return {
+      emailSendId: row.id,
+      enrollmentId: row.enrollment_id,
+      sequenceId: row.sequence_id,
+      contactId: row.contact_id,
+      contactEmail: row.contact_email,
+      contactName: row.contact_name,
+      sendingAccount: row.sending_account,
+    };
+  }
+
+  private async archiveThread(account: EmailAccount, threadId: string): Promise<void> {
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+      // Automated responses (auto-reply, OOO, left-company, unsubscribe) get pulled
+      // out of the inbox AND marked as read so they don't sit as unread noise.
+      await gmail.users.threads.modify({
+        userId: 'me',
+        id: threadId,
+        requestBody: { removeLabelIds: ['INBOX', 'UNREAD'] },
+      });
+      console.log(`[Reply Watcher] Archived + marked read thread ${threadId} from ${account.email}`);
+    } catch (err) {
+      console.error(`[Reply Watcher] Failed to archive thread ${threadId}:`, err);
     }
   }
 
   async matchReply(threadId: string, _messageId: string): Promise<ReplyMatch | null> {
     const result = await query<{
       id: string;
+      contact_id: string;
       enrollment_id: string | null;
       sequence_id: string | null;
-      stop_on_reply: boolean;
+      contact_email: string;
+      contact_name: string;
+      sending_account: string | null;
     }>(
       `SELECT
          es.id,
+         es.contact_id,
          es.enrollment_id,
          se.sequence_id,
-         COALESCE(s.stop_on_reply, false) AS stop_on_reply
+         es.to_email AS contact_email,
+         COALESCE(c.first_name || ' ' || c.last_name, c.first_name, es.to_email) AS contact_name,
+         ea.email AS sending_account
        FROM email_sends es
        LEFT JOIN sequence_enrollments se ON se.id = es.enrollment_id
-       LEFT JOIN sequences s ON s.id = se.sequence_id
-       WHERE es.gmail_thread_id = $1
+       LEFT JOIN contacts c ON c.id = es.contact_id
+       LEFT JOIN email_accounts ea ON ea.id = es.email_account_id
+       WHERE es.gmail_thread_id = $1 AND es.tenant = $2
        ORDER BY es.sent_at ASC
        LIMIT 1`,
-      [threadId]
+      [threadId, TENANT]
     );
 
     if (!result.rows[0]) return null;
@@ -115,8 +585,138 @@ export class ReplyWatcher {
       emailSendId: row.id,
       enrollmentId: row.enrollment_id,
       sequenceId: row.sequence_id,
-      stopOnReply: row.stop_on_reply,
+      contactId: row.contact_id,
+      contactEmail: row.contact_email,
+      contactName: row.contact_name,
+      sendingAccount: row.sending_account,
     };
+  }
+
+  /** Record that a reply has been forwarded to marcus@ (idempotent), without re-sending. */
+  async markForwarded(emailSendId: string): Promise<void> {
+    const existing = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'reply_fwd'`,
+      [emailSendId]
+    );
+    if (existing.rows.length > 0) return;
+    await query(
+      `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'reply_fwd')`,
+      [emailSendId]
+    );
+  }
+
+  /**
+   * One-off backfill: find the most recent inbound message from a contact across
+   * the active mailboxes and forward it to marcus@ (idempotent). Used because the
+   * stored gmail_thread_id points at the OUTBOUND thread — replies routed via
+   * Reply-To land in marcus@ on a separate thread, so we search by sender.
+   */
+  async backfillContact(
+    emailSendId: string,
+    contactEmail: string,
+    contactName: string,
+    sendingAccount: string | null,
+  ): Promise<'sent' | 'skip-primary' | 'skip-done' | 'notfound' | 'fail'> {
+    const sender = (sendingAccount || '').toLowerCase();
+    if (!sender || sender === PRIMARY_EMAIL.toLowerCase()) return 'skip-primary';
+
+    const already = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'reply_fwd'`,
+      [emailSendId]
+    );
+    if (already.rows.length > 0) return 'skip-done';
+
+    const match: ReplyMatch = {
+      emailSendId,
+      enrollmentId: null,
+      sequenceId: null,
+      contactId: '',
+      contactEmail,
+      contactName: contactName || contactEmail,
+      sendingAccount,
+    };
+
+    const accounts = await gmailClient.getActiveAccounts();
+    for (const acct of accounts) {
+      try {
+        const auth = await gmailClient.getAuthenticatedClient(acct);
+        const gmail = google.gmail({ version: 'v1', auth });
+        const list = await gmail.users.messages.list({
+          userId: 'me', q: `from:${contactEmail}`, maxResults: 5,
+        });
+        const messages = list.data.messages || [];
+        if (messages.length === 0) continue;
+        const messageId = messages[0].id; // most recent inbound from this contact
+        if (!messageId) continue;
+
+        const ok = await this.forwardReply(acct, messageId, match);
+        if (ok) {
+          await query(
+            `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'reply_fwd')`,
+            [emailSendId]
+          );
+          return 'sent';
+        }
+        return 'fail';
+      } catch {
+        continue;
+      }
+    }
+    return 'notfound';
+  }
+
+  /**
+   * One-off backfill: locate the inbound reply for a thread across the active
+   * mailboxes and forward it to marcus@ if it hasn't been forwarded already.
+   */
+  async backfillThread(threadId: string): Promise<'sent' | 'skip-primary' | 'skip-done' | 'notfound' | 'fail'> {
+    const match = await this.matchReply(threadId, '');
+    if (!match) return 'notfound';
+
+    const sender = (match.sendingAccount || '').toLowerCase();
+    if (!sender || sender === PRIMARY_EMAIL.toLowerCase()) return 'skip-primary';
+
+    const already = await query<{ id: string }>(
+      `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'reply_fwd'`,
+      [match.emailSendId]
+    );
+    if (already.rows.length > 0) return 'skip-done';
+
+    const accounts = await gmailClient.getActiveAccounts();
+    for (const acct of accounts) {
+      try {
+        const auth = await gmailClient.getAuthenticatedClient(acct);
+        const gmail = google.gmail({ version: 'v1', auth });
+        let thread;
+        try {
+          thread = await gmail.users.threads.get({
+            userId: 'me', id: threadId, format: 'metadata', metadataHeaders: ['From'],
+          });
+        } catch {
+          continue; // thread not in this mailbox
+        }
+        const msgs = thread.data.messages || [];
+        let messageId = '';
+        for (const m of msgs) {
+          const from = (m.payload?.headers || []).find(h => h.name?.toLowerCase() === 'from')?.value || '';
+          if (from.toLowerCase().includes(match.contactEmail.toLowerCase())) messageId = m.id || '';
+        }
+        if (!messageId) continue;
+
+        const ok = await this.forwardReply(acct, messageId, match);
+        if (ok) {
+          await query(
+            `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'reply_fwd')`,
+            [match.emailSendId]
+          );
+          return 'sent';
+        }
+        return 'fail';
+      } catch {
+        continue;
+      }
+    }
+    return 'notfound';
   }
 }
 

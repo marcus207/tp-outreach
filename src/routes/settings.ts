@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { query } from '../db/connection';
+import { query, TENANT } from '../db/connection';
 
 const router = Router();
 
@@ -52,28 +52,42 @@ router.put('/', async (req: Request, res: Response) => {
   }
 });
 
-// DELETE /api/email-accounts/:id — disconnect Gmail account
+// DELETE /api/email-accounts/:id — delete Gmail account and related records
 router.delete('/email-accounts/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    const result = await query(
-      `UPDATE email_accounts
-       SET is_active = false, oauth_tokens = '{}', updated_at = NOW()
-       WHERE id = $1
-       RETURNING id, email`,
-      [id]
+    // Check the account exists and belongs to this tenant
+    const check = await query<{ email: string }>(
+      `SELECT email FROM email_accounts WHERE id = $1 AND tenant = $2`,
+      [id, TENANT]
     );
-
-    if (!result.rows[0]) {
+    if (!check.rows[0]) {
       res.status(404).json({ error: 'Email account not found' });
       return;
     }
+    const email = check.rows[0].email;
 
-    res.json({ success: true, email: (result.rows[0] as { email: string }).email });
+    // Soft-disconnect rather than hard-delete. A hard delete used to cascade
+    // DELETE FROM email_sends (months of send history) AND drop the account row,
+    // which on re-auth minted a NEW account id — orphaning sequences'
+    // sending_account_ids and silently halting all sends. Instead we deactivate
+    // and clear the OAuth tokens, preserving the id + history. Re-authing the
+    // same address hits ON CONFLICT (email) DO UPDATE and reactivates this exact
+    // row, so sending resumes with zero reconfiguration. (Same fix applied to
+    // li-outreach after the Jun 4 2026 Loan Intel incident.)
+    await query(
+      `UPDATE email_accounts
+         SET is_active = false, oauth_tokens = '{}'::jsonb, updated_at = NOW()
+       WHERE id = $1`,
+      [id]
+    );
+
+    console.log(`[Settings] Disconnected email account (soft, history preserved): ${email}`);
+    res.json({ success: true, email, disconnected: true });
   } catch (err) {
-    console.error('[Settings] Error disconnecting account:', err);
-    res.status(500).json({ error: 'Failed to disconnect account' });
+    console.error('[Settings] Error deleting account:', err);
+    res.status(500).json({ error: 'Failed to delete account' });
   }
 });
 
@@ -85,7 +99,9 @@ router.get('/email-accounts', async (_req: Request, res: Response) => {
               sends_today, sends_this_hour, last_send_at, is_active, created_at,
               (oauth_tokens != '{}'::jsonb) AS has_oauth
        FROM email_accounts
-       ORDER BY email`
+       WHERE tenant = $1
+       ORDER BY email`,
+      [TENANT]
     );
     res.json(result.rows);
   } catch (err) {
@@ -106,10 +122,10 @@ router.put('/email-accounts/:id', async (req: Request, res: Response) => {
         hourly_limit = COALESCE($2, hourly_limit),
         display_name = COALESCE($3, display_name),
         updated_at = NOW()
-      WHERE id = $4
+      WHERE id = $4 AND tenant = $5
       RETURNING id, email, display_name, daily_limit, hourly_limit,
                 sends_today, sends_this_hour, last_send_at, is_active`,
-      [daily_limit, hourly_limit, display_name, id]
+      [daily_limit, hourly_limit, display_name, id, TENANT]
     );
 
     if (!result.rows[0]) {
@@ -121,6 +137,57 @@ router.put('/email-accounts/:id', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[Settings] Error updating email account:', err);
     res.status(500).json({ error: 'Failed to update email account' });
+  }
+});
+
+// GET /api/settings/sequence-cadence — current delay_days for drip sequences
+router.get('/sequence-cadence', async (_req: Request, res: Response) => {
+  try {
+    const result = await query<{ delay_days: number; step_count: string }>(
+      `SELECT ss.delay_days, COUNT(*) as step_count
+       FROM sequence_steps ss
+       JOIN sequences s ON s.id = ss.sequence_id
+       WHERE s.tenant = $1 AND s.status = 'active' AND s.type = 'drip' AND ss.delay_days > 0
+       GROUP BY ss.delay_days
+       ORDER BY step_count DESC
+       LIMIT 1`,
+      [TENANT]
+    );
+    const cadence = result.rows[0]?.delay_days ?? 30;
+    res.json({ cadence_days: cadence });
+  } catch (err) {
+    console.error('[Settings] Error getting sequence cadence:', err);
+    res.status(500).json({ error: 'Failed to get sequence cadence' });
+  }
+});
+
+// PUT /api/settings/sequence-cadence — bulk-update delay_days on all active drip steps (except step 1)
+router.put('/sequence-cadence', async (req: Request, res: Response) => {
+  try {
+    const { cadence_days } = req.body;
+    const days = parseInt(cadence_days, 10);
+    if (!days || days < 1 || days > 90) {
+      res.status(400).json({ error: 'cadence_days must be between 1 and 90' });
+      return;
+    }
+
+    const result = await query(
+      `UPDATE sequence_steps ss
+       SET delay_days = $1, updated_at = NOW()
+       FROM sequences s
+       WHERE ss.sequence_id = s.id
+         AND s.tenant = $2
+         AND s.status = 'active'
+         AND s.type = 'drip'
+         AND ss.step_number > 1`,
+      [days, TENANT]
+    );
+
+    console.log(`[Settings] Updated cadence to ${days} days for ${result.rowCount} steps (tenant=${TENANT})`);
+    res.json({ success: true, cadence_days: days, steps_updated: result.rowCount });
+  } catch (err) {
+    console.error('[Settings] Error updating sequence cadence:', err);
+    res.status(500).json({ error: 'Failed to update sequence cadence' });
   }
 });
 

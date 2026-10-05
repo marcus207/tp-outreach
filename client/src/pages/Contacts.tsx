@@ -1,13 +1,14 @@
-import React, { useState, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Search, Upload, RefreshCw, Trash2, ChevronLeft, ChevronRight,
   ChevronDown, ChevronUp, Linkedin, Mail, Phone, MapPin, X,
   CheckSquare, Square, ArrowUpDown, ArrowUp, ArrowDown,
   Filter, Tag, Building2, Globe, ShieldCheck, ShieldOff,
-  UserPlus, Download, MoreHorizontal,
+  UserPlus, Download, MoreHorizontal, Users, Briefcase, Landmark,
+  HelpCircle, Sparkles, Check, ChevronRight as ChevronRightIcon,
 } from 'lucide-react';
-import { contactsApi, apolloApi, campaignsApi, Contact, Campaign } from '../lib/api';
+import { contactsApi, apolloApi, campaignsApi, Contact, Campaign, ContactBreakdown, ContactSuggestion } from '../lib/api';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,16 @@ function displayName(c: Contact) {
   const n = `${c.first_name || ''} ${c.last_name || ''}`.trim();
   return n || c.email;
 }
+
+type CategoryTab = 'all' | 'introducer' | 'client' | 'lender' | 'unclassified';
+
+const CATEGORY_META: Record<CategoryTab, { label: string; icon: React.ReactNode; color: string; bg: string }> = {
+  all:           { label: 'All Contacts', icon: <Users size={14} />,      color: 'text-[#B0BEC5]',    bg: 'bg-[#1A2A3D]' },
+  introducer:    { label: 'Introducers',  icon: <Briefcase size={14} />,  color: 'text-violet-400',   bg: 'bg-violet-500/15' },
+  client:        { label: 'Clients',      icon: <Building2 size={14} />,  color: 'text-emerald-400',  bg: 'bg-emerald-500/15' },
+  lender:        { label: 'Lenders',      icon: <Landmark size={14} />,   color: 'text-amber-400',    bg: 'bg-amber-500/15' },
+  unclassified:  { label: 'Unclassified', icon: <HelpCircle size={14} />, color: 'text-[#6B7E8F]',   bg: 'bg-[#1A2A3D]' },
+};
 
 // ── Import CSV modal ────────────────────────────────────────────────────────
 
@@ -76,6 +87,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
       const res = await contactsApi.importCsv(csv);
       setResult(res.data);
       queryClient.invalidateQueries({ queryKey: ['contacts'] });
+      queryClient.invalidateQueries({ queryKey: ['contact-breakdown'] });
     } catch (err) {
       console.error(err);
     } finally {
@@ -105,7 +117,6 @@ function ImportModal({ onClose }: { onClose: () => void }) {
             </div>
           ) : (
             <>
-              {/* Drop zone */}
               <div
                 onDrop={handleDrop}
                 onDragOver={handleDragOver}
@@ -131,11 +142,10 @@ function ImportModal({ onClose }: { onClose: () => void }) {
                 className="hidden"
                 onChange={(e) => { const f = e.target.files?.[0]; if (f) readFile(f); }}
               />
-              {/* Paste fallback */}
               <textarea
                 value={csv}
                 onChange={(e) => { setCsv(e.target.value); setFileName(''); }}
-                placeholder="…or paste CSV content here"
+                placeholder="...or paste CSV content here"
                 rows={5}
                 className="w-full bg-[#0A131E] border border-[#1A2A3D] text-[#B0BEC5] rounded px-3 py-2 text-sm
                            focus:outline-none focus:border-[#1993C5] font-mono resize-none"
@@ -153,7 +163,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
               disabled={loading || !csv.trim()}
               className="flex-1 bg-[#1993C5] hover:bg-[#1578A2] disabled:opacity-50 text-white rounded px-4 py-2 text-sm"
             >
-              {loading ? 'Importing…' : 'Import'}
+              {loading ? 'Importing...' : 'Import'}
             </button>
           )}
         </div>
@@ -232,7 +242,133 @@ function EnrollModal({ contactIds, onClose }: { contactIds: string[]; onClose: (
               disabled={loading || !selected}
               className="flex-1 bg-[#1993C5] hover:bg-[#1578A2] disabled:opacity-50 text-white rounded px-4 py-2 text-sm"
             >
-              {loading ? 'Enrolling…' : 'Enroll'}
+              {loading ? 'Enrolling...' : 'Enroll'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Assign modal ────────────────────────────────────────────────────────────
+
+function AssignModal({ contactIds, suggestion, onClose }: {
+  contactIds: string[];
+  suggestion?: { category: string; subsector: string } | null;
+  onClose: () => void;
+}) {
+  const queryClient = useQueryClient();
+  const [category, setCategory] = useState<'introducer' | 'developer' | 'lender'>(
+    suggestion?.category === 'client' ? 'developer' : suggestion?.category === 'introducer' ? 'introducer' : 'developer'
+  );
+  const [subsector, setSubsector] = useState(suggestion?.subsector || '');
+  const [loading, setLoading] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const INTRODUCER_SUBS = [
+    { key: 'accountant', label: 'Accountant' }, { key: 'advisory', label: 'Advisory' },
+    { key: 'agent', label: 'Agent' }, { key: 'construction', label: 'Construction' },
+    { key: 'lawyer', label: 'Lawyer' }, { key: 'planning_architect', label: 'Planning / Architect' },
+    { key: 'surveyor', label: 'Surveyor' }, { key: 'wealth', label: 'Wealth' },
+  ];
+  const CLIENT_SUBS = [
+    { key: 'btr', label: 'BTR' }, { key: 'care', label: 'Care' },
+    { key: 'hospitality', label: 'Hospitality' }, { key: 'leisure', label: 'Leisure' },
+    { key: 'living', label: 'Living' }, { key: 'logistics', label: 'Logistics' },
+    { key: 'office', label: 'Office' }, { key: 'pbsa', label: 'PBSA' },
+    { key: 'retail', label: 'Retail' }, { key: 'sfh', label: 'SFH' },
+  ];
+
+  const subs = category === 'introducer' ? INTRODUCER_SUBS : category === 'developer' ? CLIENT_SUBS : [];
+
+  const handleAssign = async () => {
+    setLoading(true);
+    try {
+      await contactsApi.bulkAssign(contactIds, category, subsector || undefined);
+      queryClient.invalidateQueries({ queryKey: ['contacts'] });
+      queryClient.invalidateQueries({ queryKey: ['contact-breakdown'] });
+      setDone(true);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+      <div className="bg-[#0D1B2A] border border-[#1A2A3D] rounded-xl w-full max-w-md shadow-2xl">
+        <div className="flex items-center justify-between p-5 border-b border-[#1A2A3D]">
+          <h2 className="text-[#E0E8EE] font-semibold">Assign Category</h2>
+          <button onClick={onClose} className="text-[#6B7E8F] hover:text-[#B0BEC5]"><X size={16} /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          {done ? (
+            <p className="text-emerald-400 text-sm">{contactIds.length} contact{contactIds.length !== 1 ? 's' : ''} assigned.</p>
+          ) : (
+            <>
+              <p className="text-[#6B7E8F] text-xs">Assigning {contactIds.length} contact{contactIds.length !== 1 ? 's' : ''}</p>
+
+              {/* Category selector */}
+              <div>
+                <label className="text-[#6B7E8F] text-xs font-medium uppercase tracking-wide block mb-2">Category</label>
+                <div className="flex gap-2">
+                  {([
+                    { key: 'introducer' as const, label: 'Introducer', color: 'violet' },
+                    { key: 'developer' as const, label: 'Client', color: 'emerald' },
+                    { key: 'lender' as const, label: 'Lender', color: 'amber' },
+                  ]).map(c => (
+                    <button
+                      key={c.key}
+                      onClick={() => { setCategory(c.key); setSubsector(''); }}
+                      className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                        category === c.key
+                          ? `border-${c.color}-500/50 bg-${c.color}-500/15 text-${c.color}-400`
+                          : 'border-[#1A2A3D] text-[#6B7E8F] hover:border-[#1A2A3D] hover:bg-[#1A2A3D]'
+                      }`}
+                    >
+                      {c.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Subsector selector */}
+              {subs.length > 0 && (
+                <div>
+                  <label className="text-[#6B7E8F] text-xs font-medium uppercase tracking-wide block mb-2">Subsector</label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {subs.map(s => (
+                      <button
+                        key={s.key}
+                        onClick={() => setSubsector(subsector === s.key ? '' : s.key)}
+                        className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                          subsector === s.key
+                            ? 'bg-[#1993C5]/20 text-[#74DFF6] border border-[#1993C5]/40'
+                            : 'bg-[#0A131E] text-[#6B7E8F] border border-[#1A2A3D] hover:text-[#B0BEC5]'
+                        }`}
+                      >
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        <div className="flex gap-3 p-4 border-t border-[#1A2A3D]">
+          <button onClick={onClose} className="flex-1 border border-[#1A2A3D] text-[#B0BEC5] rounded px-4 py-2 text-sm hover:bg-[#1A2A3D]">
+            {done ? 'Close' : 'Cancel'}
+          </button>
+          {!done && (
+            <button
+              onClick={handleAssign}
+              disabled={loading}
+              className="flex-1 bg-[#1993C5] hover:bg-[#1578A2] disabled:opacity-50 text-white rounded px-4 py-2 text-sm"
+            >
+              {loading ? 'Assigning...' : 'Assign'}
             </button>
           )}
         </div>
@@ -280,10 +416,40 @@ function SortHeader({ label, col, sort, dir, onSort }: {
   );
 }
 
+// ── Suggestion chip ─────────────────────────────────────────────────────────
+
+function SuggestionChip({ suggestion, onAccept }: {
+  suggestion: ContactSuggestion;
+  onAccept: () => void;
+}) {
+  const catLabel = suggestion.category === 'introducer' ? 'Introducer' : 'Client';
+  const subLabel = suggestion.subsector || '';
+  const confColor = suggestion.confidence === 'high' ? 'text-emerald-400' : suggestion.confidence === 'medium' ? 'text-amber-400' : 'text-[#6B7E8F]';
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className={`text-xs ${confColor}`}>
+        {catLabel}{subLabel ? ` / ${subLabel}` : ''}
+      </span>
+      <button
+        onClick={(e) => { e.stopPropagation(); onAccept(); }}
+        title="Accept suggestion"
+        className="p-0.5 rounded hover:bg-emerald-500/20 text-emerald-400/60 hover:text-emerald-400 transition-colors"
+      >
+        <Check size={12} />
+      </button>
+    </div>
+  );
+}
+
 // ── Main page ───────────────────────────────────────────────────────────────
 
 export default function Contacts() {
   const queryClient = useQueryClient();
+
+  // Category / subsector
+  const [activeTab, setActiveTab] = useState<CategoryTab>('all');
+  const [activeSubsector, setActiveSubsector] = useState<string>('');
 
   // Filters
   const [search, setSearch] = useState('');
@@ -305,21 +471,41 @@ export default function Contacts() {
   // Modals
   const [showImport, setShowImport] = useState(false);
   const [showEnroll, setShowEnroll] = useState(false);
+  const [showAssign, setShowAssign] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [lookingUpNames, setLookingUpNames] = useState(false);
+  const [lookupResult, setLookupResult] = useState<{ processed: number; updated: number } | null>(null);
+
+  // Suggestions for unclassified contacts
+  const [suggestions, setSuggestions] = useState<Record<string, ContactSuggestion | null>>({});
+
+  // Reset pagination when filters change
+  useEffect(() => { setPage(1); }, [activeTab, activeSubsector, search, tagFilter, sourceFilter, companyFilter]);
+
+  // Breakdown query
+  const { data: breakdown } = useQuery({
+    queryKey: ['contact-breakdown'],
+    queryFn: () => contactsApi.breakdown().then(r => r.data),
+    staleTime: 30000,
+  });
+
+  // Build list params
+  const listParams = useMemo(() => {
+    const params: Record<string, string | number | undefined> = {
+      page, limit, sort, dir,
+      search: search || undefined,
+      tag: tagFilter || undefined,
+      source: sourceFilter || undefined,
+      company: companyFilter || undefined,
+    };
+    if (activeTab !== 'all') params.category = activeTab;
+    if (activeSubsector) params.subsector = activeSubsector;
+    return params;
+  }, [activeTab, activeSubsector, search, tagFilter, sourceFilter, companyFilter, page, sort, dir]);
 
   const { data, isLoading } = useQuery({
-    queryKey: ['contacts', search, tagFilter, sourceFilter, companyFilter, page, sort, dir],
-    queryFn: () =>
-      contactsApi.list({
-        search: search || undefined,
-        tag: tagFilter || undefined,
-        source: sourceFilter || undefined,
-        company: companyFilter || undefined,
-        page,
-        limit,
-        sort,
-        dir,
-      }).then((r) => r.data),
+    queryKey: ['contacts', listParams],
+    queryFn: () => contactsApi.list(listParams as any).then((r) => r.data),
     placeholderData: (prev) => prev,
   });
 
@@ -328,11 +514,22 @@ export default function Contacts() {
     queryFn: () => contactsApi.getTags().then((r) => r.data),
   });
 
+  // Fetch suggestions when viewing unclassified contacts
+  const contacts: Contact[] = data?.data || [];
+  const total = data?.total || 0;
+  const totalPages = Math.ceil(total / limit);
+
+  useEffect(() => {
+    if (activeTab !== 'unclassified' || contacts.length === 0) return;
+    const ids = contacts.map(c => c.id);
+    contactsApi.suggest(ids).then(r => setSuggestions(r.data)).catch(() => {});
+  }, [activeTab, contacts.map(c => c.id).join(',')]);
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => contactsApi.delete(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['contacts'] });
-      setSelected((s) => { const n = new Set(s); return n; });
+      queryClient.invalidateQueries({ queryKey: ['contact-breakdown'] });
     },
   });
 
@@ -342,6 +539,7 @@ export default function Contacts() {
       await apolloApi.sync('incremental');
       setTimeout(() => {
         queryClient.invalidateQueries({ queryKey: ['contacts'] });
+        queryClient.invalidateQueries({ queryKey: ['contact-breakdown'] });
         setSyncing(false);
       }, 3000);
     } catch {
@@ -355,12 +553,7 @@ export default function Contacts() {
     setPage(1);
   };
 
-  const contacts: Contact[] = data?.data || [];
-  const total = data?.total || 0;
-  const totalPages = Math.ceil(total / limit);
-
   const allSelected = contacts.length > 0 && contacts.every((c) => selected.has(c.id));
-  const someSelected = contacts.some((c) => selected.has(c.id));
 
   const toggleAll = () => {
     if (allSelected) {
@@ -374,7 +567,6 @@ export default function Contacts() {
     setSelected((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
   };
 
-  // Active filter pills
   const activeFilters = [
     tagFilter && { key: 'tag', label: `Tag: ${tagFilter}`, clear: () => setTagFilter('') },
     sourceFilter && { key: 'source', label: `Source: ${sourceFilter}`, clear: () => setSourceFilter('') },
@@ -389,6 +581,48 @@ export default function Contacts() {
     selectedIds.forEach((id) => deleteMutation.mutate(id));
     setSelected(new Set());
   };
+
+  const handleBulkNameLookup = async () => {
+    setLookingUpNames(true);
+    setLookupResult(null);
+    try {
+      const res = await contactsApi.bulkLookupNames();
+      setLookupResult(res.data);
+      queryClient.invalidateQueries({ queryKey: ['contacts'] });
+      setTimeout(() => setLookupResult(null), 8000);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLookingUpNames(false);
+    }
+  };
+
+  const handleAcceptSuggestion = async (contactId: string, suggestion: ContactSuggestion) => {
+    const contactType = suggestion.category === 'introducer' ? 'introducer' : 'developer';
+    try {
+      await contactsApi.bulkAssign([contactId], contactType, suggestion.subsector || undefined);
+      queryClient.invalidateQueries({ queryKey: ['contacts'] });
+      queryClient.invalidateQueries({ queryKey: ['contact-breakdown'] });
+      setSuggestions(prev => { const next = { ...prev }; delete next[contactId]; return next; });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // Subsector chips for current category
+  const currentSubsectors = useMemo(() => {
+    if (!breakdown) return [];
+    if (activeTab === 'introducer') return breakdown.introducers.subsectors;
+    if (activeTab === 'client') return breakdown.clients.subsectors;
+    return [];
+  }, [breakdown, activeTab]);
+
+  const unsectoredCount = useMemo(() => {
+    if (!breakdown) return 0;
+    if (activeTab === 'introducer') return breakdown.introducers.unsectored;
+    if (activeTab === 'client') return breakdown.clients.unsectored;
+    return 0;
+  }, [breakdown, activeTab]);
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -450,7 +684,7 @@ export default function Contacts() {
             type="text"
             value={companyFilter}
             onChange={(e) => { setCompanyFilter(e.target.value); setPage(1); }}
-            placeholder="Filter by company…"
+            placeholder="Filter by company..."
             className="w-full bg-[#0D1B2A] border border-[#1A2A3D] text-[#B0BEC5] rounded px-2 py-1.5 text-xs
                        focus:outline-none focus:border-[#1993C5] placeholder-[#4A5A6D]"
           />
@@ -464,7 +698,7 @@ export default function Contacts() {
           <div className="flex items-center justify-between mb-3">
             <div>
               <h1 className="text-[#E0E8EE] text-xl font-bold">People</h1>
-              <p className="text-[#6B7E8F] text-xs mt-0.5">{total.toLocaleString()} contacts</p>
+              <p className="text-[#6B7E8F] text-xs mt-0.5">{(breakdown?.total || total).toLocaleString()} contacts</p>
             </div>
             <div className="flex gap-2">
               <button
@@ -482,8 +716,91 @@ export default function Contacts() {
                 <Upload size={12} />
                 Import CSV
               </button>
+              <button
+                onClick={handleBulkNameLookup}
+                disabled={lookingUpNames}
+                className="flex items-center gap-1.5 border border-[#1A2A3D] text-[#B0BEC5] hover:border-[#5DCAA5] hover:text-[#5DCAA5] rounded-lg px-3 py-1.5 text-xs transition-colors disabled:opacity-50"
+              >
+                <Mail size={12} className={lookingUpNames ? 'animate-pulse' : ''} />
+                {lookingUpNames ? 'Scanning Gmail...' : 'Lookup Names'}
+              </button>
             </div>
           </div>
+
+          {/* Lookup result banner */}
+          {lookupResult && (
+            <div className="mb-3 flex items-center gap-2 bg-[#5DCAA5]/10 border border-[#5DCAA5]/30 rounded-lg px-3 py-2 text-xs">
+              <Mail size={12} className="text-[#5DCAA5]" />
+              <span className="text-[#5DCAA5]">
+                Scanned {lookupResult.processed} contacts — updated {lookupResult.updated} names from Gmail
+              </span>
+              <button onClick={() => setLookupResult(null)} className="ml-auto text-[#5DCAA5]/60 hover:text-[#5DCAA5]"><X size={12} /></button>
+            </div>
+          )}
+
+          {/* ── Category tabs ── */}
+          <div className="flex gap-1.5 mb-3">
+            {(Object.keys(CATEGORY_META) as CategoryTab[]).map(tab => {
+              const meta = CATEGORY_META[tab];
+              const count = !breakdown ? '...' :
+                tab === 'all' ? breakdown.total.toLocaleString() :
+                tab === 'introducer' ? breakdown.introducers.total.toLocaleString() :
+                tab === 'client' ? breakdown.clients.total.toLocaleString() :
+                tab === 'lender' ? breakdown.lenders.total.toLocaleString() :
+                breakdown.unclassified.total.toLocaleString();
+              const isActive = activeTab === tab;
+
+              return (
+                <button
+                  key={tab}
+                  onClick={() => { setActiveTab(tab); setActiveSubsector(''); setSelected(new Set()); }}
+                  className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                    isActive
+                      ? `${meta.bg} ${meta.color} border border-current/20`
+                      : 'text-[#6B7E8F] hover:text-[#B0BEC5] hover:bg-[#1A2A3D] border border-transparent'
+                  }`}
+                >
+                  {meta.icon}
+                  <span>{meta.label}</span>
+                  <span className={`ml-1 tabular-nums ${isActive ? 'opacity-80' : 'opacity-50'}`}>{count}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* ── Subsector chips ── */}
+          {currentSubsectors.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-3">
+              <button
+                onClick={() => setActiveSubsector('')}
+                className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                  !activeSubsector
+                    ? 'bg-[#1993C5]/20 text-[#74DFF6] border border-[#1993C5]/30'
+                    : 'bg-[#0A131E] text-[#6B7E8F] border border-[#1A2A3D] hover:text-[#B0BEC5]'
+                }`}
+              >
+                All
+              </button>
+              {currentSubsectors.map(sub => (
+                <button
+                  key={sub.key}
+                  onClick={() => setActiveSubsector(activeSubsector === sub.key ? '' : sub.key)}
+                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                    activeSubsector === sub.key
+                      ? 'bg-[#1993C5]/20 text-[#74DFF6] border border-[#1993C5]/30'
+                      : 'bg-[#0A131E] text-[#6B7E8F] border border-[#1A2A3D] hover:text-[#B0BEC5]'
+                  }`}
+                >
+                  {sub.label} <span className="opacity-50 ml-0.5">{sub.count}</span>
+                </button>
+              ))}
+              {unsectoredCount > 0 && (
+                <span className="px-2.5 py-1 text-xs text-[#4A5A6D]">
+                  + {unsectoredCount.toLocaleString()} unsectored
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Search */}
           <div className="relative">
@@ -492,7 +809,7 @@ export default function Contacts() {
               type="text"
               value={search}
               onChange={(e) => { setSearch(e.target.value); setPage(1); }}
-              placeholder="Search by name, email, company, title…"
+              placeholder="Search by name, email, company, title..."
               className="w-full bg-[#0D1B2A] border border-[#1A2A3D] text-[#B0BEC5] rounded-lg pl-8 pr-3 py-2 text-sm
                          focus:outline-none focus:border-[#1993C5] placeholder-[#4A5A6D]"
             />
@@ -516,6 +833,13 @@ export default function Contacts() {
           <div className="flex-shrink-0 flex items-center gap-3 px-6 py-2.5 bg-[#1993C5]/10 border-b border-[#1993C5]/30">
             <span className="text-[#74DFF6] text-sm font-medium">{selectedCount} selected</span>
             <div className="h-4 w-px bg-[#1993C5]/30" />
+            <button
+              onClick={() => setShowAssign(true)}
+              className="flex items-center gap-1.5 text-xs text-[#B0BEC5] hover:text-violet-400 transition-colors"
+            >
+              <Sparkles size={13} />
+              Assign Category
+            </button>
             <button
               onClick={() => setShowEnroll(true)}
               className="flex items-center gap-1.5 text-xs text-[#B0BEC5] hover:text-[#74DFF6] transition-colors"
@@ -564,14 +888,16 @@ export default function Contacts() {
                 <th className="py-3 px-3 text-left">
                   <SortHeader label="Email" col="email" sort={sort} dir={dir} onSort={handleSort} />
                 </th>
-                <th className="py-3 px-3 text-left hidden lg:table-cell">
-                  <span className="text-xs uppercase tracking-wide font-semibold text-[#6B7E8F]">Phone</span>
-                </th>
+                {/* Category column — shown for All / Unclassified tabs */}
+                {(activeTab === 'all' || activeTab === 'unclassified') && (
+                  <th className="py-3 px-3 text-left">
+                    <span className="text-xs uppercase tracking-wide font-semibold text-[#6B7E8F]">
+                      {activeTab === 'unclassified' ? 'Suggestion' : 'Category'}
+                    </span>
+                  </th>
+                )}
                 <th className="py-3 px-3 text-left">
                   <span className="text-xs uppercase tracking-wide font-semibold text-[#6B7E8F]">Tags</span>
-                </th>
-                <th className="py-3 px-3 text-right">
-                  <span className="text-xs uppercase tracking-wide font-semibold text-[#6B7E8F]">Seqs</span>
                 </th>
                 <th className="py-3 px-3 w-8" />
               </tr>
@@ -579,11 +905,11 @@ export default function Contacts() {
             <tbody>
               {isLoading ? (
                 <tr>
-                  <td colSpan={10} className="py-16 text-center text-[#6B7E8F] text-sm">Loading…</td>
+                  <td colSpan={12} className="py-16 text-center text-[#6B7E8F] text-sm">Loading...</td>
                 </tr>
               ) : contacts.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-16 text-center">
+                  <td colSpan={12} className="py-16 text-center">
                     <div className="text-[#6B7E8F] text-sm">No contacts found</div>
                     {search || activeFilters.length > 0 ? (
                       <button
@@ -602,6 +928,17 @@ export default function Contacts() {
                   const isSelected = selected.has(c.id);
                   const name = displayName(c);
                   const color = avatarColor(name);
+                  const suggestion = suggestions[c.id];
+
+                  // Category badge for All view
+                  const catBadge = c.contact_type === 'introducer'
+                    ? { label: 'Introducer', cls: 'text-violet-400 bg-violet-500/10' }
+                    : c.contact_type === 'developer'
+                    ? { label: 'Client', cls: 'text-emerald-400 bg-emerald-500/10' }
+                    : c.contact_type === 'lender'
+                    ? { label: 'Lender', cls: 'text-amber-400 bg-amber-500/10' }
+                    : null;
+
                   return (
                     <tr
                       key={c.id}
@@ -641,7 +978,7 @@ export default function Contacts() {
 
                       {/* Title */}
                       <td className="px-3 py-3 max-w-[140px]">
-                        <span className="text-[#8A9BAD] text-xs truncate block">{c.title || '—'}</span>
+                        <span className="text-[#8A9BAD] text-xs truncate block">{c.title || '\u2014'}</span>
                       </td>
 
                       {/* Company */}
@@ -657,7 +994,7 @@ export default function Contacts() {
                           ) : (
                             <Building2 size={12} className="text-[#4A5A6D] flex-shrink-0" />
                           )}
-                          <span className="text-[#B0BEC5] text-sm truncate">{c.company || '—'}</span>
+                          <span className="text-[#B0BEC5] text-sm truncate">{c.company || '\u2014'}</span>
                         </div>
                       </td>
 
@@ -666,7 +1003,7 @@ export default function Contacts() {
                         <div className="flex items-center gap-1 text-[#6B7E8F] text-xs">
                           {(c.city || c.country) && <MapPin size={11} className="flex-shrink-0" />}
                           <span className="truncate max-w-[110px]">
-                            {[c.city, c.country].filter(Boolean).join(', ') || '—'}
+                            {[c.city, c.country].filter(Boolean).join(', ') || '\u2014'}
                           </span>
                         </div>
                       </td>
@@ -683,10 +1020,28 @@ export default function Contacts() {
                         </div>
                       </td>
 
-                      {/* Phone */}
-                      <td className="px-3 py-3 hidden lg:table-cell">
-                        <span className="text-[#6B7E8F] text-xs">{c.phone || '—'}</span>
-                      </td>
+                      {/* Category / Suggestion column */}
+                      {(activeTab === 'all' || activeTab === 'unclassified') && (
+                        <td className="px-3 py-3">
+                          {activeTab === 'unclassified' && suggestion ? (
+                            <SuggestionChip
+                              suggestion={suggestion}
+                              onAccept={() => handleAcceptSuggestion(c.id, suggestion)}
+                            />
+                          ) : activeTab === 'all' && catBadge ? (
+                            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${catBadge.cls}`}>
+                              {catBadge.label}
+                              {c.subsector && (
+                                <span className="opacity-60 ml-1">/ {c.subsector.replace('_', ' ')}</span>
+                              )}
+                            </span>
+                          ) : activeTab === 'all' ? (
+                            <span className="text-xs text-[#4A5A6D]">\u2014</span>
+                          ) : (
+                            <span className="text-xs text-[#4A5A6D] italic">No match</span>
+                          )}
+                        </td>
+                      )}
 
                       {/* Tags */}
                       <td className="px-3 py-3">
@@ -706,20 +1061,14 @@ export default function Contacts() {
                         </div>
                       </td>
 
-                      {/* Sequences */}
-                      <td className="px-3 py-3 text-right">
-                        <span className={`text-xs font-medium ${(c.active_sequences || 0) > 0 ? 'text-[#74DFF6]' : 'text-[#4A5A6D]'}`}>
-                          {c.active_sequences || 0}
-                        </span>
-                      </td>
-
                       {/* Actions */}
                       <td className="px-3 py-3">
                         <button
                           onClick={() => {
                             if (confirm(`Delete ${c.email}?`)) deleteMutation.mutate(c.id);
                           }}
-                          className="text-[#4A5A6D] hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                          title="Delete contact"
+                          className="text-[#4A5A6D] hover:text-red-400 transition-colors"
                         >
                           <Trash2 size={13} />
                         </button>
@@ -763,6 +1112,7 @@ export default function Contacts() {
 
       {showImport && <ImportModal onClose={() => setShowImport(false)} />}
       {showEnroll && <EnrollModal contactIds={selectedIds} onClose={() => { setShowEnroll(false); setSelected(new Set()); }} />}
+      {showAssign && <AssignModal contactIds={selectedIds} onClose={() => { setShowAssign(false); setSelected(new Set()); }} />}
     </div>
   );
 }

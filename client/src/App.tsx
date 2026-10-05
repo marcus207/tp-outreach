@@ -7,11 +7,14 @@ import {
   Users,
   FileText,
   BarChart2,
-  Link2,
   Settings,
   LogOut,
   Menu,
   X,
+  Newspaper,
+  Megaphone,
+  Shield,
+  FileCheck,
 } from 'lucide-react';
 import { authApi } from './lib/api';
 import Login from './pages/Login';
@@ -22,8 +25,11 @@ import CampaignDetail from './pages/CampaignDetail';
 import Contacts from './pages/Contacts';
 import Templates from './pages/Templates';
 import Analytics from './pages/Analytics';
-import Dripify from './pages/Dripify';
 import SettingsPage from './pages/Settings';
+import Articles from './pages/Articles';
+import PressReleases from './pages/PressReleases';
+import Deliverability from './pages/Deliverability';
+import DMARCReports from './pages/DMARCReports';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -39,8 +45,11 @@ const navItems = [
   { to: '/campaigns', label: 'Campaigns', icon: Mail },
   { to: '/contacts', label: 'Contacts', icon: Users },
   { to: '/templates', label: 'Templates', icon: FileText },
+  { to: '/articles', label: 'Articles', icon: Newspaper },
+  { to: '/press-releases', label: 'Press Releases', icon: Megaphone },
   { to: '/analytics', label: 'Analytics', icon: BarChart2 },
-  { to: '/dripify', label: 'Dripify', icon: Link2 },
+  { to: '/deliverability', label: 'Deliverability', icon: Shield },
+  { to: '/dmarc', label: 'DMARC Reports', icon: FileCheck },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -48,7 +57,7 @@ function Sidebar({ onLogout }: { onLogout: () => void }) {
   return (
     <aside className="w-56 bg-[#0D1B2A] border-r border-[#1A2A3D] flex flex-col min-h-screen">
       <div className="p-5 border-b border-[#1A2A3D]">
-        <div className="text-[#74DFF6] font-bold text-lg tracking-wide">TP.Finance</div>
+        <div className="text-[#74DFF6] font-bold text-lg tracking-wide">{import.meta.env.VITE_BRAND_NAME || 'TP.Finance'}</div>
         <div className="text-[#6B7E8F] text-xs mt-0.5">Outreach Engine</div>
       </div>
 
@@ -96,8 +105,11 @@ function AppLayout({ onLogout }: { onLogout: () => void }) {
           <Route path="/campaigns/:id" element={<CampaignDetail />} />
           <Route path="/contacts" element={<Contacts />} />
           <Route path="/templates" element={<Templates />} />
+          <Route path="/articles" element={<Articles />} />
+          <Route path="/press-releases" element={<PressReleases />} />
           <Route path="/analytics" element={<Analytics />} />
-          <Route path="/dripify" element={<Dripify />} />
+          <Route path="/deliverability" element={<Deliverability />} />
+          <Route path="/dmarc" element={<DMARCReports />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </main>

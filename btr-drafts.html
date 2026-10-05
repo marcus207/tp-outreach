@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>BTR Email Drafts — TP Outreach</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#1a1a2e;font-family:'Inter',Arial,sans-serif;color:#fff;min-height:100vh;}
+.header{background:#0f0f23;border-bottom:1px solid rgba(255,255,255,0.06);padding:20px 40px;display:flex;align-items:center;justify-content:space-between;}
+.header h1{font-size:22px;font-weight:700;letter-spacing:-0.5px;}
+.header h1 span{color:#0D9488;margin-right:8px;}
+.header .badge{background:rgba(13,148,136,0.15);color:#0D9488;font-size:12px;font-weight:600;padding:4px 12px;border-radius:20px;}
+.subtitle{color:rgba(255,255,255,0.4);font-size:13px;margin-top:4px;}
+.size-note{color:rgba(255,255,255,0.25);font-size:11px;margin-top:2px;}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;padding:40px;max-width:1400px;margin:0 auto;}
+@media(max-width:1100px){.grid{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:700px){.grid{grid-template-columns:1fr;}}
+.card{background:#16213e;border-radius:16px;overflow:hidden;cursor:pointer;transition:all 0.25s ease;border:2px solid transparent;}
+.card:hover{border-color:#0D9488;transform:translateY(-4px);box-shadow:0 12px 40px rgba(13,148,136,0.2);}
+.card-top{padding:16px 20px;display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(255,255,255,0.04);}
+.card-top .num{background:#0D9488;color:#fff;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;}
+.card-top .type{font-size:10px;color:#0D9488;font-weight:700;text-transform:uppercase;letter-spacing:1px;}
+.card-top .size{margin-left:auto;font-size:10px;color:rgba(255,255,255,0.25);font-weight:500;}
+.card-body{padding:20px;}
+.card-body .subject{font-size:14px;font-weight:600;color:#fff;margin-bottom:8px;line-height:1.3;}
+.card-body .preview{font-size:12px;color:rgba(255,255,255,0.4);line-height:1.6;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;}
+.card-footer{padding:12px 20px;border-top:1px solid rgba(255,255,255,0.04);display:flex;align-items:center;justify-content:space-between;}
+.card-footer .view-btn{color:#0D9488;font-size:12px;font-weight:600;}
+.card-footer .day{font-size:11px;color:rgba(255,255,255,0.2);}
+
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:1000;align-items:flex-start;justify-content:center;padding:40px;overflow-y:auto;}
+.modal-overlay.active{display:flex;}
+.modal-container{width:100%;max-width:660px;position:relative;}
+.modal-close{position:fixed;top:20px;right:20px;width:40px;height:40px;background:rgba(255,255,255,0.1);border:none;border-radius:50%;color:#fff;font-size:20px;cursor:pointer;z-index:1001;display:flex;align-items:center;justify-content:center;}
+.modal-close:hover{background:rgba(255,255,255,0.2);}
+.modal-nav{display:flex;justify-content:space-between;margin-bottom:16px;}
+.modal-nav button{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:#fff;padding:8px 20px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;}
+.modal-nav button:hover{background:#0D9488;border-color:#0D9488;}
+.modal-nav .counter{color:rgba(255,255,255,0.4);font-size:13px;align-self:center;}
+.email-frame{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,0.4);}
+.email-frame iframe{width:100%;height:600px;border:none;}
+.modal-meta{margin-top:16px;background:rgba(255,255,255,0.04);border-radius:8px;padding:16px 20px;display:flex;gap:24px;flex-wrap:wrap;}
+.modal-meta .meta-item{font-size:12px;}
+.modal-meta .meta-label{color:rgba(255,255,255,0.3);text-transform:uppercase;letter-spacing:0.5px;font-size:10px;margin-bottom:2px;}
+.modal-meta .meta-value{color:#fff;font-weight:500;}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1><span>BTR</span> Email Drafts</h1>
+    <div class="subtitle">Build-to-Rent — 6 lightweight emails, plain-text style</div>
+    <div class="size-note">Each email under 4 KB — no images, no tables, no spam triggers</div>
+  </div>
+  <div class="badge">6 DRAFTS</div>
+</div>
+
+<div class="grid">
+
+  <div class="card" onclick="openModal(0)">
+    <div class="card-top"><div class="num">1</div><div class="type">Intro</div><div class="size">~2 KB</div></div>
+    <div class="card-body">
+      <div class="subject">BTR debt advisory, multifamily and single-family rental</div>
+      <div class="preview">We advise BTR developers, operators and investors on debt. From urban multifamily through to suburban single-family rental, we know which lenders have appetite and how to get the best terms.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 1</div></div>
+  </div>
+
+  <div class="card" onclick="openModal(1)">
+    <div class="card-top"><div class="num">2</div><div class="type">Development</div><div class="size">~2 KB</div></div>
+    <div class="card-body">
+      <div class="subject">BTR development finance, ground-up rental schemes</div>
+      <div class="preview">BTR development finance is one of the most active areas of UK real estate lending. Whether you are building urban multifamily or suburban single-family rental, we know which lenders are writing new business.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 7</div></div>
+  </div>
+
+  <div class="card" onclick="openModal(2)">
+    <div class="card-top"><div class="num">3</div><div class="type">Investment</div><div class="size">~2 KB</div></div>
+    <div class="card-body">
+      <div class="subject">BTR investment debt, portfolio and acquisition finance</div>
+      <div class="preview">Stabilised BTR assets are commanding some of the most competitive debt terms in UK real estate. Whether you are acquiring a single scheme or building a portfolio, we can access the best pricing.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 14</div></div>
+  </div>
+
+  <div class="card" onclick="openModal(3)">
+    <div class="card-top"><div class="num">4</div><div class="type">Refinancing</div><div class="size">~2 KB</div></div>
+    <div class="card-body">
+      <div class="subject">BTR refinancing, optimising your rental portfolio debt</div>
+      <div class="preview">With BTR rental growth outperforming most other sectors, now is an excellent time to review existing debt arrangements. We are seeing several sponsors achieve material improvements.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 21</div></div>
+  </div>
+
+  <div class="card" onclick="openModal(4)">
+    <div class="card-top"><div class="num">5</div><div class="type">Market Intel</div><div class="size">~2 KB</div></div>
+    <div class="card-body">
+      <div class="subject">BTR lending market, what we are seeing right now</div>
+      <div class="preview">Build-to-rent continues to be one of the most favoured asset classes among lenders. Record institutional capital is flowing in. Margins are compressing. Regional demand is growing fast.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 28</div></div>
+  </div>
+
+  <div class="card" onclick="openModal(5)">
+    <div class="card-top"><div class="num">6</div><div class="type">Close</div><div class="size">~1 KB</div></div>
+    <div class="card-body">
+      <div class="subject">Quick call this week?</div>
+      <div class="preview">Short follow-up. Whether you have a live requirement or just want to understand what terms are available, I would be happy to have a quick conversation.</div>
+    </div>
+    <div class="card-footer"><div class="view-btn">Preview &rarr;</div><div class="day">Day 30</div></div>
+  </div>
+
+</div>
+
+<div class="modal-overlay" id="modal">
+  <button class="modal-close" onclick="closeModal()">&times;</button>
+  <div class="modal-container">
+    <div class="modal-nav">
+      <button onclick="navEmail(-1)">&larr; Previous</button>
+      <span class="counter" id="modal-counter">1 / 6</span>
+      <button onclick="navEmail(1)">Next &rarr;</button>
+    </div>
+    <div class="email-frame">
+      <iframe id="email-iframe" sandbox="allow-same-origin"></iframe>
+    </div>
+    <div class="modal-meta">
+      <div class="meta-item"><div class="meta-label">Subject</div><div class="meta-value" id="meta-subject"></div></div>
+      <div class="meta-item"><div class="meta-label">Type</div><div class="meta-value" id="meta-type"></div></div>
+      <div class="meta-item"><div class="meta-label">Schedule</div><div class="meta-value" id="meta-step"></div></div>
+      <div class="meta-item"><div class="meta-label">Size</div><div class="meta-value" id="meta-size"></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+function e(subject, body) {
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;background:#f5f5f5;font-family:Arial,sans-serif;">' +
+  '<div style="max-width:580px;margin:32px auto;background:#fff;border-radius:6px;padding:32px 36px;box-shadow:0 1px 4px rgba(0,0,0,0.08);">' +
+  '<p style="margin:0 0 20px;font-size:15px;line-height:1.75;color:#1a1a1a;">Hey {{first_name}},</p>' +
+  body +
+  '<p style="margin:28px 0 0;font-size:15px;color:#1a1a1a;">Best,</p>' +
+  '<p style="margin:4px 0 0;font-size:15px;font-weight:600;color:#1a1a1a;">Marcus Emadi</p>' +
+  '<p style="margin:2px 0 0;font-size:13px;color:#666;">Managing Director, Turning Point Capital Advisory</p>' +
+  '<p style="margin:2px 0 0;font-size:13px;color:#666;"><a href="mailto:marcus@tp.finance" style="color:#0D9488;text-decoration:none;">marcus@tp.finance</a> · <a href="https://tp.finance" style="color:#0D9488;text-decoration:none;">tp.finance</a></p>' +
+  '<div style="margin-top:24px;padding-top:16px;border-top:1px solid #eee;text-align:center;font-size:11px;color:#999;">' +
+  'Turning Point Capital Advisory Ltd · London · <a href="{{unsubscribe_url}}" style="color:#999;">Unsubscribe</a></div>' +
+  '</div></body></html>';
+}
+
+const emails = [
+  {
+    subject: 'BTR debt advisory, multifamily and single-family rental',
+    type: 'Intro / Debt Advisory',
+    step: 'Day 1',
+    size: '~2 KB',
+    html: e('BTR debt advisory',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">I am reaching out because we advise BTR developers, operators and investors on debt across the UK.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">We have deep experience in BTR finance. From single-family rental through to large-scale multifamily and suburban BTR platforms. Our clients typically work with us because we know which lenders have appetite for BTR at any given time, and we can move quickly on terms.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">Some of the areas we cover:</p>' +
+      '<ul style="margin:0 0 16px;padding-left:20px;font-size:15px;line-height:1.75;color:#1a1a1a;">' +
+      '<li>Multifamily development, senior and mezzanine for 200+ unit urban schemes</li>' +
+      '<li>Single-family rental, portfolio and development finance for suburban BTR</li>' +
+      '<li>Stabilised investment debt, competitive margins for proven occupancy</li>' +
+      '<li>Platform finance, revolving credit for BTR operators assembling at scale</li>' +
+      '</ul>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">If you have any BTR requirements in the pipeline, I would welcome a quick conversation. Free for 15 minutes?</p>'
+    )
+  },
+  {
+    subject: 'BTR development finance, ground-up rental schemes',
+    type: 'Development Finance',
+    step: 'Day 7',
+    size: '~2 KB',
+    html: e('BTR development finance',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">BTR development finance is one of the most active areas of UK real estate lending right now. Whether you are building urban multifamily or suburban single-family rental, we know which lenders are writing new business and what structures are working.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">We are currently advising on:</p>' +
+      '<ul style="margin:0 0 16px;padding-left:20px;font-size:15px;line-height:1.75;color:#1a1a1a;">' +
+      '<li>Urban multifamily, senior and stretched senior for purpose-built rental apartments</li>' +
+      '<li>Suburban BTR, single-family and townhouse schemes attracting growing lender interest</li>' +
+      '<li>Mixed-tenure developments, combining BTR with affordable and shared ownership</li>' +
+      '<li>Forward-fund structures, debt alongside institutional commitments</li>' +
+      '</ul>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">If you have any BTR developments in the pipeline, I would welcome the chance to discuss financing options. Free for a 15-minute call?</p>'
+    )
+  },
+  {
+    subject: 'BTR investment debt, portfolio and acquisition finance',
+    type: 'Investment Debt',
+    step: 'Day 14',
+    size: '~2 KB',
+    html: e('BTR investment debt',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">Stabilised BTR assets are commanding some of the most competitive debt terms in UK real estate. Banks and alternative lenders are actively competing for quality BTR income streams.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">We are advising on:</p>' +
+      '<ul style="margin:0 0 16px;padding-left:20px;font-size:15px;line-height:1.75;color:#1a1a1a;">' +
+      '<li>Multifamily portfolios, single-facility financing across multiple BTR assets</li>' +
+      '<li>Single-family rental portfolios, housing estate scale with long-term income</li>' +
+      '<li>Stabilised acquisitions, senior debt for assets with proven occupancy</li>' +
+      '<li>Platform acquisitions, combining asset debt with corporate facilities</li>' +
+      '</ul>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">If you are looking at any BTR acquisitions, I would be happy to share current pricing and lender appetite. Shall we arrange a quick call?</p>'
+    )
+  },
+  {
+    subject: 'BTR refinancing, optimising your rental portfolio debt',
+    type: 'Refinancing',
+    step: 'Day 21',
+    size: '~2 KB',
+    html: e('BTR refinancing',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">With BTR rental growth outperforming most other sectors, now is an excellent time to review existing debt arrangements. We are advising several sponsors on refinancings that are delivering material improvements in terms.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">Common scenarios we are seeing:</p>' +
+      '<ul style="margin:0 0 16px;padding-left:20px;font-size:15px;line-height:1.75;color:#1a1a1a;">' +
+      '<li>Development exit, replacing construction facilities with longer-term investment debt as schemes stabilise</li>' +
+      '<li>Equity release, refinancing at higher leverage once occupancy is proven</li>' +
+      '<li>Portfolio consolidation, merging bilateral facilities into a single arrangement</li>' +
+      '<li>Green BTR finance, sustainability-linked margins for strong EPC ratings</li>' +
+      '</ul>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">If you have any BTR assets approaching maturity or where you would like to benchmark terms, we would be glad to help. Free for a quick chat?</p>'
+    )
+  },
+  {
+    subject: 'BTR lending market, what we are seeing right now',
+    type: 'Market Intelligence',
+    step: 'Day 28',
+    size: '~2 KB',
+    html: e('BTR lending market',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">I wanted to share some observations from the BTR lending market. Build-to-rent continues to be one of the most favoured asset classes among lenders, and we are seeing some interesting dynamics.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">What we are hearing from lenders:</p>' +
+      '<ul style="margin:0 0 16px;padding-left:20px;font-size:15px;line-height:1.75;color:#1a1a1a;">' +
+      '<li>Record institutional capital. BTR is attracting more institutional money than any other UK sector. Lending appetite is following</li>' +
+      '<li>Suburban BTR is emerging. Lenders are increasingly comfortable with single-family rental. Appetite is broadening rapidly</li>' +
+      '<li>Margins are compressing. Competition for stabilised BTR is driving margins to historic lows</li>' +
+      '<li>Regional demand is growing. Manchester, Birmingham, Leeds, Edinburgh and Bristol are all active markets now</li>' +
+      '</ul>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">Happy to share more detail on a call. It may be useful context for any BTR transactions you have in the pipeline. Are you free for 15 minutes?</p>'
+    )
+  },
+  {
+    subject: 'Quick call this week?',
+    type: 'Partnership / Close',
+    step: 'Day 30',
+    size: '~1 KB',
+    html: e('Quick call',
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">I have sent a few emails over the past month about our BTR finance advisory. I appreciate your time is valuable, so I will keep this brief.</p>' +
+      '<p style="margin:0 0 16px;font-size:15px;line-height:1.75;color:#1a1a1a;">We work with developers, operators and investors across the BTR sector. From urban multifamily through to single-family rental platforms. Our clients typically come to us because they want a faster, more competitive process than going to lenders directly.</p>' +
+      '<p style="margin:0 0 0;font-size:15px;line-height:1.75;color:#1a1a1a;">If you have any live requirements or would simply like to understand what terms are available, I would be happy to have a quick conversation. Are you free for 15 minutes this week?</p>'
+    )
+  },
+];
+
+let currentIndex = 0;
+
+function openModal(i) {
+  currentIndex = i;
+  renderModal();
+  document.getElementById('modal').classList.add('active');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+  document.body.style.overflow = '';
+}
+
+function navEmail(dir) {
+  currentIndex = (currentIndex + dir + emails.length) % emails.length;
+  renderModal();
+}
+
+function renderModal() {
+  const em = emails[currentIndex];
+  document.getElementById('email-iframe').srcdoc = em.html;
+  document.getElementById('modal-counter').textContent = (currentIndex + 1) + ' / ' + emails.length;
+  document.getElementById('meta-subject').textContent = em.subject;
+  document.getElementById('meta-type').textContent = em.type;
+  document.getElementById('meta-step').textContent = em.step;
+  document.getElementById('meta-size').textContent = em.size;
+}
+
+document.addEventListener('keydown', function(ev) {
+  if (!document.getElementById('modal').classList.contains('active')) return;
+  if (ev.key === 'Escape') closeModal();
+  if (ev.key === 'ArrowLeft') navEmail(-1);
+  if (ev.key === 'ArrowRight') navEmail(1);
+});
+
+document.getElementById('modal').addEventListener('click', function(ev) {
+  if (ev.target === this) closeModal();
+});
+</script>
+
+</body>
+</html>

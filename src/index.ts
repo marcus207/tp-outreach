@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -8,7 +8,7 @@ import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
 import cors from 'cors';
 import helmet from 'helmet';
-import { pool, query } from './db/connection';
+import { pool, query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from './db/connection';
 import { requireAuth, requireApiKey } from './middleware/auth';
 import { gmailClient } from './services/gmail-client';
 import { dripifyMonitor } from './services/dripify-monitor';
@@ -20,6 +20,11 @@ import templateRoutes from './routes/templates';
 import analyticsRoutes from './routes/analytics';
 import settingsRoutes from './routes/settings';
 import digestRoutes from './routes/digest';
+import draftReviewRoutes from './routes/draft-reviews';
+import webhookRoutes from './routes/webhooks';
+import campaignPlannerRoutes from './routes/campaign-planner';
+import articleRoutes from './routes/articles';
+import pressReleaseRoutes from './routes/press-releases';
 import { digestService } from './services/digest';
 import { healthCheckService } from './services/health-check';
 
@@ -37,14 +42,18 @@ app.use(helmet({
 app.use(cors({
   origin: process.env.NODE_ENV === 'production'
     ? false
-    : ['http://localhost:5173', 'http://localhost:3100'],
+    : ['http://localhost:5173', 'http://localhost:3105'],
   credentials: true,
 }));
+
+// Webhook routes use express.raw() — MUST be registered BEFORE express.json()
+// so the raw body is available for HMAC signature verification
+app.use('/api/webhooks', express.raw({ type: '*/*', limit: '1mb' }), webhookRoutes);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Session
+// Session — use a unique table name per tenant to avoid session conflicts
 const PgSession = connectPgSimple(session);
 app.use(
   session({
@@ -66,16 +75,17 @@ app.use(
 
 // ---- Auth Routes ----
 app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { password } = req.body;
-  if (!process.env.DASHBOARD_PASSWORD) {
-    res.status(500).json({ error: 'DASHBOARD_PASSWORD not configured' });
+  const { email, password } = req.body;
+  if (!process.env.DASHBOARD_PASSWORD || !process.env.DASHBOARD_EMAIL) {
+    res.status(500).json({ error: 'Auth not configured' });
     return;
   }
-  if (password === process.env.DASHBOARD_PASSWORD) {
+  if (email === process.env.DASHBOARD_EMAIL && password === process.env.DASHBOARD_PASSWORD) {
     req.session.authenticated = true;
-    res.json({ success: true });
+    req.session.email = email;
+    res.json({ success: true, email });
   } else {
-    res.status(401).json({ error: 'Invalid password' });
+    res.status(401).json({ error: 'Invalid email or password' });
   }
 });
 
@@ -93,7 +103,7 @@ app.get('/api/auth/me', (req: Request, res: Response) => {
 app.get('/api/health', async (_req: Request, res: Response) => {
   try {
     await query('SELECT 1');
-    res.json({ ok: true, ts: new Date().toISOString() });
+    res.json({ ok: true, ts: new Date().toISOString(), tenant: TENANT });
   } catch (err) {
     res.status(503).json({ ok: false, error: (err as Error).message });
   }
@@ -125,7 +135,8 @@ app.post('/api/auth/forgot-password', async (_req: Request, res: Response) => {
 
     // Try to send via a connected Gmail account
     const accountResult = await query<{ email: string; oauth_tokens: Record<string, unknown> }>(
-      `SELECT email, oauth_tokens FROM email_accounts WHERE is_active = true LIMIT 1`
+      `SELECT email, oauth_tokens FROM email_accounts WHERE is_active = true AND tenant = $1 LIMIT 1`,
+      [TENANT]
     );
 
     if (accountResult.rows.length > 0) {
@@ -139,12 +150,12 @@ app.post('/api/auth/forgot-password', async (_req: Request, res: Response) => {
       oauth2Client.setCredentials(account.oauth_tokens as Parameters<typeof oauth2Client.setCredentials>[0]);
       const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
       const emailBody = [
-        `To: marcus@tp.finance`,
+        `To: ${BRAND_EMAIL}`,
         `From: ${account.email}`,
-        `Subject: Outreach Engine — Password Reset`,
+        `Subject: ${BRAND_NAME} Outreach — Password Reset`,
         `Content-Type: text/html; charset=utf-8`,
         ``,
-        `<p>Click the link below to reset your Outreach Engine password. This link expires in 1 hour.</p>`,
+        `<p>Click the link below to reset your ${BRAND_NAME} Outreach password. This link expires in 1 hour.</p>`,
         `<p><a href="${resetUrl}">${resetUrl}</a></p>`,
         `<p>If you did not request this, ignore this email.</p>`,
       ].join('\n');
@@ -228,17 +239,18 @@ app.get('/api/auth/gmail/callback', requireAuth, async (req: Request, res: Respo
     const { tokens, email, name } = await gmailClient.exchangeCode(code);
 
     await query(
-      `INSERT INTO email_accounts (email, display_name, oauth_tokens)
-       VALUES ($1, $2, $3)
+      `INSERT INTO email_accounts (email, display_name, oauth_tokens, tenant)
+       VALUES ($1, $2, $3, $4)
        ON CONFLICT (email) DO UPDATE SET
          oauth_tokens = $3,
          display_name = COALESCE($2, email_accounts.display_name),
+         tenant = $4,
          is_active = true,
          updated_at = NOW()`,
-      [email, name || email, JSON.stringify(tokens)]
+      [email, name || email, JSON.stringify(tokens), TENANT]
     );
 
-    console.log(`[Index] Gmail account connected: ${email}`);
+    console.log(`[Index] Gmail account connected: ${email} (tenant: ${TENANT})`);
     res.redirect('/outreach/#/settings?connected=true');
   } catch (err) {
     console.error('[Index] Gmail OAuth error:', err);
@@ -252,8 +264,8 @@ app.get('/t/:trackingId/open', async (req: Request, res: Response) => {
 
   try {
     const sendResult = await query<{ id: string; enrollment_id: string | null }>(
-      `SELECT id, enrollment_id FROM email_sends WHERE tracking_id = $1`,
-      [trackingId]
+      `SELECT id, enrollment_id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
+      [trackingId, TENANT]
     );
 
     if (sendResult.rows[0]) {
@@ -287,8 +299,8 @@ app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
 
   try {
     const sendResult = await query<{ id: string }>(
-      `SELECT id FROM email_sends WHERE tracking_id = $1`,
-      [trackingId]
+      `SELECT id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
+      [trackingId, TENANT]
     );
 
     if (sendResult.rows[0]) {
@@ -314,12 +326,25 @@ app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
+// RFC 8058 one-click unsubscribe (email client UI button)
+app.post('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
   const { trackingId } = req.params;
+
+  // RFC 8058 requires body to contain List-Unsubscribe=One-Click
+  const body = typeof req.body === 'string' ? req.body : '';
+  const formBody = req.body?.['List-Unsubscribe'] || '';
+  const isValidRfc8058 = body.includes('List-Unsubscribe=One-Click') || formBody === 'One-Click';
+
+  if (!isValidRfc8058) {
+    console.log(`[Tracking] Rejected non-RFC-8058 POST unsubscribe for ${trackingId} ua=${req.headers['user-agent']}`);
+    res.status(200).send('OK');
+    return;
+  }
+
   try {
     const sendResult = await query<{ contact_id: string }>(
-      `SELECT contact_id FROM email_sends WHERE tracking_id = $1`,
-      [trackingId]
+      `SELECT contact_id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
+      [trackingId, TENANT]
     );
     if (sendResult.rows[0]) {
       await query(
@@ -328,22 +353,125 @@ app.get('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
         [sendResult.rows[0].contact_id]
       );
       await query(
-        `INSERT INTO email_events (email_send_id, event_type)
-         SELECT id, 'unsubscribe' FROM email_sends WHERE tracking_id = $1`,
-        [trackingId]
+        `UPDATE sequence_enrollments SET status = 'cancelled', updated_at = NOW()
+         WHERE contact_id = $1 AND status = 'active' AND tenant = $2`,
+        [sendResult.rows[0].contact_id, TENANT]
+      );
+      await query(
+        `INSERT INTO email_events (email_send_id, event_type, ip_address, user_agent)
+         SELECT id, 'unsubscribe', $2, $3 FROM email_sends WHERE tracking_id = $1`,
+        [trackingId, req.ip, req.headers['user-agent'] || null]
+      );
+    }
+  } catch (err) {
+    console.error('[Tracking] Error recording one-click unsubscribe:', err);
+  }
+  res.status(200).send('OK');
+});
+
+// GET unsubscribe — show confirmation page (prevents bot/scanner false positives)
+app.get('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
+  const { trackingId } = req.params;
+  const confirmed = req.query.confirm === '1';
+
+  if (!confirmed) {
+    res.send(`<!DOCTYPE html><html><head><title>Unsubscribe</title></head>
+<body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;">
+<h2>Unsubscribe from ${BRAND_NAME}</h2>
+<p>Click the button below to confirm you'd like to stop receiving emails.</p>
+<form method="GET" action="" style="margin-top:24px;">
+<input type="hidden" name="confirm" value="1" />
+<button type="submit" style="background:#dc2626;color:#fff;border:none;padding:12px 32px;border-radius:6px;font-size:16px;cursor:pointer;">Confirm Unsubscribe</button>
+</form>
+</body></html>`);
+    return;
+  }
+
+  try {
+    const sendResult = await query<{ contact_id: string }>(
+      `SELECT contact_id FROM email_sends WHERE tracking_id = $1 AND tenant = $2`,
+      [trackingId, TENANT]
+    );
+    if (sendResult.rows[0]) {
+      await query(
+        `UPDATE contacts SET tags = array_append(tags, 'unsubscribed'), updated_at = NOW()
+         WHERE id = $1 AND NOT ('unsubscribed' = ANY(tags))`,
+        [sendResult.rows[0].contact_id]
+      );
+      await query(
+        `UPDATE sequence_enrollments SET status = 'cancelled', updated_at = NOW()
+         WHERE contact_id = $1 AND status = 'active' AND tenant = $2`,
+        [sendResult.rows[0].contact_id, TENANT]
+      );
+      await query(
+        `INSERT INTO email_events (email_send_id, event_type, ip_address, user_agent)
+         SELECT id, 'unsubscribe', $2, $3 FROM email_sends WHERE tracking_id = $1`,
+        [trackingId, req.ip, req.headers['user-agent'] || null]
       );
     }
   } catch (err) {
     console.error('[Tracking] Error recording unsubscribe:', err);
   }
-  res.send(`<!DOCTYPE html><html><head><title>Unsubscribed</title></head><body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;"><h2>You've been unsubscribed</h2><p>You will no longer receive emails from Turning Point Capital.</p></body></html>`);
+  res.send(`<!DOCTYPE html><html><head><title>Unsubscribed</title></head><body style="font-family:Arial,sans-serif;text-align:center;padding:60px;color:#333;"><h2>You've been unsubscribed</h2><p>You will no longer receive emails from ${BRAND_NAME}.</p></body></html>`);
 });
 
-// ---- Dripify Ingest Endpoint ----
+// ---- Dripify Ingest Endpoint — creates contacts in TP tenant ----
 app.post('/api/dripify/ingest', requireApiKey, async (req: Request, res: Response) => {
   try {
-    const snapshotId = await dripifyMonitor.ingestSnapshot(req.body);
-    res.json({ success: true, snapshot_id: snapshotId });
+    const payload = req.body || {};
+    const snapshotId = await dripifyMonitor.ingestSnapshot(payload);
+
+    // Dripify contacts are TP leads (LinkedIn outreach) — store in TP tenant
+    const DRIPIFY_TENANT = 'tp';
+    const email = (payload.email || payload.corporateEmail || payload.linkedInEmail || payload.manualEmail || '').toLowerCase().trim();
+    if (email) {
+      const existing = await query<{ id: string }>(
+        `SELECT id FROM contacts WHERE LOWER(email) = $1 AND tenant = $2`,
+        [email, DRIPIFY_TENANT]
+      );
+
+      if (existing.rows[0]) {
+        await query(
+          `UPDATE contacts SET
+            first_name     = COALESCE(NULLIF($1, ''), first_name),
+            last_name      = COALESCE(NULLIF($2, ''), last_name),
+            company        = COALESCE(NULLIF($3, ''), company),
+            title          = COALESCE(NULLIF($4, ''), title),
+            linkedin_url   = COALESCE(NULLIF($5, ''), linkedin_url),
+            company_domain = COALESCE(NULLIF($6, ''), company_domain),
+            phone          = COALESCE(NULLIF($7, ''), phone),
+            city           = COALESCE(NULLIF($8, ''), city),
+            country        = COALESCE(NULLIF($9, ''), country),
+            updated_at     = NOW()
+          WHERE LOWER(email) = $10 AND tenant = $11`,
+          [
+            payload.firstName || '', payload.lastName || '',
+            payload.company || '', payload.position || '',
+            payload.link || '', (payload.companyWebsite || '').replace(/^https?:\/\//, '').replace(/\/$/, ''),
+            payload.phone || '', payload.city || '',
+            payload.country || '', email, DRIPIFY_TENANT,
+          ]
+        );
+        console.log(`[Dripify] Updated existing contact: ${email}`);
+      } else {
+        await query(
+          `INSERT INTO contacts (email, first_name, last_name, company, title,
+            linkedin_url, company_domain, phone, city, country, source, tenant)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'dripify',$11)`,
+          [
+            email, payload.firstName || null, payload.lastName || null,
+            payload.company || null, payload.position || null,
+            payload.link || null,
+            (payload.companyWebsite || '').replace(/^https?:\/\//, '').replace(/\/$/, '') || null,
+            payload.phone || null, payload.city || null,
+            payload.country || null, DRIPIFY_TENANT,
+          ]
+        );
+        console.log(`[Dripify] Created new contact: ${email}`);
+      }
+    }
+
+    res.json({ success: true, snapshot_id: snapshotId, contact_email: email || null });
   } catch (err) {
     console.error('[Dripify] Error ingesting snapshot:', err);
     res.status(500).json({ error: 'Failed to ingest snapshot' });
@@ -385,7 +513,6 @@ app.put('/api/dripify/alerts/read-all', requireAuth, async (_req: Request, res: 
 app.post('/api/apollo/sync', requireAuth, async (req: Request, res: Response) => {
   const { type = 'incremental' } = req.body;
   try {
-    // Fire and forget — sync runs in background
     apolloSyncService.syncContacts(type as 'full' | 'incremental').catch((err) => {
       console.error('[Apollo] Background sync error:', err);
     });
@@ -425,7 +552,7 @@ app.get('/api/digest/:id/approve', async (req: Request, res: Response) => {
   <div style="font-size:48px">✓</div>
   <h1 style="color:#16a34a;margin:16px 0 8px">Approved!</h1>
   <p style="font-size:18px;color:#555">${count} emails queued — sending between 9am–5pm UTC today.</p>
-  <p style="margin-top:32px"><a href="/outreach/" style="color:#1a1a2e;text-decoration:none;font-weight:600">Open Outreach Platform →</a></p>
+  <p style="margin-top:32px"><a href="/outreach/" style="color:#1a1a2e;text-decoration:none;font-weight:600">Open ${BRAND_NAME} Outreach →</a></p>
 </div></body></html>`);
   } catch (err) {
     const msg = (err as Error).message;
@@ -441,10 +568,15 @@ app.use('/api/templates', requireAuth, templateRoutes);
 app.use('/api/analytics', requireAuth, analyticsRoutes);
 app.use('/api/settings', requireAuth, settingsRoutes);
 app.use('/api/digest', requireAuth, digestRoutes);
+// draft-reviews: most routes require auth, but approve/skip are public (token-validated)
+app.use('/api/draft-reviews', draftReviewRoutes);
+app.use('/api/campaign-planner', requireAuth, campaignPlannerRoutes);
+app.use('/api/articles', requireAuth, articleRoutes);
+app.use('/api/press-releases', requireAuth, pressReleaseRoutes);
 
 // Health check
 app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), tenant: TENANT });
 });
 
 // Serve built React frontend (production)
@@ -459,8 +591,8 @@ app.get('*', (req: Request, res: Response) => {
 
 // ---- Start ----
 app.listen(PORT, () => {
-  console.log(`[Index] TP.Finance Outreach Engine running on port ${PORT}`);
-  console.log(`[Index] Dashboard: https://tp.finance/outreach/`);
+  console.log(`[Index] ${BRAND_NAME} Outreach Engine running on port ${PORT} (tenant: ${TENANT})`);
+  console.log(`[Index] Dashboard: https://www.${BRAND_DOMAIN}/outreach/`);
 });
 
 export default app;

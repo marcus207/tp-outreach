@@ -1,5 +1,5 @@
 import { Queue } from 'bullmq';
-import { query } from '../db/connection';
+import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { gmailClient } from './gmail-client';
 import { templateEngine } from './template-engine';
 import { Sequence, SequenceStep, SequenceEnrollment, Contact, Template, EmailAccount } from '../types';
@@ -23,6 +23,7 @@ export class SequenceEngine {
   constructor() {
     this.stepQueue = new Queue<SequenceStepJobData>(SEQUENCE_QUEUE_NAME, {
       connection: getRedisConnection(),
+      prefix: BULL_PREFIX,
       defaultJobOptions: {
         removeOnComplete: 100,
         removeOnFail: 50,
@@ -33,19 +34,33 @@ export class SequenceEngine {
   async enrollContact(sequenceId: string, contactId: string): Promise<string> {
     console.log(`[Sequence Engine] Enrolling contact ${contactId} in sequence ${sequenceId}`);
 
-    // Check if contact has unsubscribed
-    const contactCheck = await query<{ tags: string[] }>(
-      `SELECT tags FROM contacts WHERE id = $1`,
-      [contactId]
+    // Check if contact has unsubscribed (only within this tenant)
+    const contactCheck = await query<{ tags: string[]; email: string }>(
+      `SELECT tags, email FROM contacts WHERE id = $1 AND tenant = $2`,
+      [contactId, TENANT]
     );
     if (contactCheck.rows[0]?.tags?.includes('unsubscribed')) {
       throw new Error('Contact has unsubscribed');
     }
+    if (contactCheck.rows[0]?.tags?.includes('bounced')) {
+      throw new Error('Contact email has bounced');
+    }
 
-    // Check if already enrolled
+    // Check permanent suppression list
+    if (contactCheck.rows[0]?.email) {
+      const suppressed = await query<{ id: string }>(
+        `SELECT id FROM suppressed_emails WHERE LOWER(email) = LOWER($1) AND tenant = $2 LIMIT 1`,
+        [contactCheck.rows[0].email, TENANT]
+      );
+      if (suppressed.rows.length > 0) {
+        throw new Error('Email is permanently suppressed');
+      }
+    }
+
+    // Check if already enrolled (within this tenant)
     const existing = await query<{ id: string; status: string }>(
-      `SELECT id, status FROM sequence_enrollments WHERE sequence_id = $1 AND contact_id = $2`,
-      [sequenceId, contactId]
+      `SELECT id, status FROM sequence_enrollments WHERE sequence_id = $1 AND contact_id = $2 AND tenant = $3`,
+      [sequenceId, contactId, TENANT]
     );
 
     if (existing.rows.length > 0) {
@@ -57,26 +72,24 @@ export class SequenceEngine {
       await query(
         `UPDATE sequence_enrollments
          SET status = 'active', current_step = 0, enrolled_at = NOW(),
-             completed_at = NULL, replied_at = NULL, updated_at = NOW()
+             completed_at = NULL, replied_at = NULL,
+             next_step_number = 1, next_step_due_at = NOW(),
+             updated_at = NOW()
          WHERE id = $1`,
         [enrollment.id]
       );
-      await this.scheduleStep(enrollment.id, 1, 0);
       return enrollment.id;
     }
 
-    // Create enrollment
+    // Create enrollment with tenant — planner picks up step 1 on next run
     const result = await query<{ id: string }>(
-      `INSERT INTO sequence_enrollments (sequence_id, contact_id, status, current_step)
-       VALUES ($1, $2, 'active', 0)
+      `INSERT INTO sequence_enrollments (sequence_id, contact_id, status, current_step, tenant, next_step_number, next_step_due_at)
+       VALUES ($1, $2, 'active', 0, $3, 1, NOW())
        RETURNING id`,
-      [sequenceId, contactId]
+      [sequenceId, contactId, TENANT]
     );
 
     const enrollmentId = result.rows[0].id;
-
-    // Schedule first step immediately (step_number = 1)
-    await this.scheduleStep(enrollmentId, 1, 0);
 
     console.log(`[Sequence Engine] Enrolled ${contactId} with enrollment ${enrollmentId}`);
     return enrollmentId;
@@ -87,8 +100,8 @@ export class SequenceEngine {
 
     // Fetch enrollment
     const enrollmentResult = await query<SequenceEnrollment>(
-      `SELECT * FROM sequence_enrollments WHERE id = $1`,
-      [enrollmentId]
+      `SELECT * FROM sequence_enrollments WHERE id = $1 AND tenant = $2`,
+      [enrollmentId, TENANT]
     );
 
     if (!enrollmentResult.rows[0]) {
@@ -103,10 +116,17 @@ export class SequenceEngine {
       return;
     }
 
+    // Skip if this step was already processed (prevents duplicate sends from
+    // duplicate BullMQ jobs)
+    if (enrollment.current_step >= stepNumber) {
+      console.log(`[Sequence Engine] Step ${stepNumber} already processed for enrollment ${enrollmentId} (current: ${enrollment.current_step}), skipping`);
+      return;
+    }
+
     // Fetch sequence
     const seqResult = await query<Sequence>(
-      `SELECT * FROM sequences WHERE id = $1`,
-      [enrollment.sequence_id]
+      `SELECT * FROM sequences WHERE id = $1 AND tenant = $2`,
+      [enrollment.sequence_id, TENANT]
     );
 
     if (!seqResult.rows[0] || seqResult.rows[0].status !== 'active') {
@@ -115,6 +135,15 @@ export class SequenceEngine {
     }
 
     const sequence = seqResult.rows[0];
+
+    // Check if we're within the send window — if not, reschedule
+    if (!this.isWithinSendWindow(sequence)) {
+      const nextOpen = this.adjustForWindow(new Date(), sequence);
+      const delayMs = nextOpen.getTime() - Date.now();
+      console.log(`[Sequence Engine] Outside send window for enrollment ${enrollmentId}, rescheduling step ${stepNumber} in ${Math.round(delayMs / 60000)}m`);
+      await this.scheduleStep(enrollmentId, stepNumber, Math.max(0, delayMs));
+      return;
+    }
 
     // Fetch step
     const stepResult = await query<SequenceStep>(
@@ -138,8 +167,8 @@ export class SequenceEngine {
 
     // Fetch contact
     const contactResult = await query<Contact>(
-      `SELECT * FROM contacts WHERE id = $1`,
-      [enrollment.contact_id]
+      `SELECT * FROM contacts WHERE id = $1 AND tenant = $2`,
+      [enrollment.contact_id, TENANT]
     );
 
     if (!contactResult.rows[0]) {
@@ -148,6 +177,29 @@ export class SequenceEngine {
     }
 
     const contact = contactResult.rows[0];
+
+    // Sunset policy: skip contacts with 4+ sends and zero opens
+    if (stepNumber > 1) {
+      const engagementCheck = await query<{ sent: string; opened: string }>(
+        `SELECT
+           COUNT(*) FILTER (WHERE es.status = 'sent') AS sent,
+           COUNT(DISTINCT ee.email_send_id) FILTER (WHERE ee.event_type = 'open') AS opened
+         FROM email_sends es
+         LEFT JOIN email_events ee ON ee.email_send_id = es.id AND ee.event_type = 'open'
+         WHERE es.contact_id = $1 AND es.tenant = $2`,
+        [contact.id, TENANT]
+      );
+      const sent = parseInt(engagementCheck.rows[0]?.sent || '0', 10);
+      const opened = parseInt(engagementCheck.rows[0]?.opened || '0', 10);
+      if (sent >= 6 && opened === 0) {
+        await query(
+          `UPDATE sequence_enrollments SET status = 'sunset', updated_at = NOW() WHERE id = $1`,
+          [enrollmentId]
+        );
+        console.log(`[Sequence Engine] Sunset: contact ${contact.email} has ${sent} sends, 0 opens — pausing enrollment ${enrollmentId}`);
+        return;
+      }
+    }
 
     // Determine which template to use (A/B testing)
     let templateId = step.template_id;
@@ -168,10 +220,10 @@ export class SequenceEngine {
       return;
     }
 
-    // Fetch template
+    // Fetch template (within this tenant)
     const templateResult = await query<Template>(
-      `SELECT * FROM templates WHERE id = $1`,
-      [templateId]
+      `SELECT * FROM templates WHERE id = $1 AND tenant = $2`,
+      [templateId, TENANT]
     );
 
     if (!templateResult.rows[0]) {
@@ -181,13 +233,15 @@ export class SequenceEngine {
 
     const template = templateResult.rows[0];
 
-    // Get sending account
-    const account = await gmailClient.getBestSendingAccount(
+    // Atomically reserve a sending slot (increments the account's daily/hourly
+    // counters as part of selection). Prevents a burst of steps from all
+    // passing a stale cap check before any send lands — the 24 Jun blowout.
+    const account = await gmailClient.reserveSendingAccount(
       sequence.sending_account_ids || []
     );
 
     if (!account) {
-      console.error(`[Sequence Engine] No available sending account for enrollment ${enrollmentId}`);
+      console.error(`[Sequence Engine] No available sending account (all at daily/hourly cap) for enrollment ${enrollmentId}`);
       // Retry in 1 hour
       await this.scheduleStep(enrollmentId, stepNumber, 60 * 60 * 1000);
       return;
@@ -196,22 +250,23 @@ export class SequenceEngine {
     // Render template
     const rendered = templateEngine.renderTemplate(template, contact);
 
-    // Get previous send's thread ID for reply threading
+    // Get previous send's thread ID for reply threading (same account only)
     const prevSend = await query<{ gmail_thread_id: string }>(
       `SELECT gmail_thread_id FROM email_sends
        WHERE enrollment_id = $1 AND gmail_thread_id IS NOT NULL
+         AND email_account_id = $2 AND tenant = $3
        ORDER BY created_at ASC LIMIT 1`,
-      [enrollmentId]
+      [enrollmentId, account.id, TENANT]
     );
 
     const threadId = prevSend.rows[0]?.gmail_thread_id;
 
-    // Create email_sends record
+    // Create email_sends record with tenant
     const sendResult = await query<{ id: string }>(
       `INSERT INTO email_sends (
         enrollment_id, sequence_step_id, contact_id, email_account_id, template_id,
-        to_email, from_email, subject, body_html, status, ab_variant
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10)
+        to_email, from_email, subject, body_html, status, ab_variant, tenant
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, $11)
       RETURNING id`,
       [
         enrollmentId,
@@ -224,6 +279,7 @@ export class SequenceEngine {
         rendered.subject,
         rendered.bodyHtml,
         abVariant,
+        TENANT,
       ]
     );
 
@@ -235,19 +291,18 @@ export class SequenceEngine {
       [stepNumber, enrollmentId]
     );
 
-    // Add to email send queue (with random delay)
     const { Queue: BullQueue } = await import('bullmq');
     const sendQueue = new BullQueue('email-sends', {
       connection: getRedisConnection(),
+      prefix: BULL_PREFIX,
+      defaultJobOptions: { removeOnComplete: 200, removeOnFail: 100 },
     });
 
-    const minDelay = parseInt(process.env.SEND_DELAY_MIN_SECONDS || '30', 10) * 1000;
-    const maxDelay = parseInt(process.env.SEND_DELAY_MAX_SECONDS || '120', 10) * 1000;
-    const delay = Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
+    const delay = Math.floor(Math.random() * 15000) + 5000;
 
     await sendQueue.add(
       'send-email',
-      { emailSendId, threadId, fromName: account.display_name || undefined },
+      { emailSendId, threadId, fromName: account.display_name || undefined, preCounted: true },
       { delay }
     );
 
@@ -279,14 +334,6 @@ export class SequenceEngine {
     console.log(`[Sequence Engine] Cancelling enrollment ${enrollmentId}: ${reason}`);
 
     const status = reason === 'replied' ? 'replied' : 'cancelled';
-    const updates: Record<string, unknown> = {
-      status,
-      updated_at: new Date(),
-    };
-
-    if (reason === 'replied') {
-      updates.replied_at = new Date();
-    }
 
     await query(
       `UPDATE sequence_enrollments
@@ -310,12 +357,13 @@ export class SequenceEngine {
   }
 
   async scheduleStep(enrollmentId: string, stepNumber: number, delayMs: number): Promise<void> {
+    // No jobId — deduplication happens in processStep via current_step check.
+    // Using jobId caused rescheduling failures when completed jobs blocked new ones.
     await this.stepQueue.add(
       'process-step',
       { enrollmentId, stepNumber },
       {
         delay: delayMs,
-        jobId: `enrollment-${enrollmentId}-step-${stepNumber}`,
         attempts: 3,
         backoff: { type: 'exponential', delay: 5000 },
       }
@@ -326,14 +374,34 @@ export class SequenceEngine {
   }
 
   /**
+   * Check if the current time is within the sequence's send window.
+   */
+  private isWithinSendWindow(sequence: Sequence): boolean {
+    const now = new Date();
+    const dayOfWeek = now.getUTCDay();
+
+    if (sequence.skip_weekends && (dayOfWeek === 0 || dayOfWeek === 6)) {
+      return false;
+    }
+
+    const [startH, startM] = (sequence.send_window_start || '09:00').split(':').map(Number);
+    const [endH, endM] = (sequence.send_window_end || '17:00').split(':').map(Number);
+    const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const windowStart = startH * 60 + startM;
+    const windowEnd = endH * 60 + endM;
+
+    return currentMinutes >= windowStart && currentMinutes < windowEnd;
+  }
+
+  /**
    * Adjust a scheduled time to fall within the sequence's send window.
    * Respects skip_weekends and send_window_start/end (treated as UTC).
    */
   private adjustForWindow(scheduledTime: Date, sequence: Sequence): Date {
     let dt = new Date(scheduledTime);
 
-    const [startH, startM] = (sequence.send_window_start || '08:00').split(':').map(Number);
-    const [endH, endM] = (sequence.send_window_end || '18:00').split(':').map(Number);
+    const [startH, startM] = (sequence.send_window_start || '09:00').split(':').map(Number);
+    const [endH, endM] = (sequence.send_window_end || '17:00').split(':').map(Number);
 
     const windowStartMinutes = startH * 60 + startM;
     const windowEndMinutes = endH * 60 + endM;

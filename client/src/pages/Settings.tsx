@@ -137,6 +137,7 @@ export default function Settings() {
   const [windowStart, setWindowStart] = useState('08:00');
   const [windowEnd, setWindowEnd] = useState('18:00');
   const [skipWeekends, setSkipWeekends] = useState(true);
+  const [sendGapMinutes, setSendGapMinutes] = useState('5');
   const [creditsThreshold, setCreditsThreshold] = useState('50');
   const [limitPct, setLimitPct] = useState('90');
 
@@ -144,6 +145,7 @@ export default function Settings() {
     if (settings) {
       if (settings.send_window_start) setWindowStart(settings.send_window_start as string);
       if (settings.send_window_end) setWindowEnd(settings.send_window_end as string);
+      if (settings.send_gap_minutes) setSendGapMinutes(String(settings.send_gap_minutes));
       if (settings.dripify_alert_credits_threshold) setCreditsThreshold(String(settings.dripify_alert_credits_threshold));
       if (settings.dripify_alert_limit_pct) setLimitPct(String(settings.dripify_alert_limit_pct));
     }
@@ -167,6 +169,7 @@ export default function Settings() {
         send_window_start: windowStart,
         send_window_end: windowEnd,
         skip_weekends: skipWeekends,
+        send_gap_minutes: parseInt(sendGapMinutes) || 5,
         dripify_alert_credits_threshold: parseInt(creditsThreshold),
         dripify_alert_limit_pct: parseInt(limitPct),
       };
@@ -288,6 +291,28 @@ export default function Settings() {
           />
           Skip weekends by default
         </label>
+        <div className="mt-4">
+          <label className="block text-[#6B7E8F] text-sm mb-1">Delay Between Sends (minutes)</label>
+          <div className="flex items-center gap-3">
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={sendGapMinutes}
+              onChange={(e) => setSendGapMinutes(e.target.value)}
+              className="w-24 bg-[#0A131E] border border-[#1A2A3D] text-[#B0BEC5] rounded px-3 py-2 text-sm
+                         focus:outline-none focus:border-[#1993C5]"
+            />
+            <span className="text-[#6B7E8F] text-xs">
+              {parseInt(sendGapMinutes) > 0
+                ? `~${Math.floor(60 / parseInt(sendGapMinutes))} emails/hour within send window`
+                : ''}
+            </span>
+          </div>
+          <p className="text-[#6B7E8F] text-xs mt-1">
+            Emails are only sent during the window above. Outside hours, they queue until the next window opens.
+          </p>
+        </div>
       </div>
 
       {/* Dripify Alerts */}

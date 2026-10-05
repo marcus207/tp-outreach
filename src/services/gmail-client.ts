@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
-import { query } from '../db/connection';
+import { query, TENANT, BRAND_NAME } from '../db/connection';
 import { EmailAccount, OAuthTokens } from '../types';
 
 interface SendEmailOptions {
@@ -27,6 +27,13 @@ interface GmailMessage {
   };
 }
 
+const REQUIRED_SCOPES = [
+  'https://www.googleapis.com/auth/gmail.modify',
+  'https://www.googleapis.com/auth/gmail.settings.basic',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+];
+
 export class GmailClient {
   private getOAuth2Client(): OAuth2Client {
     return new google.auth.OAuth2(
@@ -41,9 +48,7 @@ export class GmailClient {
     return oauth2Client.generateAuthUrl({
       access_type: 'offline',
       scope: [
-        'https://www.googleapis.com/auth/gmail.send',
-        'https://www.googleapis.com/auth/gmail.readonly',
-        'https://www.googleapis.com/auth/gmail.labels',
+        'https://www.googleapis.com/auth/gmail.modify',
         'https://www.googleapis.com/auth/gmail.settings.basic',
         'https://www.googleapis.com/auth/userinfo.email',
         'https://www.googleapis.com/auth/userinfo.profile',
@@ -75,7 +80,7 @@ export class GmailClient {
     };
   }
 
-  private async getAuthenticatedClient(account: EmailAccount): Promise<OAuth2Client> {
+  async getAuthenticatedClient(account: EmailAccount): Promise<OAuth2Client> {
     const oauth2Client = this.getOAuth2Client();
     oauth2Client.setCredentials(account.oauth_tokens);
 
@@ -87,6 +92,7 @@ export class GmailClient {
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token ?? account.oauth_tokens.refresh_token,
           expiry_date: tokens.expiry_date != null ? tokens.expiry_date : account.oauth_tokens.expiry_date,
+          scope: tokens.scope ?? account.oauth_tokens.scope,
         };
         await query(
           `UPDATE email_accounts SET oauth_tokens = $1, updated_at = NOW() WHERE id = $2`,
@@ -95,6 +101,17 @@ export class GmailClient {
         console.log(`[Gmail Client] Refreshed tokens for ${account.email}`);
       }
     });
+
+    // Validate stored scopes against required scopes
+    if (account.oauth_tokens.scope) {
+      const grantedScopes = account.oauth_tokens.scope.split(' ');
+      const missingScopes = REQUIRED_SCOPES.filter(s => !grantedScopes.includes(s));
+      if (missingScopes.length > 0) {
+        console.warn(`[Gmail] Account ${account.email} needs re-authorization (missing scopes: ${missingScopes.join(', ')})`);
+      }
+    } else {
+      console.warn(`[Gmail] Account ${account.email} has no stored scopes — may need re-authorization`);
+    }
 
     return oauth2Client;
   }
@@ -112,23 +129,43 @@ export class GmailClient {
 
     // Build tracking pixel URL if tracking domain configured
     const trackingDomain = process.env.TRACKING_DOMAIN || '';
+    // Deliverability: open-pixels and link-redirect wrapping are strong
+    // phishing/spam signals. Default OFF for cold outreach. Enable per-need
+    // via TRACK_OPENS / TRACK_CLICKS. Unsubscribe handling is always applied.
+    const trackOpens = process.env.TRACK_OPENS === 'true';
+    const trackClicks = process.env.TRACK_CLICKS === 'true';
     let htmlBody = options.htmlBody;
     if (options.trackingId && trackingDomain) {
-      const trackingPixel = `<img src="${trackingDomain}/t/${options.trackingId}/open" width="1" height="1" style="display:none" alt="" />`;
-      htmlBody = htmlBody + trackingPixel;
+      if (trackOpens) {
+        const trackingPixel = `<img src="${trackingDomain}/t/${options.trackingId}/open" width="1" height="1" style="display:none" alt="" />`;
+        htmlBody = htmlBody + trackingPixel;
+      }
 
-      // Rewrite links for click tracking
-      htmlBody = htmlBody.replace(/(<a\s[^>]*href=")([^"]+)(")/gi, (_match, pre, url, post) => {
-        // Skip mailto:, anchors, and already-tracked links
-        if (url.startsWith('mailto:') || url.startsWith('#') || url.includes('/t/')) {
-          return pre + url + post;
-        }
-        return pre + `${trackingDomain}/t/${options.trackingId}/click?url=${encodeURIComponent(url)}` + post;
-      });
-
-      // Append unsubscribe footer
       const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
-      htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;"><p>You're receiving this because you're a contact of Turning Point Capital.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a></p></div>`;
+
+      // Replace placeholder unsubscribe URLs from template engine
+      htmlBody = htmlBody.replace(/href="#unsubscribe"/gi, `href="${unsubscribeUrl}"`);
+      htmlBody = htmlBody.replace(/\{\{unsubscribe_url\}\}/gi, unsubscribeUrl);
+      // Fix empty href="" on unsubscribe links (from records created before template engine fix)
+      htmlBody = htmlBody.replace(/href=""([^>]*>)\s*Unsubscribe\s*<\/a>/gi, `href="${unsubscribeUrl}"$1Unsubscribe</a>`);
+
+      // Rewrite links for click tracking (off by default — redirect wrapping
+      // through the sending domain reads as phishing to spam filters).
+      if (trackClicks) {
+        htmlBody = htmlBody.replace(/(<a\s[^>]*href=")([^"]+)(")/gi, (_match, pre, url, post) => {
+          // Skip mailto:, anchors, and already-tracked links
+          if (url.startsWith('mailto:') || url.startsWith('#') || url.includes('/t/')) {
+            return pre + url + post;
+          }
+          return pre + `${trackingDomain}/t/${options.trackingId}/click?url=${encodeURIComponent(url)}` + post;
+        });
+      }
+
+      // Only append unsubscribe footer if template doesn't already have one
+      const hasUnsubscribe = htmlBody.toLowerCase().includes('unsubscribe</a>');
+      if (!hasUnsubscribe) {
+        htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;"><p>You're receiving this because you're a contact of ${BRAND_NAME}.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a></p></div>`;
+      }
     }
 
     // Build plain text body (with unsubscribe notice if tracking)
@@ -141,7 +178,12 @@ export class GmailClient {
     const messageParts = [
       `From: ${fromLine}`,
       `To: ${options.to}`,
-      `Subject: ${options.subject}`,
+      `Reply-To: Marcus Emadi <marcus@tp.finance>`,
+      `Subject: ${encodeHeaderValue(options.subject)}`,
+      ...(options.trackingId && trackingDomain ? [
+        `List-Unsubscribe: <${trackingDomain}/t/${options.trackingId}/unsubscribe>`,
+        `List-Unsubscribe-Post: List-Unsubscribe=One-Click`,
+      ] : []),
       'MIME-Version: 1.0',
       'Content-Type: multipart/alternative; boundary="boundary_tp_outreach"',
       '',
@@ -233,18 +275,19 @@ export class GmailClient {
 
   async getActiveAccounts(): Promise<EmailAccount[]> {
     const result = await query<EmailAccount>(
-      `SELECT * FROM email_accounts WHERE is_active = true ORDER BY email`
+      `SELECT * FROM email_accounts WHERE is_active = true AND tenant = $1 ORDER BY email`,
+      [TENANT]
     );
     return result.rows;
   }
 
   async getBestSendingAccount(sequenceAccountIds: string[]): Promise<EmailAccount | null> {
-    let whereClause = 'is_active = true';
-    const params: unknown[] = [];
+    const params: unknown[] = [TENANT];
+    let whereClause = `is_active = true AND tenant = $1`;
 
     if (sequenceAccountIds.length > 0) {
       params.push(sequenceAccountIds);
-      whereClause += ` AND id = ANY($1::uuid[])`;
+      whereClause += ` AND id = ANY($${params.length}::uuid[])`;
     }
 
     const result = await query<EmailAccount>(
@@ -254,6 +297,46 @@ export class GmailClient {
          AND sends_this_hour < hourly_limit
        ORDER BY sends_today ASC, last_send_at ASC NULLS FIRST
        LIMIT 1`,
+      params
+    );
+
+    return result.rows[0] || null;
+  }
+
+  /**
+   * Atomically reserve a sending slot: pick the best account under BOTH its
+   * daily and hourly caps and increment its counters in a single statement.
+   * This closes the check-then-act race in the sequence-step path — where a
+   * burst of steps (e.g. the 24 Jun backlog flush of ~18k enrollments) all
+   * read a stale sends_today≈0 via getBestSendingAccount before any actual
+   * send incremented the counter, so every one passed the cap. With the
+   * increment folded into the selection, capacity is consumed at reserve time.
+   * Returns null when no account has capacity — the caller should reschedule.
+   */
+  async reserveSendingAccount(sequenceAccountIds: string[]): Promise<EmailAccount | null> {
+    const params: unknown[] = [TENANT];
+    let filter = `is_active = true AND tenant = $1`;
+    if (sequenceAccountIds.length > 0) {
+      params.push(sequenceAccountIds);
+      filter += ` AND id = ANY($${params.length}::uuid[])`;
+    }
+
+    const result = await query<EmailAccount>(
+      `UPDATE email_accounts
+         SET sends_today = sends_today + 1,
+             sends_this_hour = sends_this_hour + 1,
+             last_send_at = NOW(),
+             updated_at = NOW()
+       WHERE id = (
+         SELECT id FROM email_accounts
+         WHERE ${filter}
+           AND sends_today < daily_limit
+           AND sends_this_hour < hourly_limit
+         ORDER BY sends_today ASC, last_send_at ASC NULLS FIRST
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING *`,
       params
     );
 
@@ -294,6 +377,15 @@ function stripHtml(html: string): string {
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+// RFC 2047 encode a header value (e.g. Subject) when it contains non-ASCII
+// characters. Without this, a raw UTF-8 byte like £ (C2 A3) in a header is
+// mis-decoded by mail clients into mojibake such as "Ã‚Â£".
+function encodeHeaderValue(value: string): string {
+  if (/^[\x00-\x7F]*$/.test(value)) return value; // pure ASCII, no encoding needed
+  const b64 = Buffer.from(value, 'utf-8').toString('base64');
+  return `=?UTF-8?B?${b64}?=`;
 }
 
 export const gmailClient = new GmailClient();

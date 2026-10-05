@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import Anthropic from '@anthropic-ai/sdk';
-import { query } from '../db/connection';
+import { query, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -199,7 +199,7 @@ class DigestService {
     if (!digest) throw new Error(`Digest ${digestId} not found`);
 
     const contacts = digest.contacts;
-    const baseUrl = process.env.TRACKING_DOMAIN || 'https://tp.finance/outreach';
+    const baseUrl = process.env.TRACKING_DOMAIN || `https://www.${BRAND_DOMAIN}/outreach`;
     const approveUrl = `${baseUrl}/api/digest/${digest.id}/approve?token=${digest.approval_token}`;
     const viewUrl   = `${baseUrl}/#/digest/${digest.id}`;
 
@@ -322,12 +322,13 @@ class DigestService {
 </body>
 </html>`;
 
-    // Send from a different connected account so it lands in marcus@tp.finance inbox
+    // Send from a different connected account so it lands in the brand email inbox
     // (Gmail suppresses self-sent emails from showing in inbox)
     const accountResult = await query<{ id: string; email: string; oauth_tokens: Record<string, unknown> }>(
       `SELECT id, email, oauth_tokens FROM email_accounts
-       WHERE email != 'marcus@tp.finance' AND is_active = true AND oauth_tokens != '{}'::jsonb
-       LIMIT 1`
+       WHERE email != $1 AND is_active = true AND oauth_tokens != '{}'::jsonb
+       LIMIT 1`,
+      [BRAND_EMAIL]
     );
 
     if (!accountResult.rows[0]) {
@@ -344,8 +345,8 @@ class DigestService {
 
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     const emailLines = [
-      `To: marcus@tp.finance`,
-      `From: TP Outreach <${account.email}>`,
+      `To: ${BRAND_EMAIL}`,
+      `From: ${BRAND_NAME} Outreach <${account.email}>`,
       `Subject: [Outreach] ${contacts.length} contacts ready — ${today}`,
       `Content-Type: text/html; charset=utf-8`,
       ``,
@@ -556,10 +557,10 @@ class DigestService {
     // The first message is the original digest — replies are everything after
     if (messages.length <= 1) return;
 
-    // Find the most recent reply FROM marcus@tp.finance that we haven't processed
+    // Find the most recent reply FROM the brand email that we haven't processed
     const replies = messages.slice(1).filter(msg => {
       const from = msg.payload?.headers?.find(h => h.name?.toLowerCase() === 'from')?.value || '';
-      return from.toLowerCase().includes('marcus@tp.finance');
+      return from.toLowerCase().includes(BRAND_EMAIL.toLowerCase());
     });
 
     if (replies.length === 0) return;
@@ -597,7 +598,7 @@ class DigestService {
       messages: [
         {
           role: 'user',
-          content: `You are helping manage email templates for a hospitality debt advisory firm. Marcus has replied to his daily digest email with editing instructions.
+          content: `You are helping manage email templates for ${BRAND_NAME}. Marcus has replied to his daily digest email with editing instructions.
 
 Here are the available templates:
 ${templateList}
@@ -657,7 +658,7 @@ Only include templates that need changing. Be specific in the editPrompt — it 
           messages: [
             {
               role: 'user',
-              content: `You are editing an HTML email template for Turning Point Capital Advisory, a hospitality debt advisory firm.
+              content: `You are editing an HTML email template for ${BRAND_NAME}.
 
 Here is the current HTML template:
 <current_html>
@@ -672,7 +673,6 @@ ${edit.editPrompt}
 Rules:
 - Return ONLY the complete, updated HTML — no explanation, no markdown code fences.
 - Preserve all inline styles and the table-based email structure.
-- Available hero images: https://tp.finance/images/sectors/hospitality.jpg, https://tp.finance/images/sectors/hotel_london.jpg, https://tp.finance/images/sectors/uk_hotel.jpg, https://tp.finance/images/sectors/product_07_stabilisation_hotels.jpg, https://tp.finance/images/stock/london_hotel.jpg
 - Keep merge fields like {{first_name}} intact.
 - Do not change anything not mentioned in the change request.`,
             },
@@ -700,8 +700,8 @@ Rules:
     const confirmText = `Got it — I've updated ${appliedEdits.length === 1 ? 'the template' : `${appliedEdits.length} templates`}:\n\n${appliedEdits.map(n => `• ${n}`).join('\n')}\n\nChanges will apply from tomorrow's digest onwards.`;
 
     const replyLines = [
-      `To: marcus@tp.finance`,
-      `From: TP Outreach <${account.email}>`,
+      `To: ${BRAND_EMAIL}`,
+      `From: ${BRAND_NAME} Outreach <${account.email}>`,
       `Subject: Re: [Outreach] Digest edits applied`,
       `In-Reply-To: ${latestReply.id}`,
       `References: ${digest.digest_gmail_thread_id}`,
