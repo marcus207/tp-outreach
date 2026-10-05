@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { query, TENANT, BRAND_NAME } from '../db/connection';
@@ -120,95 +121,19 @@ export class GmailClient {
     account: EmailAccount,
     options: SendEmailOptions
   ): Promise<SendEmailResult> {
+    const built = buildOutboundMessage(options);
+
+    // SEND_MODE switch: only SEND_MODE=live ever reaches Gmail. Prod .env sets
+    // SEND_MODE=live. Anything else is captured (tests) or refused.
+    if (process.env.SEND_MODE !== 'live') {
+      return captureNonLiveSend(account, options, built);
+    }
+
     const auth = await this.getAuthenticatedClient(account);
     const gmail = google.gmail({ version: 'v1', auth });
 
-    const fromLine = options.fromName
-      ? `"${options.fromName}" <${options.from}>`
-      : options.from;
-
-    // Build tracking pixel URL if tracking domain configured
-    const trackingDomain = process.env.TRACKING_DOMAIN || '';
-    // Deliverability: open-pixels and link-redirect wrapping are strong
-    // phishing/spam signals. Default OFF for cold outreach. Enable per-need
-    // via TRACK_OPENS / TRACK_CLICKS. Unsubscribe handling is always applied.
-    const trackOpens = process.env.TRACK_OPENS === 'true';
-    const trackClicks = process.env.TRACK_CLICKS === 'true';
-    let htmlBody = options.htmlBody;
-    if (options.trackingId && trackingDomain) {
-      if (trackOpens) {
-        const trackingPixel = `<img src="${trackingDomain}/t/${options.trackingId}/open" width="1" height="1" style="display:none" alt="" />`;
-        htmlBody = htmlBody + trackingPixel;
-      }
-
-      const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
-
-      // Replace placeholder unsubscribe URLs from template engine
-      htmlBody = htmlBody.replace(/href="#unsubscribe"/gi, `href="${unsubscribeUrl}"`);
-      htmlBody = htmlBody.replace(/\{\{unsubscribe_url\}\}/gi, unsubscribeUrl);
-      // Fix empty href="" on unsubscribe links (from records created before template engine fix)
-      htmlBody = htmlBody.replace(/href=""([^>]*>)\s*Unsubscribe\s*<\/a>/gi, `href="${unsubscribeUrl}"$1Unsubscribe</a>`);
-
-      // Rewrite links for click tracking (off by default — redirect wrapping
-      // through the sending domain reads as phishing to spam filters).
-      if (trackClicks) {
-        htmlBody = htmlBody.replace(/(<a\s[^>]*href=")([^"]+)(")/gi, (_match, pre, url, post) => {
-          // Skip mailto:, anchors, and already-tracked links
-          if (url.startsWith('mailto:') || url.startsWith('#') || url.includes('/t/')) {
-            return pre + url + post;
-          }
-          return pre + `${trackingDomain}/t/${options.trackingId}/click?url=${encodeURIComponent(url)}` + post;
-        });
-      }
-
-      // Only append unsubscribe footer if template doesn't already have one
-      const hasUnsubscribe = htmlBody.toLowerCase().includes('unsubscribe</a>');
-      if (!hasUnsubscribe) {
-        htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;"><p>You're receiving this because you're a contact of ${BRAND_NAME}.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a></p></div>`;
-      }
-    }
-
-    // Build plain text body (with unsubscribe notice if tracking)
-    let textBody = options.textBody || stripHtml(htmlBody);
-    if (options.trackingId && trackingDomain) {
-      const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
-      textBody = textBody + `\n\n---\nTo unsubscribe: ${unsubscribeUrl}`;
-    }
-
-    const messageParts = [
-      `From: ${fromLine}`,
-      `To: ${options.to}`,
-      `Reply-To: Marcus Emadi <marcus@tp.finance>`,
-      `Subject: ${encodeHeaderValue(options.subject)}`,
-      ...(options.trackingId && trackingDomain ? [
-        `List-Unsubscribe: <${trackingDomain}/t/${options.trackingId}/unsubscribe>`,
-        `List-Unsubscribe-Post: List-Unsubscribe=One-Click`,
-      ] : []),
-      'MIME-Version: 1.0',
-      'Content-Type: multipart/alternative; boundary="boundary_tp_outreach"',
-      '',
-      '--boundary_tp_outreach',
-      'Content-Type: text/plain; charset=UTF-8',
-      '',
-      textBody,
-      '',
-      '--boundary_tp_outreach',
-      'Content-Type: text/html; charset=UTF-8',
-      '',
-      htmlBody,
-      '',
-      '--boundary_tp_outreach--',
-    ];
-
-    const rawMessage = messageParts.join('\r\n');
-    const encodedMessage = Buffer.from(rawMessage)
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
     const requestBody: { raw: string; threadId?: string } = {
-      raw: encodedMessage,
+      raw: built.encodedMessage,
     };
 
     if (options.threadId) {
@@ -368,6 +293,178 @@ export class GmailClient {
     );
     console.log('[Gmail Client] Reset daily send counts');
   }
+}
+
+interface BuiltMessage {
+  fromLine: string;
+  htmlBody: string;
+  textBody: string;
+  headerLines: string[];
+  rawMessage: string;
+  encodedMessage: string;
+}
+
+/**
+ * Build the exact RFC 822 message sendEmail() hands to Gmail (tracking pixel,
+ * unsubscribe rewrite/footer, List-Unsubscribe headers, multipart body).
+ * Pure: no I/O. Shared by the live path and the non-live capture path so the
+ * test outbox sees byte-for-byte what production would send.
+ */
+function buildOutboundMessage(options: SendEmailOptions): BuiltMessage {
+  const fromLine = options.fromName
+    ? `"${options.fromName}" <${options.from}>`
+    : options.from;
+
+  // Build tracking pixel URL if tracking domain configured
+  const trackingDomain = process.env.TRACKING_DOMAIN || '';
+  // Deliverability: open-pixels and link-redirect wrapping are strong
+  // phishing/spam signals. Default OFF for cold outreach. Enable per-need
+  // via TRACK_OPENS / TRACK_CLICKS. Unsubscribe handling is always applied.
+  const trackOpens = process.env.TRACK_OPENS === 'true';
+  const trackClicks = process.env.TRACK_CLICKS === 'true';
+  let htmlBody = options.htmlBody;
+  if (options.trackingId && trackingDomain) {
+    if (trackOpens) {
+      const trackingPixel = `<img src="${trackingDomain}/t/${options.trackingId}/open" width="1" height="1" style="display:none" alt="" />`;
+      htmlBody = htmlBody + trackingPixel;
+    }
+
+    const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
+
+    // Replace placeholder unsubscribe URLs from template engine
+    htmlBody = htmlBody.replace(/href="#unsubscribe"/gi, `href="${unsubscribeUrl}"`);
+    htmlBody = htmlBody.replace(/\{\{unsubscribe_url\}\}/gi, unsubscribeUrl);
+    // Fix empty href="" on unsubscribe links (from records created before template engine fix)
+    htmlBody = htmlBody.replace(/href=""([^>]*>)\s*Unsubscribe\s*<\/a>/gi, `href="${unsubscribeUrl}"$1Unsubscribe</a>`);
+
+    // Rewrite links for click tracking (off by default — redirect wrapping
+    // through the sending domain reads as phishing to spam filters).
+    if (trackClicks) {
+      htmlBody = htmlBody.replace(/(<a\s[^>]*href=")([^"]+)(")/gi, (_match, pre, url, post) => {
+        // Skip mailto:, anchors, and already-tracked links
+        if (url.startsWith('mailto:') || url.startsWith('#') || url.includes('/t/')) {
+          return pre + url + post;
+        }
+        return pre + `${trackingDomain}/t/${options.trackingId}/click?url=${encodeURIComponent(url)}` + post;
+      });
+    }
+
+    // Only append unsubscribe footer if template doesn't already have one
+    const hasUnsubscribe = htmlBody.toLowerCase().includes('unsubscribe</a>');
+    if (!hasUnsubscribe) {
+      htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;"><p>You're receiving this because you're a contact of ${BRAND_NAME}.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a></p></div>`;
+    }
+  }
+
+  // Build plain text body (with unsubscribe notice if tracking)
+  let textBody = options.textBody || stripHtml(htmlBody);
+  if (options.trackingId && trackingDomain) {
+    const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
+    textBody = textBody + `\n\n---\nTo unsubscribe: ${unsubscribeUrl}`;
+  }
+
+  const messageParts = [
+    `From: ${fromLine}`,
+    `To: ${options.to}`,
+    `Reply-To: Marcus Emadi <marcus@tp.finance>`,
+    `Subject: ${encodeHeaderValue(options.subject)}`,
+    ...(options.trackingId && trackingDomain ? [
+      `List-Unsubscribe: <${trackingDomain}/t/${options.trackingId}/unsubscribe>`,
+      `List-Unsubscribe-Post: List-Unsubscribe=One-Click`,
+    ] : []),
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="boundary_tp_outreach"',
+    '',
+    '--boundary_tp_outreach',
+    'Content-Type: text/plain; charset=UTF-8',
+    '',
+    textBody,
+    '',
+    '--boundary_tp_outreach',
+    'Content-Type: text/html; charset=UTF-8',
+    '',
+    htmlBody,
+    '',
+    '--boundary_tp_outreach--',
+  ];
+
+  const rawMessage = messageParts.join('\r\n');
+  const encodedMessage = Buffer.from(rawMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const blank = messageParts.indexOf('');
+  const headerLines = blank >= 0 ? messageParts.slice(0, blank) : [];
+
+  return { fromLine, htmlBody, textBody, headerLines, rawMessage, encodedMessage };
+}
+
+// ── Test seams ─────────────────────────────────────────────────────────
+//
+// Every Gmail call in this codebase goes through `google.gmail({ version, auth })`
+// on the shared googleapis singleton (this file, reply-watcher, digest,
+// draft-review, health-check, dmarc-scanner, gmail-scanner, routes). Swapping
+// that one factory lets integration tests inject inbound mail (replies, DSN
+// bounces, OOO), fake getProfile, and capture forwards, with zero network I/O.
+// Refuses to run outside NODE_ENV=test, so prod can never be re-pointed.
+
+/** Shape of google.gmail; fakes only need to implement the methods a test exercises. */
+export type GmailApiFactory = (options: { version: 'v1'; auth?: unknown }) => unknown;
+
+const realGmailFactory = google.gmail;
+
+export function setGmailTransportForTests(factory: GmailApiFactory | null): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('setGmailTransportForTests() is only available under NODE_ENV=test');
+  }
+  (google as unknown as { gmail: unknown }).gmail = factory ?? realGmailFactory;
+}
+
+/**
+ * SEND_MODE != 'live'. Under NODE_ENV=test the fully-built message is written
+ * to the test-only `test_outbox` table (exists in test/schema.sql, never in
+ * prod) and a fake id pair is returned. Anywhere else it logs and throws, so a
+ * process started without SEND_MODE=live can never send.
+ */
+async function captureNonLiveSend(
+  account: EmailAccount,
+  options: SendEmailOptions,
+  built: BuiltMessage,
+): Promise<SendEmailResult> {
+  if (process.env.NODE_ENV !== 'test') {
+    console.error(
+      `[Gmail Client] SEND_MODE=${process.env.SEND_MODE ?? '(unset)'}: NOT sending to ${options.to} from ${options.from} ` +
+      `(subject "${options.subject}"). Set SEND_MODE=live to send.`
+    );
+    throw new Error('SEND_MODE is not live');
+  }
+
+  const fakeMessageId = `test-msg-${randomUUID()}`;
+  const fakeThreadId = options.threadId || `test-thread-${randomUUID()}`;
+  const headers: Record<string, string> = {};
+  for (const line of built.headerLines) {
+    const idx = line.indexOf(':');
+    if (idx > 0) headers[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  }
+
+  await query(
+    `INSERT INTO test_outbox (
+       account_id, account_email, from_header, from_email, to_email, reply_to, subject,
+       html_body, text_body, headers, raw_message, thread_id, tracking_id,
+       fake_message_id, fake_thread_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    [
+      account.id || null, account.email, built.fromLine, options.from, options.to,
+      headers['Reply-To'] || null, options.subject, built.htmlBody, built.textBody,
+      JSON.stringify(headers), built.rawMessage, options.threadId || null,
+      options.trackingId || null, fakeMessageId, fakeThreadId,
+    ]
+  );
+  console.log(`[Gmail Client] SEND_MODE=${process.env.SEND_MODE ?? '(unset)'} (test): captured ${options.from} -> ${options.to} in test_outbox`);
+
+  return { messageId: fakeMessageId, threadId: fakeThreadId };
 }
 
 function stripHtml(html: string): string {

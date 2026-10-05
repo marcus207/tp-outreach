@@ -17,21 +17,12 @@
  */
 import { Queue } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
+import { getRedisConnection } from '../db/redis';
 import { canSend, isWithinSendWindow, msUntilSendWindowCloses } from './send-gate';
 import { dailyPlanner, buildSendJobData } from './daily-planner';
 
 const MIN_SPACING_MS = 2 * 60 * 1000;
 const MAX_SPACING_MS = 5 * 60 * 1000;
-
-function getRedisConnection() {
-  const url = process.env.REDIS_URL || 'redis://localhost:6379';
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port || '6379', 10),
-    password: parsed.password || undefined,
-  };
-}
 
 interface StuckSendRow {
   id: string;

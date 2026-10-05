@@ -7,6 +7,7 @@
  */
 import { Queue } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
+import { getRedisConnection } from '../db/redis';
 import { isWithinSendWindow } from './send-gate';
 import { BROADCAST_SENDER_DOMAIN } from '../routes/articles';
 import { EmailAccount } from '../types';
@@ -15,16 +16,6 @@ import { EmailAccount } from '../types';
 // lower it hard after a deliverability hit, raise it slowly as reputation heals.
 // Recovery default is deliberately low (10/hr/account).
 const BROADCAST_HOURLY_LIMIT = parseInt(process.env.BROADCAST_HOURLY_LIMIT || '10', 10);
-
-function getRedisConnection() {
-  const url = process.env.REDIS_URL || 'redis://localhost:6379';
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port || '6379', 10),
-    password: parsed.password || undefined,
-  };
-}
 
 interface BroadcastPlanResult {
   planned: number;

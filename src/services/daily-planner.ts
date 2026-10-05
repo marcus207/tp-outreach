@@ -9,22 +9,13 @@
  */
 import { Queue } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
+import { getRedisConnection } from '../db/redis';
 import { templateEngine } from './template-engine';
 import {
   isWithinSendWindow, nextSendWindowStart, msUntilSendWindowCloses,
   isSuppressed, isInternalAddress, COLD_SENDER_DOMAIN,
 } from './send-gate';
 import { EmailAccount, Sequence, SequenceStep, Contact, Template } from '../types';
-
-function getRedisConnection() {
-  const url = process.env.REDIS_URL || 'redis://localhost:6379';
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port || '6379', 10),
-    password: parsed.password || undefined,
-  };
-}
 
 /** Max failed attempts at one step before the enrollment is cancelled. */
 const MAX_FAILED_ATTEMPTS_PER_STEP = 5;

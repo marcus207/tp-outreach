@@ -1,11 +1,12 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
+import { getRedisConnection } from '../db/redis';
 import { gmailClient } from './gmail-client';
 import { canSend } from './send-gate';
 import { dailyPlanner } from './daily-planner';
 import { EmailAccount } from '../types';
 
-interface EmailSendJobData {
+export interface EmailSendJobData {
   emailSendId: string;
   threadId?: string;
   fromName?: string;
@@ -27,16 +28,6 @@ interface EmailSendRecord {
   broadcast_id: string | null;
   contact_id: string;
   status: string;
-}
-
-function getRedisConnection() {
-  const url = process.env.REDIS_URL || 'redis://localhost:6379';
-  const parsed = new URL(url);
-  return {
-    host: parsed.hostname,
-    port: parseInt(parsed.port || '6379', 10),
-    password: parsed.password || undefined,
-  };
 }
 
 export class SendQueue {
@@ -92,7 +83,11 @@ export class SendQueue {
     console.log('[Send Queue] Worker started');
   }
 
-  private async processEmailSend(data: EmailSendJobData): Promise<void> {
+  /**
+   * Process one email-sends job payload. Public so the integration-test harness
+   * can drive the exact production send path synchronously (no BullMQ worker).
+   */
+  async processEmailSend(data: EmailSendJobData): Promise<void> {
     const { emailSendId, threadId, fromName } = data;
 
     // Centralised pre-send gate — all checks in one place (send-gate.ts)

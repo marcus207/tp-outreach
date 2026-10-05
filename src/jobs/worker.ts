@@ -20,6 +20,7 @@ import { dailyPlanner } from '../services/daily-planner';
 import { broadcastPlanner } from '../services/broadcast-planner';
 import { processScheduledArticles } from '../services/article-scheduler';
 import { dmarcScanner } from '../services/dmarc-scanner';
+import { evaluate as evaluateCircuitBreaker, isCircuitBreakerEnabled } from '../services/circuit-breaker';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { SequenceStepJobData, ApolloSyncJobData } from '../types';
 
@@ -260,6 +261,21 @@ cron.schedule('0 6 * * *', async () => {
     }
   } catch (err) {
     console.error('[Worker Cron] DMARC scan error:', (err as Error).message);
+  }
+});
+
+// Every 15 minutes: outreach circuit breaker (tp only). Zeroes account limits on
+// high bounce / unsubscribe / infra-failure rates or auth errors; never raises them.
+// Enabled unless CIRCUIT_BREAKER_ENABLED=false.
+cron.schedule('*/15 * * * *', async () => {
+  if (TENANT !== 'tp' || !isCircuitBreakerEnabled()) return;
+  try {
+    const result = await evaluateCircuitBreaker();
+    if (result.trips.length > 0) {
+      console.warn(`[Worker Cron] Circuit breaker: ${result.trips.length} trip(s); zeroed=[${result.accountsZeroed.join(', ')}] alerts=[${result.alertsSent.join(', ')}]`);
+    }
+  } catch (err) {
+    console.error('[Worker Cron] Circuit breaker error:', (err as Error).message);
   }
 });
 

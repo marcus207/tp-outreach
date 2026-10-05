@@ -28,7 +28,7 @@ import pressReleaseRoutes from './routes/press-releases';
 import { digestService } from './services/digest';
 import { healthCheckService } from './services/health-check';
 
-const app = express();
+export const app = express();
 const PORT = parseInt(process.env.PORT || '3105', 10);
 
 // Trust nginx proxy so secure cookies work over HTTPS
@@ -798,9 +798,14 @@ app.get('*', (req: Request, res: Response) => {
 });
 
 // ---- Start ----
-app.listen(PORT, () => {
-  console.log(`[Index] ${BRAND_NAME} Outreach Engine running on port ${PORT} (tenant: ${TENANT})`);
-  console.log(`[Index] Dashboard: https://www.${BRAND_DOMAIN}/outreach/`);
-});
+// Listen unless imported by the test harness (supertest drives `app` directly).
+// Prod runs `tsx src/index.ts` with NODE_ENV=production, so this always listens there.
+const isEntrypoint = typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module;
+if (process.env.NODE_ENV !== 'test' || isEntrypoint) {
+  app.listen(PORT, () => {
+    console.log(`[Index] ${BRAND_NAME} Outreach Engine running on port ${PORT} (tenant: ${TENANT})`);
+    console.log(`[Index] Dashboard: https://www.${BRAND_DOMAIN}/outreach/`);
+  });
+}
 
 export default app;
