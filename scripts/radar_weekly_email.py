@@ -569,10 +569,18 @@ def card_fields(c, radar, allow_check):
     ev = ", ".join(c["evidence"][:4]) or "-"
     if c.get("sic_note"):
         ev += "; " + c["sic_note"]
+    cls_txt = f"{c['cls']} ({ev})"
+    ident = c.get("asset_id") or {}
+    from asset_profile import PRIMARY_CARE
+    if c["cls"] == "Care" and (ident.get("sector") == "primary care / medical centres"
+                               or any(PRIMARY_CARE.search(p or "") for p in c.get("parents") or [])):
+        cls_txt = f"Primary care / medical centres, not Care (radar class was Care: {ev})"
+    if ident.get("outside_uk") and ident.get("confidence") in ("likely", "possible"):
+        cls_txt += f"; Outside UK ({ident.get('country')}): UK data sources do not cover the asset"
     return [
         *asset_fields(c),
         ("Parent / PSC", parent),
-        ("Asset class", f"{c['cls']} ({ev})"),
+        ("Asset class", cls_txt),
         ("Charges", f"{c['n']} in window, {c['n_total']} outstanding in total; {shown}"),
         ("Lender(s)", lenders),
         ("Property charged", property_line(pi, with_link=False), prop_link,
@@ -598,7 +606,9 @@ def build(radar, top, distress, credit, wc):
               "accounts on Companies House (bank borrowings preferred, else creditors due after one "
               "year, labelled); candidates whose accounts show under £10m are excluded, and PDF-only "
               "accounts are shown as not available. Property charged is taken from the charge "
-              "particulars; where the charge is an all-assets debenture the property is not stated. "
+              "particulars; where the charge is an all-assets debenture the property is not stated, and the "
+              "asset is inferred from current and former owners (Companies House), timing and dated public "
+              "news, shown as Likely or Possible with its evidence; capacity only where a source states it. "
               "LinkedIn links come from public web search "
               "and are marked likely, not confirmed. Director work emails are from Apollo: only "
               "'verified' emails are usable; nothing here is added to contacts or sequences. "
@@ -686,9 +696,9 @@ _PC = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.I)
 def asset_profiles(top):
     """What each charged asset is and how big (beds / rooms / units / sq ft), via
     scripts/asset_profile.py. Never raises; a failed profile shows as unknown."""
-    st = {"ok": 0, "errors": 0}
+    st = {"ok": 0, "errors": 0, "debenture": 0, "identified": 0}
     try:
-        from asset_profile import build_asset_profile
+        from asset_profile import build_asset_profile, identify_by_ownership
     except Exception as ex:
         log(f"asset profile unavailable: {type(ex).__name__}")
         st["errors"] = len(top)
@@ -708,6 +718,17 @@ def asset_profiles(top):
             c["asset"] = None
             st["errors"] += 1
             log(f"asset profile failed for {c['company_number']}: {type(ex).__name__}")
+        if pi.get("generic"):
+            # debenture / no property address: ownership-and-news identification
+            st["debenture"] += 1
+            try:
+                c["asset_id"] = identify_by_ownership(c["company_number"], c.get("name") or "", c.get("cls") or "",
+                                                      charge_dates=c.get("dates"), lenders=c.get("lenders"))
+                c["asset_id"].pop("facts", None)
+                st["identified"] += c["asset_id"].get("confidence") in ("likely", "possible")
+            except Exception as ex:
+                c["asset_id"] = None
+                log(f"asset identification failed for {c['company_number']}: {type(ex).__name__}")
     return st
 
 
@@ -719,9 +740,25 @@ def asset_fields(c):
     known_cap = cap.get("value") not in (None, "unknown")
     names = [x for x in (a.get("brand"), a.get("operator")) if x and x != "unknown"]
     names = list(dict.fromkeys(names))
-    if not known_cap and not names and pi.get("generic"):
-        return [("The asset", "Not identified yet: the charge is a general debenture with no "
-                              "property address (Land Registry ownership data will fill this in)")]
+    if pi.get("generic"):
+        from asset_profile import ownership_line
+        ident = c.get("asset_id") or {}
+        line = ownership_line(ident)
+        if line:
+            out = [("The asset", line)]
+            ev = [{**b, "text": b["text"] if len(b["text"]) <= 170 else b["text"][:167].rsplit(" ", 1)[0] + "..."}
+                  for b in ident.get("evidence") or [] if b.get("url")][:3]
+            if ev:
+                out.append(("Evidence", "; ".join(f"{b['text']} [{b['url']}]" for b in ev), None, None,
+                            "<br>".join(f'&bull; {e(b["text"])} <a href="{html.escape(b["url"])}" '
+                                        f'style="color:#1f3a5f">[source]</a>' for b in ev)))
+            if known_cap and cap.get("source", "").startswith(("CQC", "GIAS")):
+                out.append(("Capacity (regulator)", f"{cap.get('value')} {cap.get('metric') or ''}".strip()
+                            + f" (source: {cap['source']})"))
+            return out
+        if not known_cap and not names:
+            return [("The asset", "Not identified yet: the charge is a general debenture with no "
+                                  "property address (Land Registry data would confirm)")]
     out = []
     if a.get("summary") and (known_cap or names or not pi.get("generic")):
         out.append(("The asset", a["summary"]))
@@ -775,7 +812,8 @@ def main():
         + ("" if ap["enabled"] else " (no API key)"))
 
     prof = asset_profiles(top)
-    log(f"asset profiles: {prof['ok']}/{len(top)} with capacity, errors {prof['errors']}")
+    log(f"asset profiles: {prof['ok']}/{len(top)} with capacity, errors {prof['errors']}; debenture "
+        f"cards identified by ownership/news {prof['identified']}/{prof['debenture']}")
 
     credit, st = enrich(top, enabled=not a.no_credit)
     log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "

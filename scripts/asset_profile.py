@@ -66,7 +66,7 @@ import urllib.parse
 import urllib.robotparser
 import zipfile
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -762,7 +762,8 @@ def brave(query: str, count=8) -> dict:
     if code != 200 or not body:
         return {"status": UNAVAILABLE, "results": [], "http": code}
     res = [{"title": r.get("title"), "url": r.get("url"),
-            "snippet": re.sub(r"<[^>]+>", "", " ".join([r.get("description") or ""] + (r.get("extra_snippets") or [])))}
+            "snippet": re.sub(r"<[^>]+>", "", " ".join([r.get("description") or ""] + (r.get("extra_snippets") or []))),
+            "date": (r.get("page_age") or "")[:10] or None}
            for r in (body.get("web") or {}).get("results", [])]
     return {"status": OK if res else NOT_FOUND, "results": res}
 
@@ -1172,6 +1173,397 @@ def build_asset_profile(address: str | None, postcode: str | None, company_numbe
     return prof
 
 
+# ---------------------------------------------------------------- ownership-and-news identification
+# For debenture / no-address candidates: what does this SPV most likely own? Reasons over
+# Companies House ownership (current AND ceased PSCs, their parents, previous names), timing
+# (incorporation, charge date) and dated public news, then asks Claude to name the asset ONLY
+# when independent signals agree. Public data only; capacity only when quoted in a source.
+
+OWN_MAX_QUERIES = 6
+UK_COUNTRIES = {"united kingdom", "uk", "england", "wales", "scotland", "northern ireland", "great britain"}
+ASSET_WORDS = {"Hotels": "hotel", "Care": "care home", "SEN": "school", "Living": "apartments",
+               "Offices": "office", "Logistics/Industrial": "warehouse", "Retail/Leisure": "retail park"}
+SIC_WORDS = [(r"^551", "hotel"), (r"^871|^873", "care home"), (r"^86", "healthcare"), (r"^8559|^852|^851", "school"),
+             (r"^5590", "student accommodation")]
+_LEGAL = re.compile(r"\s*\b(limited|ltd\.?|plc|llp|l\.?p\.?|s\.?a\.?r\.?l\.?|b\.?v\.?|inc\.?)\s*$", re.I)
+PRIMARY_CARE = re.compile(r"primary\s+(health|care)|medical cent|health cent|\bGP\b|surger(y|ies)|"
+                          r"Assura|Primary Health Properties|\bPHP\b", re.I)
+SECTORS = {"hotel", "care home", "primary care / medical centres", "hospital / clinic", "school",
+           "student accommodation", "build to rent / residential", "co-living", "office", "industrial / logistics",
+           "retail / leisure", "mixed / portfolio", "other"}
+
+
+def _clean_owner(n: str) -> str:
+    n = re.sub(r"\s+", " ", (n or "").strip())
+    for _ in range(2):
+        n = _LEGAL.sub("", n).strip(" ,.")
+    n = re.sub(r"\s*\([^)]*\)", "", n)
+    for _ in range(2):
+        n = re.sub(r"\s+\b(UK|holdings?|group|bidco|topco|midco|newco|propco|opco)\b\.?$", "", n, flags=re.I).strip(" ,.")
+    return n
+
+
+def _is_uk_reg(ident: dict) -> bool:
+    txt = " ".join(str(ident.get(k) or "") for k in ("country_registered", "place_registered", "legal_authority")).lower()
+    return bool(ident.get("registration_number")) and bool(
+        re.search(r"united kingdom|england|wales|scotland|companies house|uk register|companies act", txt))
+
+
+def ch_ownership_facts(company_number: str, charge_dates=None, lenders=None, ch=None) -> dict:
+    """Companies House facts used for identification. Cached by maturity_radar.CH (6 days)."""
+    if ch is None:
+        from maturity_radar import CH
+        ch = CH()
+    cn = company_number
+    p = ch.get(f"/company/{cn}") or {}
+    ps = ch.get(f"/company/{cn}/persons-with-significant-control?items_per_page=100") or {}
+    psc = [{"name": x.get("name"), "kind": (x.get("kind") or "").replace("-person-with-significant-control", ""),
+            "notified_on": x.get("notified_on"), "ceased_on": x.get("ceased_on"),
+            "registration_number": (x.get("identification") or {}).get("registration_number"),
+            "country_registered": (x.get("identification") or {}).get("country_registered"),
+            "_uk": _is_uk_reg(x.get("identification") or {})}
+           for x in ps.get("items") or []]
+    # walk up the ownership chain for UK-registered corporate owners (current first, then ceased;
+    # up to 2 levels, max 5 extra CH calls)
+    parents_up = []
+    corp = [x for x in psc if "corporate" in x["kind"] or "legal-person" in x["kind"]]
+    frontier = [(x["name"], x["registration_number"], x["_uk"], 1)
+                for x in sorted(corp, key=lambda x: bool(x["ceased_on"]))]
+    calls, done = 0, set()
+    while frontier and calls < 5:
+        nm, reg, uk, depth = frontier.pop(0)
+        if not (uk and reg) or depth > 2:
+            continue
+        rn = re.sub(r"\s", "", reg).upper().zfill(8)
+        if rn in done:
+            continue
+        done.add(rn)
+        calls += 1
+        up = ch.get(f"/company/{rn}/persons-with-significant-control?items_per_page=100") or {}
+        for y in up.get("items") or []:
+            if "corporate" in (y.get("kind") or "") or "legal-person" in (y.get("kind") or ""):
+                idf = y.get("identification") or {}
+                parents_up.append({"name": y.get("name"), "owner_of": nm, "level": depth + 1,
+                                   "ceased_on": y.get("ceased_on"), "country_registered": idf.get("country_registered")})
+                frontier.append((y.get("name"), idf.get("registration_number"), _is_uk_reg(idf), depth + 1))
+    ch_items = []
+    d = ch.get(f"/company/{cn}/charges?items_per_page=100") or {}
+    want = set(charge_dates or [])
+    for i in d.get("items") or []:
+        if want and i.get("created_on") not in want:
+            continue
+        if not want and i.get("status") != "outstanding":
+            continue
+        ch_items.append({"created_on": i.get("created_on"), "status": i.get("status"),
+                         "persons_entitled": [x.get("name") for x in i.get("persons_entitled") or []],
+                         "particulars": ((i.get("particulars") or {}).get("description") or "")[:300]})
+    ro = p.get("registered_office_address") or {}
+    for x in psc:
+        x.pop("_uk", None)
+    return {
+        "company_number": cn, "company_name": p.get("company_name"), "incorporated": p.get("date_of_creation"),
+        "status": p.get("company_status"), "sic_codes": p.get("sic_codes") or [],
+        "registered_office": ", ".join(str(ro.get(k)) for k in ("premises", "address_line_1", "address_line_2",
+                                                                 "locality", "region", "postal_code", "country") if ro.get(k)),
+        "registered_office_locality": ro.get("locality"),
+        "previous_company_names": [{"name": x.get("name"), "from": x.get("effective_from"), "to": x.get("ceased_on")}
+                                   for x in p.get("previous_company_names") or []],
+        "pscs_including_ceased": psc, "owners_of_corporate_pscs": parents_up,
+        "qualifying_charges": ch_items or [{"created_on": dd, "persons_entitled": lenders or []} for dd in sorted(want)],
+        "last_accounts_type": ((p.get("accounts") or {}).get("last_accounts") or {}).get("type"),
+    }
+
+
+def _asset_word(asset_class: str, sic_codes) -> str:
+    for s in sic_codes or []:
+        for pat, w in SIC_WORDS:
+            if re.match(pat, s):
+                return w
+    return ASSET_WORDS.get(asset_class, "property")
+
+
+def _ddate(s):
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+OWN_SYS = """You are a property-finance analyst identifying which specific real estate asset(s) a UK company (an SPV that
+granted a general debenture with no property address) most likely owns. You get Companies House facts (name,
+incorporation date, SIC codes, registered office, ALL persons with significant control INCLUDING CEASED ones, owners of
+those corporate PSCs, previous names, the qualifying charge date and lender) and web search results (title, url,
+snippet, page date) plus some page passages.
+
+Identify an asset ONLY if multiple independent signals agree:
+  (a) an ownership link: a source names a current/former PSC, a PSC's owner, the company itself, or a previous name as the
+      buyer/owner/developer/operator of the asset;
+  (b) timing consistent: acquisition/development announced around incorporation or within ~12 months before the charge;
+  (c) location consistent with company name, registered office or the sources;
+  (d) asset class consistent with the SIC codes / company name.
+confidence "likely" = (a) plus at least two of (b),(c),(d), with no contradicting signal. "possible" = (a) plus one other
+signal, or strong (b)+(c)+(d) with only an indirect ownership link. Otherwise "none" and asset_name null.
+A newly incorporated SPV usually holds an asset acquired or developed around its incorporation date and financed by
+the qualifying charge; prefer that asset over assets the group has held for many years (those sit in older companies).
+Ultimate parents may be foreign (e.g. a sovereign or listed group) and are often known in the press by a short name or
+acronym; a press release by the group naming the acquisition counts as the ownership link.
+If the owner is a large multi-asset group (listed REIT, fund, operator with many sites), the group buying an asset is NOT
+by itself an ownership link to this SPV: there must be something tying the asset to THIS company (its name, previous
+name, incorporation timing, or a source naming the company). Company-data aggregator profiles (pomanda, endole,
+companycheck, globaldatabase, bloomberg/pitchbook profiles) merely restate Companies House and are not independent signals,
+except where they report a dated transaction. If the sources show the company is an operating business (e.g. home care /
+domiciliary care, services) rather than a property owner, return confidence "none".
+Always return sector (your best reading of what the company's business is) and country even when confidence is "none".
+The asset may be a portfolio (e.g. "portfolio of 12 care homes") if the sources say so; name the portfolio as the sources do.
+Never invent capacity: capacity only if a number with its unit (rooms, beds, units, apartments, homes, properties, sq ft)
+appears verbatim in a supplied snippet or passage about THIS asset; copy that text into capacity.quote exactly and give its url.
+Otherwise capacity null. Do not use chain totals or group-wide figures as the asset's capacity unless the asset IS the group portfolio.
+sector must be one of: hotel, care home, primary care / medical centres, hospital / clinic, school, student accommodation,
+build to rent / residential, co-living, office, industrial / logistics, retail / leisure, mixed / portfolio, other.
+GP surgeries, primary care centres and medical centres are "primary care / medical centres", NOT "care home".
+country = the country where the asset is located (e.g. "England", "Ireland"); null if unknown.
+evidence: 2 to 4 short bullets, each citing exactly one source: a url from the results, or "Companies House".
+Return ONLY JSON:
+{"asset_name": str|null, "asset_type": str|null, "sector": str|null,
+ "capacity": {"value": int, "metric": str, "quote": str, "source_url": str}|null,
+ "location": str|null, "country": str|null, "confidence": "likely"|"possible"|"none",
+ "evidence": [{"text": str, "source": str}]}
+British English. No em dashes."""
+
+
+def identify_by_ownership(company_number: str, company_name: str, asset_class: str, *, charge_dates=None,
+                          lenders=None, ch=None, use_llm=True, max_queries=OWN_MAX_QUERIES) -> dict:
+    """Ownership-and-news identification for debenture / no-address candidates. Never raises."""
+    out = {"confidence": "none", "asset_name": None, "asset_type": None, "sector": None, "capacity": None,
+           "location": None, "country": None, "outside_uk": False, "evidence": [], "queries": [], "status": {}}
+    try:
+        facts = ch_ownership_facts(company_number, charge_dates, lenders, ch)
+        out["status"]["companies_house"] = OK
+    except Exception as e:
+        out["status"]["companies_house"] = f"{UNAVAILABLE}: {type(e).__name__}"
+        facts = {"company_name": company_name, "sic_codes": [], "pscs_including_ceased": [],
+                 "owners_of_corporate_pscs": [], "previous_company_names": [],
+                 "qualifying_charges": [{"created_on": d, "persons_entitled": lenders or []} for d in charge_dates or []]}
+    name = facts.get("company_name") or company_name
+    word = _asset_word(asset_class, facts.get("sic_codes"))
+    out["facts"] = facts
+
+    # ---- queries (priority order, capped)
+    owners = []
+    psc = facts.get("pscs_including_ceased") or []
+    cdates = sorted(c.get("created_on") for c in facts.get("qualifying_charges") or [] if c.get("created_on"))
+    cd0 = cdates[0] if cdates else "9999"
+
+    def at_charge(x):   # owner on the charge date first, then other current, then other former owners
+        held = (x.get("notified_on") or "0000") <= cd0 and (not x.get("ceased_on") or x["ceased_on"] >= cd0)
+        return (0 if held else 1 if not x.get("ceased_on") else 2, x.get("ceased_on") or "")
+    for x in sorted([x for x in psc if "corporate" in x["kind"] or "legal-person" in x["kind"]], key=at_charge):
+        owners.append(_clean_owner(x["name"]))
+    owners += [_clean_owner(x["name"]) for x in facts.get("owners_of_corporate_pscs") or []]
+    own_tok = tokens(name)
+    owners = [o for o in dict.fromkeys(owners) if o and o.lower() != _clean_owner(name).lower()]
+    loc = facts.get("registered_office_locality") or ""
+    cname = _clean_owner(name)
+    distinct = " ".join(t for t in re.findall(r"[A-Za-z0-9']+", cname)
+                        if t.lower() not in STOP and t.lower() not in {"healthcare", "health", "social"})
+    # deal year: incorporation year for a new SPV, else the charge year
+    inc_y, ch_y = (facts.get("incorporated") or "")[:4], cd0[:4] if cd0 != "9999" else ""
+    yr = inc_y if inc_y and (not ch_y or int(ch_y) - int(inc_y) <= 2) else ch_y
+    qs = [f'"{cname}"']
+    if distinct:
+        qs.append(f"{distinct} {word} acquisition {yr}".strip())
+    if owners and distinct:
+        qs.append(f"{distinct} {owners[0]} {word}")
+    for o in owners[:2]:
+        qs.append(f'"{o}" acquires {word} {yr}'.strip())
+    for pn in (facts.get("previous_company_names") or [])[:1]:
+        qs.insert(4, f'"{_clean_owner(pn["name"])}" {word}')
+    if owners:
+        qs.append(f"{owners[0]} {word} {loc}".strip())
+    qs = list(dict.fromkeys(qs))[:max_queries - 1]   # one query kept back for the capacity follow-up
+    out["queries"] = qs
+
+    results, seen = [], set()
+    for q in qs:
+        b = brave(q, count=8)
+        out["status"].setdefault("brave", b["status"])
+        if b["status"] == NEEDS_KEY:
+            break
+        if b["status"] == OK:
+            out["status"]["brave"] = OK
+        for r in b["results"]:
+            if r["url"] and r["url"] not in seen:
+                seen.add(r["url"])
+                results.append({**r, "query": q})
+    # timing: prefer pages dated within ~12 months before the (earliest) charge
+    cds = [_ddate(c.get("created_on")) for c in facts.get("qualifying_charges") or []]
+    cds = [d for d in cds if d]
+    inc = _ddate(facts.get("incorporated"))
+    ref = min(cds) if cds else None
+    anchors = [x for x in (inc, ref) if x]
+    lo = min(anchors) - timedelta(days=365) if anchors else None
+    hi = (ref or inc) + timedelta(days=365) if anchors else None
+    otoks = set().union(*[tokens(o) for o in owners]) if owners else set()
+    for r in results:
+        d = _ddate(r.get("date"))
+        r["in_window"] = bool(d and lo and hi and lo <= d <= hi)
+        txt = tokens(f"{r['title']} {r['snippet']}")
+        r["mentions_owner"] = bool(otoks and len(otoks & txt) >= min(2, len(otoks)))
+        r["mentions_company"] = bool(own_tok) and own_tok <= txt
+    results.sort(key=lambda r: (-(r["in_window"] * 2 + r["mentions_owner"] * 2 + r["mentions_company"]),))
+    out["results"] = [{k: r.get(k) for k in ("title", "url", "date", "in_window", "query")} for r in results[:12]]
+    if not results or not use_llm:
+        out["status"]["llm"] = "skipped"
+        return out
+
+    # page passages for the strongest few results (capacity must be quoted somewhere)
+    passages = []
+    fetched = 0
+    for r in results[:8]:
+        if fetched >= 3:
+            break
+        if not (r["in_window"] or r["mentions_owner"] or r["mentions_company"]):
+            continue
+        txt = fetch_page_text(r["url"])
+        if not txt:
+            continue
+        fetched += 1
+        for m in list(NUM_NEAR.finditer(txt))[:8]:
+            passages.append({"url": r["url"], "text": m.group(0).strip()[:400]})
+        passages.append({"url": r["url"], "text": txt[:1200]})
+    payload = {"companies_house": facts, "asset_class_from_radar": asset_class,
+               "search_results": [{"title": r["title"], "url": r["url"], "date": r.get("date"),
+                                   "dated_in_window": r["in_window"], "snippet": (r["snippet"] or "")[:600]}
+                                  for r in results[:25]],
+               "page_passages": passages[:30]}
+    raw = _llm_json(OWN_SYS, payload, max_tokens=1200)
+    out["status"]["llm"] = OK if raw else UNAVAILABLE
+    if not raw:
+        return out
+
+    # ---- validation: every evidence bullet must cite a supplied url or Companies House;
+    # capacity quote must be verbatim in a supplied snippet/passage and contain the number
+    urls = {r["url"] for r in results} | {p["url"] for p in passages}
+    ev = []
+    for b in raw.get("evidence") or []:
+        if not isinstance(b, dict) or not b.get("text"):
+            continue
+        src = (b.get("source") or "").strip()
+        if src in urls:
+            ev.append({"text": re.sub(r"\s*[—–]\s*", ", ", b["text"]).strip(), "url": src})
+        elif re.search(r"companies house", src, re.I):
+            ev.append({"text": re.sub(r"\s*[—–]\s*", ", ", b["text"]).strip(), "url": CH_COMPANY.format(company_number)})
+    conf = raw.get("confidence") if raw.get("confidence") in ("likely", "possible") else "none"
+    web_ev = [b for b in ev if "company-information.service.gov.uk" not in b["url"]]
+    if conf != "none" and (not raw.get("asset_name") or not web_ev):
+        conf = "none"
+    elif conf == "likely" and len(ev) < 2:
+        conf = "possible"
+    # mechanical ownership check: at least one web source must mention the company (or a current/former
+    # owner) AND the asset itself; otherwise "likely" drops to "possible" and capacity is not attributed
+    def _src_text(u):
+        return " ".join([f"{r['title']} {r['snippet']}" for r in results if r["url"] == u] +
+                        [p["text"] for p in passages if p["url"] == u])
+    who = [tokens(_clean_owner(name))] + [tokens(o) for o in owners]
+    who = [w for w in who if w]
+    asset_tok = tokens(raw.get("asset_name")) - set().union(*who) if who else tokens(raw.get("asset_name"))
+    link_urls = set()
+    for b in web_ev:
+        tt = tokens(_src_text(b["url"]))
+        if any(len(w & tt) >= min(2, len(w)) for w in who) and (not asset_tok or asset_tok & tt):
+            link_urls.add(b["url"])
+    out["ownership_link_verified"] = bool(link_urls)
+    if conf == "likely" and not link_urls:
+        conf = "possible"
+    cap = _valid_capacity(raw.get("capacity"), results, passages)
+    if cap and not link_urls:
+        ctt = tokens(_src_text(cap["source_url"]))
+        if not any(len(w & ctt) >= min(2, len(w)) for w in who):
+            out["capacity_dropped"] = "capacity source does not name the company or an owner"
+            cap = None
+    if conf != "none" and not cap and raw.get("asset_name") and link_urls:
+        # one follow-up search for the named asset's size; same verbatim-quote rule
+        q = f'"{raw["asset_name"]}" {CAP_HINT.get(raw.get("sector"), "size")}'
+        out["queries"].append(q)
+        b = brave(q, count=8)
+        fres = [r for r in b.get("results") or [] if r.get("url")]
+        fpass = []
+        for r in fres[:5]:
+            if len([1 for p in fpass if p.get("_page")]) >= 2:
+                break
+            txt = fetch_page_text(r["url"])
+            if txt:
+                fpass += [{"url": r["url"], "text": m.group(0).strip()[:400], "_page": True}
+                          for m in list(NUM_NEAR.finditer(txt))[:8]]
+        craw = _llm_json(CAP_SYS, {"asset": raw["asset_name"], "location": raw.get("location"),
+                                   "sector": raw.get("sector"),
+                                   "snippets": [{"url": r["url"], "text": f"{r['title']}. {r['snippet']}"[:700]} for r in fres],
+                                   "page_passages": [{"url": p["url"], "text": p["text"]} for p in fpass[:20]]},
+                         max_tokens=300)
+        cap = _valid_capacity((craw or {}).get("capacity"), fres, fpass)
+        if cap:
+            results += fres
+    sector = raw.get("sector") if raw.get("sector") in SECTORS else ("other" if raw.get("sector") else None)
+    blob = " ".join([raw.get("asset_name") or "", raw.get("asset_type") or ""] + [p["name"] or "" for p in psc])
+    if sector in (None, "care home", "hospital / clinic", "other", "mixed / portfolio") and PRIMARY_CARE.search(blob):
+        sector = "primary care / medical centres"      # classification guard: GP / medical centres are not Care
+    country = raw.get("country")
+    out.update(confidence=conf, sector=sector, country=country,
+               outside_uk=bool(country) and country.strip().lower() not in UK_COUNTRIES,
+               evidence=ev[:4] if conf != "none" else ev[:2])
+    if conf != "none":
+        out.update(asset_name=raw.get("asset_name"), asset_type=raw.get("asset_type"), capacity=cap,
+                   location=raw.get("location"))
+    else:
+        out["location"] = raw.get("location")
+    return out
+
+
+CAP_HINT = {"hotel": "hotel rooms", "care home": "care home beds", "student accommodation": "beds",
+            "co-living": "co-living homes", "build to rent / residential": "apartments", "school": "pupils",
+            "primary care / medical centres": "medical centres portfolio", "office": "sq ft",
+            "industrial / logistics": "sq ft", "retail / leisure": "sq ft"}
+
+CAP_SYS = """From the snippets/passages, give the size of the named property asset ONLY if a number with its unit
+(rooms, keys, beds, units, apartments, homes, properties, sq ft) is stated verbatim about THIS asset (not a chain, group
+or sister property). Copy the exact text containing the number into quote. Return ONLY JSON
+{"capacity": {"value": int, "metric": str, "quote": str, "source_url": str} | null}. If unsure, null."""
+
+
+def _valid_capacity(cap, results, passages):
+    if not (isinstance(cap, dict) and cap.get("quote") and cap.get("source_url")):
+        return None
+    n = _num(cap.get("value"))
+    q = _norm_txt(_clean_quote(cap["quote"]))
+    texts = [_norm_txt(f"{r['title']}. {r['snippet']}") for r in results if r["url"] == cap["source_url"]] + \
+            [_norm_txt(r["snippet"]) for r in results if r["url"] == cap["source_url"]] + \
+            [_norm_txt(p["text"]) for p in passages if p["url"] == cap["source_url"]]
+    if not (n and len(q) >= 4 and any(q in t for t in texts)
+            and re.search(rf"\b{re.escape(f'{n:,}')}\b|\b{n}\b", cap["quote"])):
+        return None
+    return {"value": n, "metric": cap.get("metric") or "", "source_url": cap["source_url"],
+            "quote": re.sub(r"\s+", " ", cap["quote"])[:200]}
+
+
+CH_COMPANY = "https://find-and-update.company-information.service.gov.uk/company/{}"
+
+
+def ownership_line(ident: dict | None) -> str | None:
+    """'Likely: DoubleTree by Hilton London ExCeL, 287 rooms (Royal Docks, London)' or None."""
+    if not ident or ident.get("confidence") not in ("likely", "possible"):
+        return None
+    s = f"{ident['confidence'].capitalize()}: {ident['asset_name']}"
+    cap = ident.get("capacity")
+    if cap:
+        s += f", {cap['value']:,} {cap['metric']}".rstrip()
+    loc = ident.get("location")
+    if loc and not tokens(loc) <= tokens(ident["asset_name"]):
+        s += f" ({loc})"
+    if ident.get("outside_uk"):
+        s += f" [Outside UK: {ident.get('country')}]"
+    return s
+
+
 def bulk_status() -> dict:
     out = {}
     for n in ("cqc", "gias", "voa"):
@@ -1211,6 +1603,9 @@ def main():
     ap.add_argument("--no-web", action="store_true")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--full", action="store_true", help="print the full dict")
+    ap.add_argument("--identify", action="store_true",
+                    help="ownership-and-news identification (debenture / no-address candidates)")
+    ap.add_argument("--charge-date", action="append", help="qualifying charge date(s) YYYY-MM-DD")
     ap.add_argument("--refresh-bulk", action="store_true", help="refresh CQC + GIAS bulk files")
     ap.add_argument("--build-voa", action="store_true", help="download (~250 MB) and index the VOA 2026 list")
     ap.add_argument("--status", action="store_true")
@@ -1222,6 +1617,12 @@ def main():
         print("VOA:", build_voa())
     if a.status:
         print(json.dumps(bulk_status(), indent=2))
+    if a.identify:
+        r = identify_by_ownership(a.company_number, a.company_name, a.asset_class, charge_dates=a.charge_date)
+        r.pop("facts", None) if not a.full else None
+        print(json.dumps(r, indent=2, default=str))
+        print("CARD:", ownership_line(r) or "Not identified yet")
+        return
     if a.company_name or a.address or a.postcode:
         p = build_asset_profile(a.address, a.postcode, a.company_number, a.company_name, a.asset_class,
                                 postcode_is_registered_office=a.registered_office,
