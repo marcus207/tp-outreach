@@ -2,9 +2,12 @@
 """
 Weekly refinancing radar email for Marcus (Monday morning).
 
-  1. Runs scripts/maturity_radar.py (imported) and re-selects the TOP 10 from its
-     balanced shortlist: max 3 per asset class, DO NOT CONTACT entries skipped.
-     Distress list shown separately (max 5), not for cold approach.
+  1. Runs scripts/maturity_radar.py (imported), takes up to PROFILE_MAX (25) de-duplicated
+     candidates from its balanced shortlist (DO NOT CONTACT skipped), builds asset profiles for
+     them (capacity: rooms/beds/units/sq ft; cached), then scores LIKELY LOAN SIZE
+     (scripts/radar_size.py, rules in radar_size_rules.json). The email TOP 10 ranks
+     Likely £10m+, then Likely £5m-10m, then Possible (max 3 per asset class); Unlikely
+     candidates are excluded and counted. Distress list shown separately (max 5).
   2. Enriches the 10 with credit data via the existing integration in /root/tp_api_v2
      (creditsafe_browser.fetch_creditsafe_report). Uses a cached creditsafe_reports row
      if < 7 days old; otherwise fetches (rate limited ~10s/company inside the module) in
@@ -46,6 +49,10 @@ SENDER = "marcus.emadi@go.tp.finance"
 SENDER_NAME = "Refinancing Radar"
 DEFAULT_TO = "marcus@tp.finance"
 TOP_N, PER_CLASS, DISTRESS_MAX = 10, 3, 5
+# Asset profiles cost web search + LLM calls: profile at most PROFILE_MAX candidates
+# (max PROFILE_PER_CLASS per class), cached for PROFILE_CACHE_DAYS.
+PROFILE_MAX, PROFILE_PER_CLASS, PROFILE_CACHE_DAYS = 25, 6, 6
+RADAR_ARGS = ["--deep", "70", "--top", "60", "--per-class", "10"]  # wide radar shortlist to profile from
 CREDIT_CAP_S = 240
 CACHE_DAYS = 7
 CH_LINK = "https://find-and-update.company-information.service.gov.uk/company/{}"
@@ -63,10 +70,12 @@ def log(*a):
 
 
 # --------------------------------------------------------------------------- selection
-def select(radar):
+def dedupe(cands):
+    """Drop DO NOT CONTACT, sibling SPVs sharing a name stem, and same-board sponsor groups.
+    Keeps input order (radar score order, one per parent group already)."""
     from maturity_radar import norm
-    picked, per, stems, board_sets = [], {}, set(), []
-    for c in radar["picked"]:  # already score-ordered and one per parent group
+    out, stems, board_sets = [], set(), []
+    for c in cands:
         if c.get("dnc"):
             continue
         toks = norm(c["name"]).split()
@@ -76,16 +85,49 @@ def select(radar):
         dirs = {d.split(" (appointed")[0] for d in c.get("directors") or []}
         if any(len(dirs & p) >= 2 for p in board_sets):  # same board = same sponsor group
             continue
-        if per.get(c["cls"], 0) >= PER_CLASS:
-            continue
-        picked.append(c)
+        out.append(c)
         if stem:
             stems.add(stem)
         board_sets.append(dirs)
+    return out
+
+
+def balanced(cands, n, per_class):
+    """First n of cands with at most per_class per asset class (order preserved)."""
+    picked, per = [], {}
+    for c in cands:
+        if per.get(c["cls"], 0) >= per_class:
+            continue
+        picked.append(c)
         per[c["cls"]] = per.get(c["cls"], 0) + 1
-        if len(picked) >= TOP_N:
+        if len(picked) >= n:
             break
-    return picked, radar["distress"][:DISTRESS_MAX]
+    return picked
+
+
+def profile_set(radar):
+    """Candidates worth an asset profile. Provisionally micro-entity -> can never be Likely, so
+    skipped (counted). Order: provisional band, then radar score."""
+    from radar_size import band_rank
+    cands = dedupe(radar["picked"])
+    micro = [c for c in cands if (c.get("acc_type") or "") == "micro-entity"]
+    rest = [c for c in cands if c not in micro]
+    rest.sort(key=lambda c: (band_rank(c.get("size")), -c["score"]))
+    return balanced(rest, PROFILE_MAX, PROFILE_PER_CLASS), micro
+
+
+def select_top(scored):
+    """Email top N: Likely £10m+, then Likely £5m-10m, then Possible; never Unlikely."""
+    from radar_size import band_rank
+    ok = [c for c in scored if c["size"]["band"] != "unlikely"]
+    ok.sort(key=lambda c: (band_rank(c["size"]), -(c["size"]["score10"] + c["score"])))
+    return balanced(ok, TOP_N, PER_CLASS)
+
+
+def distress_list(radar):
+    """Distress section rows (administration / liquidation / insolvency history): noted, never
+    for cold approach. Extend here (e.g. a fuller distress section) without touching the top 10."""
+    return radar["distress"][:DISTRESS_MAX]
 
 
 # --------------------------------------------------------------------------- credit data
@@ -535,11 +577,13 @@ def credit_lines(cr, inc_fallback=None):
     ]
 
 
-def card_fields(c, radar, allow_check):
+def card_fields(c, radar):
+    from maturity_radar import lenders_line
+    from radar_size import size_line
     mo = radar["months_old"]
     dates = c["dates"]
     shown = ", ".join(f"{d} ({mo(d)} months old)" for d in dates[:6]) + (" ..." if len(dates) > 6 else "")
-    lenders = "; ".join(l + (" (check)" if l in allow_check else "") for l in c["lenders"])
+    lenders = lenders_line(c)
     parent = "; ".join(c.get("parents") or []) or "(no corporate PSC)"
     if c.get("psc_people"):
         parent += " | individuals: " + "; ".join(c["psc_people"])
@@ -578,6 +622,7 @@ def card_fields(c, radar, allow_check):
     if ident.get("outside_uk") and ident.get("confidence") in ("likely", "possible"):
         cls_txt += f"; Outside UK ({ident.get('country')}): UK data sources do not cover the asset"
     return [
+        ("Size", size_line(c.get("size"))),
         *asset_fields(c),
         ("Parent / PSC", parent),
         ("Asset class", cls_txt),
@@ -593,19 +638,45 @@ def card_fields(c, radar, allow_check):
     ]
 
 
-def build(radar, top, distress, credit, wc):
+def distress_block(distress):
+    """(html lines, text lines) for the distress section."""
+    H = ['<h2 style="font-size:16px;font-weight:normal;margin:22px 0 6px">'
+         'Distress / not for cold approach</h2>',
+         '<ul style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 18px;padding-left:18px">']
+    T = ["Distress / not for cold approach"]
+    for c in distress:
+        line = (f"{c['name']} ({c['company_number']}): status {c['status']}"
+                f"{', insolvency history' if c.get('insolv') else ''}; {c['n']} window charge(s) "
+                f"with {'; '.join(c['lenders'][:3])}")
+        H.append(f"<li>{e(line)}</li>")
+        T.append(f" - {line}")
+    if not distress:
+        H.append("<li>None this week</li>")
+        T.append(" - None this week")
+    H.append("</ul>")
+    return H, T
+
+
+def build(radar, top, distress, credit, wc, size_counts=None):
     why = radar["why"]
+    sc = size_counts or {}
     subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}"
     intro = (f"{len(top)} sponsors whose facilities are likely in their refinancing window. "
              "Reply with the numbers you'd like approached and I'll draft a personal note for each.")
     method = ("Method: public Companies House charges reaching their 5-year anniversary in the "
-              "next 3 months, still outstanding, with lenders on our £10m+ allowlist; target asset "
-              "classes only (schools: SEN-specific only); maturity is inferred from charge age, "
-              "not known. '(check)' marks a lender on the allowlist pending "
-              "verification. Debt is estimated from tagged values in the latest filed "
-              "accounts on Companies House (bank borrowings preferred, else creditors due after one "
-              "year, labelled); candidates whose accounts show under £10m are excluded, and PDF-only "
-              "accounts are shown as not available. Property charged is taken from the charge "
+              "next 3 months, still outstanding (BTL/residential lenders and housebuilder "
+              "counterparties excluded); target asset classes only (schools: SEN-specific only); "
+              "maturity is inferred from charge age, not known. Loan size is inferred from signals, "
+              "not stated by Companies House (which never shows loan amounts): lender named as "
+              "security agent/trustee or several lenders on one charge, lender type (clearing banks "
+              "score nothing as they lend at every size), asset capacity, rateable value, portfolio, "
+              "accounts filing type (never the figures) and institutional parent. Ranked Likely £10m+, "
+              "then Likely £5m+, then Possible"
+              + (f"; {sc.get('unlikely', 0)} of {sc.get('profiled', 0)} profiled candidates "
+                 f"(+{sc.get('micro_skipped', 0)} micro-entities not profiled) judged Unlikely and left out"
+                 if sc else "")
+              + ". A '?' after a lender category marks a placement pending review. "
+              "Property charged is taken from the charge "
               "particulars; where the charge is an all-assets debenture the property is not stated, and the "
               "asset is inferred from current and former owners (Companies House), timing and dated public "
               "news, shown as Likely or Possible with its evidence; capacity only where a source states it. "
@@ -623,8 +694,7 @@ def build(radar, top, distress, credit, wc):
     T = [subject, "", intro, ""]
     for i, c in enumerate(top, 1):
         cn = c["company_number"]
-        allow_check = {r["lname"] for r in c["charges"] if r["allow"] and r["allow"][1]}
-        fields = card_fields(c, radar, allow_check)
+        fields = card_fields(c, radar)
         H.append('<div style="background:#fff;border:1px solid #ddd;padding:14px 16px;margin:0 0 14px;'
                  'font-family:Arial,sans-serif">')
         H.append(f'<div style="font-family:Georgia,serif;font-size:17px;margin:0 0 2px">'
@@ -646,19 +716,9 @@ def build(radar, top, distress, credit, wc):
         T += [f"{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
         T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
         T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", ""]
-    H.append('<h2 style="font-size:16px;font-weight:normal;margin:22px 0 6px">'
-             'Distress / not for cold approach</h2>')
-    H.append('<ul style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 18px;padding-left:18px">')
-    T.append("Distress / not for cold approach")
-    for c in distress:
-        line = (f"{c['name']} ({c['company_number']}): status {c['status']}"
-                f"{', insolvency history' if c.get('insolv') else ''}; {c['n']} window charge(s) "
-                f"with {'; '.join(c['lenders'][:3])}")
-        H.append(f"<li>{e(line)}</li>")
-        T.append(f" - {line}")
-    if not distress:
-        H.append("<li>None this week</li>")
-        T.append(" - None this week")
+    dh, dtx = distress_block(distress)
+    H += dh
+    T += dtx
     H.append(f'<p style="font-family:Arial,sans-serif;font-size:11px;color:#666;line-height:1.5;'
              f'border-top:1px solid #ccc;padding-top:10px">{e(method)}</p></div></body></html>')
     T += ["", method]
@@ -693,10 +753,27 @@ def send(to, subject, html_body, text_body):
 _PC = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.I)
 
 
+PROFILE_CACHE_DIR = os.path.join(OUT_DIR, "asset_cache", "profiles")
+
+
+def _profile_cache(c, key, fn):
+    """Whole-result cache per company for PROFILE_CACHE_DAYS (the underlying web/LLM calls are
+    cached inside asset_profile.py too). key captures the inputs that change the result."""
+    import hashlib
+    os.makedirs(PROFILE_CACHE_DIR, exist_ok=True)
+    path = os.path.join(PROFILE_CACHE_DIR, f"{c['company_number']}-"
+                        + hashlib.sha1(json.dumps(key, default=str).encode()).hexdigest()[:12] + ".json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < PROFILE_CACHE_DAYS * 86400:
+        return json.load(open(path)), True
+    res = fn()
+    json.dump(res, open(path, "w"), default=str)
+    return res, False
+
+
 def asset_profiles(top):
     """What each charged asset is and how big (beds / rooms / units / sq ft), via
     scripts/asset_profile.py. Never raises; a failed profile shows as unknown."""
-    st = {"ok": 0, "errors": 0, "debenture": 0, "identified": 0}
+    st = {"ok": 0, "errors": 0, "debenture": 0, "identified": 0, "cached": 0, "secs": []}
     try:
         from asset_profile import build_asset_profile, identify_by_ownership
     except Exception as ex:
@@ -704,13 +781,17 @@ def asset_profiles(top):
         st["errors"] = len(top)
         return st
     for c in top:
+        t1 = time.time()
         pi = c.get("prop") or {}
         addr = None if pi.get("generic") else pi.get("address")
         m = _PC.search(addr or "")
         pc, ro = (m.group(1).upper(), False) if m else (pi.get("ro_postcode") or c.get("postcode"), True)
         try:
-            c["asset"] = build_asset_profile(addr, pc, c["company_number"], c.get("name") or "",
-                                             c.get("cls") or "", postcode_is_registered_office=ro)
+            c["asset"], hit = _profile_cache(
+                c, ["asset", addr, pc, c.get("name"), c.get("cls"), ro],
+                lambda: build_asset_profile(addr, pc, c["company_number"], c.get("name") or "",
+                                            c.get("cls") or "", postcode_is_registered_office=ro))
+            st["cached"] += hit
             cap = (c["asset"].get("capacity") or {})
             if cap.get("value") not in (None, "unknown"):
                 st["ok"] += 1
@@ -721,14 +802,19 @@ def asset_profiles(top):
         if pi.get("generic"):
             # debenture / no property address: ownership-and-news identification
             st["debenture"] += 1
+            def _ident():
+                r = identify_by_ownership(c["company_number"], c.get("name") or "", c.get("cls") or "",
+                                          charge_dates=c.get("dates"), lenders=c.get("lenders"))
+                r.pop("facts", None)
+                return r
             try:
-                c["asset_id"] = identify_by_ownership(c["company_number"], c.get("name") or "", c.get("cls") or "",
-                                                      charge_dates=c.get("dates"), lenders=c.get("lenders"))
-                c["asset_id"].pop("facts", None)
+                c["asset_id"], _ = _profile_cache(
+                    c, ["ident", c.get("name"), c.get("cls"), c.get("dates"), c.get("lenders")], _ident)
                 st["identified"] += c["asset_id"].get("confidence") in ("likely", "possible")
             except Exception as ex:
                 c["asset_id"] = None
                 log(f"asset identification failed for {c['company_number']}: {type(ex).__name__}")
+        st["secs"].append((c["company_number"], round(time.time() - t1, 1)))
     return st
 
 
@@ -780,6 +866,26 @@ def asset_fields(c):
     return out
 
 
+def write_size_csv(run, cands, micro):
+    """reports/radar/size-YYYY-MM-DD.csv: every profiled candidate's band + signals, for tuning
+    radar_size_rules.json."""
+    import csv
+    path = os.path.join(OUT_DIR, f"size-{run}.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["company_number", "company_name", "asset_class", "band", "score_10m", "score_5m",
+                    "reasons", "signals"])
+        for c in cands:
+            z = c["size"]
+            w.writerow([c["company_number"], c["name"], c["cls"], z["label"], z["score10"], z["score5"],
+                        z["reasons"], " | ".join(f"{s['label']} [{s['strength']}, {'/'.join(s['bands'])}]"
+                                                 for s in z["signals"])])
+        for c in micro:
+            w.writerow([c["company_number"], c["name"], c["cls"], "Unlikely (micro-entity, not profiled)",
+                        "", "", "micro-entity accounts", ""])
+    log(f"wrote {path}")
+
+
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -791,12 +897,33 @@ def main():
     log(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] radar weekly email start")
 
     import maturity_radar
-    radar = maturity_radar.main([])
-    top, distress = select(radar)
-    log(f"selected {len(top)} (distress shown {len(distress)})")
-    ast = radar.get("acc_stats", {})
-    log(f"debt from accounts: figure {ast.get('with_figure', 0)}, PDF only {ast.get('pdf', 0)}, "
-        f"excluded: under £10m {len(radar.get('debt_excluded', []))}")
+    from radar_size import score_size
+    radar = maturity_radar.main(RADAR_ARGS)
+    distress = distress_list(radar)
+    cands, micro = profile_set(radar)
+    log(f"profile set {len(cands)} (cap {PROFILE_MAX}, max {PROFILE_PER_CLASS}/class); "
+        f"micro-entity skipped before profiling {len(micro)}; distress shown {len(distress)}")
+
+    t1 = time.time()
+    prof = asset_profiles(cands)
+    slow = sorted(prof["secs"], key=lambda x: -x[1])[:3]
+    log(f"asset profiles: {len(cands)} in {time.time() - t1:.0f}s (cached {prof['cached']}; slowest "
+        + ", ".join(f"{cn} {s_}s" for cn, s_ in slow) + f"); {prof['ok']} with capacity, errors "
+        f"{prof['errors']}; debenture cards identified {prof['identified']}/{prof['debenture']}")
+
+    for c in cands:
+        c["size"] = score_size(c)
+    counts = {b: sum(1 for c in cands if c["size"]["band"] == b)
+              for b in ("likely_10m", "likely_5m", "possible", "unlikely")}
+    size_counts = {**counts, "profiled": len(cands), "micro_skipped": len(micro)}
+    log("size bands (profiled): Likely £10m+ {likely_10m}, Likely £5m-10m {likely_5m}, Possible "
+        "{possible}, Unlikely {unlikely}".format(**counts))
+    for c in cands:
+        log(f"  {c['size']['label']:<15} {c['name'][:45]:<45} {c['cls']:<20} {c['size']['reasons']}")
+    write_size_csv(radar["run"], cands, micro)
+
+    top = select_top(cands)
+    log(f"selected {len(top)}")
     log("property charged in top %d: address %d, not stated %d" % (
         len(top), sum(1 for c in top if not c["prop"]["generic"]),
         sum(1 for c in top if c["prop"]["generic"])))
@@ -811,21 +938,17 @@ def main():
         f"{ap['email']}, verified {ap['verified']}, errors {ap['errors']}"
         + ("" if ap["enabled"] else " (no API key)"))
 
-    prof = asset_profiles(top)
-    log(f"asset profiles: {prof['ok']}/{len(top)} with capacity, errors {prof['errors']}; debenture "
-        f"cards identified by ownership/news {prof['identified']}/{prof['debenture']}")
-
     credit, st = enrich(top, enabled=not a.no_credit)
     log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "
         f"not reached (cap) {st['skipped_cap']}")
 
     run = radar["run"]
     wc = run - dt.timedelta(days=run.weekday())
-    subject, html_body, text_body = build(radar, top, distress, credit, wc)
+    subject, html_body, text_body = build(radar, top, distress, credit, wc, size_counts)
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"email-{run}.html")
     open(path, "w").write(html_body)
-    log(f"wrote {path}")
+    log(f"wrote {path} ({time.time() - t0:.0f}s so far)")
 
     if a.dry_run:
         log("dry run: not sent")

@@ -21,17 +21,20 @@ Pipeline
      date, i.e. reaching the 5-year anniversary within the next 3 months
      -> institution/trustee lenders -> minus BTL/residential lenders
      -> minus housebuilder/land-seller counterparties
-     -> lender must match the GBP 10m+ allowlist (scripts/radar_lenders_10m_plus.txt)
      -> minus finance-named / lender borrowers.
+     Lenders are put in categories (scripts/radar_lenders_10m_plus.txt) that feed the likely
+     loan-size score (scripts/radar_size.py); the category is no longer a pass/fail filter.
   2. Asset class from company name + (conservative) property-description keywords.
   3. Pre-score in SQL data; top N get CH company profile (SIC confirm/upgrade, status,
      accounts type, insolvency). Distressed companies listed separately, not targeted.
-  4. Top ~50 get CH officers + PSC; pick top 20 balanced across classes (max 5 each).
+  4. Top ~50 get CH officers + PSC + charge particulars and a PROVISIONAL size band
+     (radar_size.score_size, no asset capacity yet); pick top 20 balanced across classes.
+     radar_weekly_email.py re-scores after asset profiles and drops "Unlikely".
   5. Match against tp outreach contacts; flag suppressed/unsubscribed/hold = DO NOT CONTACT.
   6. Write reports/radar/radar-YYYY-MM-DD.{md,csv} + lender-review-YYYY-MM-DD.csv.
 
-Usage: python3 scripts/maturity_radar.py [--date YYYY-MM-DD] [--strict-lenders]
-                                          [--profile-pool 200] [--deep 50] [--top 20]
+Usage: python3 scripts/maturity_radar.py [--date YYYY-MM-DD] [--profile-pool 300] [--deep 50]
+                                          [--top 20] [--per-class 5]
 """
 import argparse
 import csv
@@ -46,10 +49,13 @@ from collections import Counter, defaultdict
 import psycopg2
 import requests
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from radar_size import lender_category, score_size, size_line  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(ROOT, "reports", "radar")
 CACHE_DIR = os.path.join(OUT_DIR, "ch_cache")
-ALLOWLIST_FILE = os.path.join(ROOT, "scripts", "radar_lenders_10m_plus.txt")
+LENDERS_FILE = os.path.join(ROOT, "scripts", "radar_lenders_10m_plus.txt")  # categories, see radar_size.py
 DSN = "postgresql://tpca@localhost:5432/tpca_platform"  # password via ~/.pgpass
 CH_BASE = "https://api.company-information.service.gov.uk"
 CH_KEYS_SOURCE = "/root/scanner.py"  # existing CH scanner holds the API key list
@@ -207,32 +213,6 @@ def add_months(d, n):
     m += 1
     import calendar
     return d.replace(year=y, month=m, day=min(d.day, calendar.monthrange(y, m)[1]))
-
-
-# --------------------------------------------------------------------------- allowlist
-def load_allowlist(strict):
-    pats = []
-    for line in open(ALLOWLIST_FILE):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        parts = re.split(r"\s+#", line.rstrip("\n"), maxsplit=1)
-        rx = parts[0].strip()
-        check = len(parts) > 1 and "CHECK" in parts[1].upper()
-        if strict and check:
-            continue
-        pats.append((re.compile(rx, re.I), rx, check))
-    return pats
-
-
-def allow_match(pats, *names):
-    """Return (pattern, is_check) of the first allowlist hit, preferring confirmed lines."""
-    hit = None
-    for rx, raw, check in pats:
-        if any(n and rx.search(n) for n in names):
-            if not check:
-                return raw, False
-            hit = hit or (raw, True)
-    return hit
 
 
 # --------------------------------------------------------------------------- CH API
@@ -651,7 +631,8 @@ def charge_property(ch, c):
     cn = c["company_number"]
     out = {"address": None, "titles": [], "more": 0, "generic": True, "flags": "",
            "deed_link": None, "charges_link": CHARGES_LINK.format(cn), "ro_postcode": None,
-           "ccod": get_ccod_titles(cn), "n_charges": 0}
+           "ccod": get_ccod_titles(cn), "n_charges": 0,
+           "persons": [], "more_than_four": False}  # persons entitled per qualifying charge
     try:
         out["ro_postcode"] = ((c.get("profile") or {}).get("registered_office_address") or {}) \
             .get("postal_code")
@@ -672,6 +653,8 @@ def charge_property(ch, c):
         out["n_charges"] = len(qual)
         addrs, titles, flags = [], [], set()
         for i in qual:
+            out["persons"].append([p.get("name") or "" for p in i.get("persons_entitled") or []])
+            out["more_than_four"] |= bool(i.get("more_than_four_persons_entitled"))
             pt = i.get("particulars") or {}
             for k, lbl in (("contains_fixed_charge", "fixed"), ("contains_floating_charge", "floating"),
                            ("contains_negative_pledge", "negative pledge")):
@@ -720,6 +703,15 @@ def property_line(pi, with_link=True):
     return s + (f" {link}" if with_link and link else "")
 
 
+def lenders_line(c):
+    """'Aareal Bank (German / European bank); NatWest (clearing bank)'. CHECK placements get '?'."""
+    seen = {}
+    for r in c["charges"]:
+        cat = r.get("lcat")
+        seen.setdefault(r["lname"], f" ({cat['label']}{'?' if cat['check'] else ''})" if cat else "")
+    return "; ".join(k + v for k, v in seen.items())
+
+
 def debt_line(info, with_link=True):
     """One-line summary, e.g. '~£23.4m bank borrowings at 31 Dec 2024'."""
     if not info:
@@ -743,9 +735,7 @@ def main(argv=None):
     """CLI entry. Also importable: returns a dict with the shortlist and distress list."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="run date YYYY-MM-DD (default today)")
-    ap.add_argument("--strict-lenders", action="store_true",
-                    help="ignore allowlist lines marked '# CHECK'")
-    ap.add_argument("--profile-pool", type=int, default=200)
+    ap.add_argument("--profile-pool", type=int, default=300)
     ap.add_argument("--deep", type=int, default=50)
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--per-class", type=int, default=5)
@@ -788,7 +778,6 @@ def main(argv=None):
                   and not BTL_LENDERS.search(r["lender"] or "")])
     rows = stage("Minus housebuilder / land-seller chargees",
                  [r for r in rows if not HOUSEBUILDERS.search(r["lender"] or "")])
-    pre_allow = rows
 
     # borrower-is-a-lender screen: names that appear as institutional chargees elsewhere
     lender_names = {norm(x["lender"]) for x in q(conn, """
@@ -808,11 +797,11 @@ def main(argv=None):
                 return k, "desc"
         return None, None
 
-    # ---- lender review helper (target-class borrowers, before allowlist) ----
-    pats = load_allowlist(a.strict_lenders)
-    all_pats = load_allowlist(False)
+    # ---- lender categories (size signal, not a filter) + lender review helper ----
+    for r in rows:
+        r["lcat"] = lender_category(r["lname"], r["lender"])
     lrev = defaultdict(lambda: {"charges": 0, "cos": set(), "raw": Counter(), "types": set()})
-    for r in pre_allow:
+    for r in rows:
         if not borrower_ok(r):
             continue
         cls, _ = classify_charge(r)
@@ -827,21 +816,19 @@ def main(argv=None):
     with open(rev_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["rank", "lender_normalised", "charges_in_window_target_classes",
-                    "companies", "lender_type", "allowlist_match", "allowlist_pattern",
-                    "example_raw_names", "add_to_allowlist (tick)"])
+                    "companies", "lender_type", "size_category", "category_pattern",
+                    "placement_check", "example_raw_names", "recategorise (note)"])
         top = sorted(lrev.items(), key=lambda kv: -kv[1]["charges"])[:100]
         for i, (ln, d) in enumerate(top, 1):
-            hit = allow_match(all_pats, ln, *d["raw"].keys())
+            hit = lender_category(ln, *d["raw"].keys())
             w.writerow([i, ln, d["charges"], len(d["cos"]), "/".join(sorted(d["types"])),
-                        "no" if not hit else ("yes-CHECK" if hit[1] else "yes"),
-                        hit[0] if hit else "",
+                        hit["cat"] if hit else "uncategorised", hit["pattern"] if hit else "",
+                        "CHECK" if hit and hit["check"] else "",
                         " | ".join(n for n, _ in d["raw"].most_common(3)), ""])
-
-    for r in rows:
-        r["allow"] = allow_match(pats, r["lname"], r["lender"])
-    rows = stage("Lender on GBP 10m+ allowlist" + (" (strict, no CHECK)" if a.strict_lenders
-                                                    else " (incl. CHECK entries)"),
-                 [r for r in rows if r["allow"]])
+    stages.append(("  of which large-ticket lender category (scored, not a filter)",
+                   sum(1 for r in rows if r["lcat"] and r["lcat"]["strength"] != "neutral"),
+                   len({r["company_number"] for r in rows
+                        if r["lcat"] and r["lcat"]["strength"] != "neutral"})))
     rows = stage("Minus finance-named / lender borrowers", [r for r in rows if borrower_ok(r)])
 
     # ---- company aggregation ----
@@ -863,6 +850,7 @@ def main(argv=None):
     nums = list(cos)
     later = Counter()
     total_out = Counter()
+    out_dates = defaultdict(set)
     if nums:
         for x in q(conn, """
             select c.company_number, c.date_created, c.lender, lc.lender_type
@@ -870,6 +858,7 @@ def main(argv=None):
             where c.status='outstanding' and not coalesce(c.excluded,false)
               and c.company_number = any(%s)""", (nums,)):
             total_out[x["company_number"]] += 1
+            out_dates[x["company_number"]].add(x["date_created"])
             if (x["lender_type"] in ("institution", "trustee") and x["date_created"]
                     and x["date_created"] > w_end.isoformat()):
                 later[x["company_number"]] += 1
@@ -878,9 +867,11 @@ def main(argv=None):
         c["cls"] = c["cls_votes"].most_common(1)[0][0] if c["cls_votes"] else None
         c["n"] = len(c["charges"])
         c["n_total"] = total_out[c["company_number"]]
+        c["out_dates"] = sorted(d for d in out_dates[c["company_number"]] if d)
         c["later"] = later[c["company_number"]]
         c["lenders"] = sorted({r["lname"] for r in c["charges"]})
-        c["lender_check"] = all(r["allow"][1] for r in c["charges"])
+        cats = [r["lcat"] for r in c["charges"] if r["lcat"]]
+        c["lender_pre"] = max((x["pre_points"] for x in cats), default=0)
         c["dates"] = sorted(r["date_created"] for r in c["charges"])
         c["corp_psc_db"] = bool(re.search(r"\b(limited|ltd|plc|llp|lp|s\.?a\.?r\.?l|b\.?v)\b",
                                           c["psc_db"] or "", re.I))
@@ -889,7 +880,7 @@ def main(argv=None):
                            for r in c["charges"])
         s = TARGET_PRIORITY.get(c["cls"], 0)
         s += min(c["n"], 10) * 3
-        s += 8 if not c["lender_check"] else 2
+        s += c["lender_pre"]  # lender category (radar_size_rules.json pre_points)
         s += 6 if c["trustee"] else 0
         s += 10 if c["corp_psc_db"] else 0
         s -= 10 if c["later"] else 0
@@ -964,7 +955,9 @@ def main(argv=None):
             c["score"] += 10
         elif not c["parents"] and c["corp_psc_db"]:
             c["score"] -= 5  # DB said corporate, CH now says not
-    stages.append(("Deep-checked (officers + PSC)", len(deep), len(deep)))
+        # charge particulars (property, titles, persons entitled) feed the size score
+        c["prop"] = charge_property(ch, c)
+    stages.append(("Deep-checked (officers + PSC + charge particulars)", len(deep), len(deep)))
 
     # ---- estimated debt from latest filed accounts (deep set only) ----
     # Off by default (Marcus, Oct 2026: filed accounts aren't reliable enough to filter on).
@@ -1018,6 +1011,9 @@ def main(argv=None):
             break
     stages.append(("Shortlist (balanced, max %d per class, 1 per parent group)" % a.per_class, len(picked),
                    len(picked)))
+    # provisional size band (no asset capacity yet; radar_weekly_email.py re-scores after profiles)
+    for c in picked:
+        c["size"] = score_size(c)
 
     # ---- contact matching (tp tenant only) ----
     contacts = q(conn, """select email, first_name, last_name, title, company, company_domain,
@@ -1076,7 +1072,6 @@ def main(argv=None):
         return res
 
     for c in picked:
-        c["prop"] = charge_property(ch, c)
         c["contacts"] = match(c)
         c["dnc"] = any(x["flags"] for x in c["contacts"])
 
@@ -1110,10 +1105,10 @@ def main(argv=None):
          f"({a.min_months}-{a.max_months} months old, still outstanding). "
          "Source: public Companies House data only. For Marcus to approve personal one-to-one "
          "outreach; nothing is sent automatically.", "",
-         "Lender allowlist: `scripts/radar_lenders_10m_plus.txt`"
-         + (" (strict: CHECK lines ignored)" if a.strict_lenders else
-            " (CHECK lines active; flagged 'lender unverified')")
-         + f". Lender review helper: `reports/radar/lender-review-{run}.csv`.", "",
+         "Lender categories: `scripts/radar_lenders_10m_plus.txt`; size rules: "
+         "`scripts/radar_size_rules.json`. Size here is PROVISIONAL (no asset capacity yet); "
+         "the weekly email re-scores after asset profiles. "
+         f"Lender review helper: `reports/radar/lender-review-{run}.csv`.", "",
          "## Filter funnel", "", "| Stage | Charges/rows | Companies |", "|---|---:|---:|"]
     L += [f"| {s} | {n:,} | {k:,} |" for s, n, k in stages]
     L += ["", f"## Shortlist ({len(picked)})", ""]
@@ -1130,8 +1125,8 @@ def main(argv=None):
               + (" ..." if c["n"] > 6 else ""),
               *([f"- Sibling SPVs under same parent (also in window): {'; '.join(c['siblings'])}"]
                 if c.get("siblings") else []),
-              f"- Lender(s): {'; '.join(c['lenders'])}"
-              + (" (lender unverified: allowlist CHECK)" if c["lender_check"] else ""),
+              f"- Lender(s): {lenders_line(c)}",
+              f"- Size (provisional): {size_line(c.get('size'))}",
               f"- Property: {(c['charges'][0]['property_description'] or '-')[:220]}"
               f" | postcode {c['postcode'] or '-'}",
               f"- Accounts: {c['acc_type'] or 'none filed'}"
@@ -1167,17 +1162,18 @@ def main(argv=None):
         w.writerow(["rank", "company_number", "company_name", "ch_link", "asset_class",
                     "class_evidence", "sic_codes", "window_charges", "total_outstanding",
                     "first_charge", "last_charge", "months_old_first", "lenders",
-                    "lender_unverified", "postcode", "property_description", "accounts_type",
+                    "size_band_provisional", "postcode", "property_description", "accounts_type",
                     "parents", "directors", "contacts", "do_not_contact", "score", "why_now",
                     "debt_estimate_gbp", "debt_basis", "accounts_made_up", "investment_property_gbp",
                     "total_assets_gbp", "accounts_source", "accounts_filing_link",
-                    "property_charged", "title_numbers", "charge_flags", "charge_deed_link"])
+                    "property_charged", "title_numbers", "charge_flags", "charge_deed_link",
+                    "size_reasons_provisional"])
         for i, c in enumerate(picked, 1):
             w.writerow([i, c["company_number"], c["name"], CH_LINK.format(c["company_number"]),
                         c["cls"], "; ".join(c["evidence"]) + ("; " + c["sic_note"]
                                                               if c.get("sic_note") else ""),
                         " ".join(c["sic"]), c["n"], c["n_total"], c["dates"][0], c["dates"][-1],
-                        mo(c["dates"][0]), "; ".join(c["lenders"]), c["lender_check"],
+                        mo(c["dates"][0]), lenders_line(c), c["size"]["label"],
                         c["postcode"] or "", (c["charges"][0]["property_description"] or "")[:300],
                         c["acc_type"] or "", "; ".join(c.get("parents") or []),
                         "; ".join(c.get("directors") or []),
@@ -1190,7 +1186,8 @@ def main(argv=None):
                            c["debt"]["inv_prop"], c["debt"]["total_assets"], c["debt"]["status"],
                            c["debt"]["link"])]
                        + [property_line(c["prop"], with_link=False), " ".join(c["prop"]["titles"]),
-                          c["prop"]["flags"], c["prop"]["deed_link"] or c["prop"]["charges_link"]])
+                          c["prop"]["flags"], c["prop"]["deed_link"] or c["prop"]["charges_link"],
+                          c["size"]["reasons"]])
 
     print(f"Run date {run}; window {w_start}..{w_end}; {time.time() - t0:.0f}s; "
           f"CH fetched {ch.fetched} cached {ch.cached}")

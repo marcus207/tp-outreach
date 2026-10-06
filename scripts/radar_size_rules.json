@@ -1,0 +1,123 @@
+{
+  "_readme": [
+    "Refinancing radar: LIKELY LOAN SIZE rules (used by scripts/radar_size.py).",
+    "Companies House never shows loan amounts, so size is INFERRED from public signals.",
+    "No figures from filed accounts are used; only the accounts filing TYPE (group/full/small/micro).",
+    "Every threshold below is an ASSUMPTION for Marcus to tune. Keys starting with '_' are comments.",
+    "Strengths: strong / medium_strong / medium / weak / negative. 'medium_strong' counts as a medium for the",
+    "'two mediums' rule but carries more points. Points per strength are in 'points'."
+  ],
+
+  "points": {
+    "_assumption": "Points per signal strength. A single strong signal alone reaches the £10m+ threshold.",
+    "strong": 40,
+    "medium_strong": 22,
+    "medium": 15,
+    "weak": 8,
+    "negative_micro": -25,
+    "negative_dormant": -40
+  },
+
+  "bands": {
+    "_assumption": "A band needs BOTH its minimum score AND (>= 1 strong OR >= 2 medium) signals counted for that band.",
+    "likely_10m": {"label": "Likely £10m+", "card": "Likely £10m+", "min_score": 35, "min_strong": 1, "min_medium": 2},
+    "likely_5m": {"label": "Likely £5m-10m", "card": "Likely £5m+", "min_score": 25, "min_strong": 1, "min_medium": 2},
+    "possible": {"label": "Possible", "card": "Possible", "_note": "any positive signal that does not reach a Likely band"},
+    "unlikely": {"label": "Unlikely", "card": "Unlikely", "_note": "micro-entity accounts (unless a strong signal), or no positive signals; excluded from the email and counted"}
+  },
+
+  "micro_entity_max_band": "possible",
+  "_micro_entity_note": "ASSUMPTION: micro-entity accounts cap the verdict at Possible even with a strong signal (a micro-entity's balance sheet is normally far below a £5m loan).",
+
+  "capacity": {
+    "_assumption": "Capacity thresholds by asset type. '10m' meets the £10m+ band, '5m' the £5m-10m band. All ASSUMPTIONS.",
+    "hotel_rooms": {"10m": 100, "10m_london": 60, "5m": 50, "5m_london": 35},
+    "care_beds": {"10m": 60, "5m": 40},
+    "pbsa_beds": {"10m": 250, "5m": 120, "_note": "student and co-living beds"},
+    "btr_units": {"10m": 100, "5m": 50, "_note": "BTR / residential units (apartments, homes)"},
+    "sen_places": {"10m": 200, "5m": 80, "_note": "ASSUMPTION: SEN school pupil places (GIAS capacity)"},
+    "sqft": {
+      "Logistics/Industrial": {"10m": 50000, "5m": 25000},
+      "Offices": {"10m": 25000, "5m": 12000},
+      "Retail/Leisure": {"10m": 30000, "5m": 15000}
+    }
+  },
+
+  "capacity_weight": {
+    "_assumption": "How much a capacity figure counts, by how sure we are it is the charged asset.",
+    "confirmed": "strong",
+    "likely": "medium_strong",
+    "possible": "weak",
+    "provider_total": "medium",
+    "_definitions": [
+      "confirmed: regulator file (CQC/GIAS), VOA/EPC, or a web figure for a charge that names the property address",
+      "likely: from a 'likely' ownership/news identification, or a web figure where the charge gives no address",
+      "possible: from a 'possible' ownership/news identification",
+      "provider_total: CQC/GIAS totals across an operator's whole estate (not necessarily all charged)"
+    ]
+  },
+
+  "rateable_value": {
+    "_assumption": "VOA 2026 rateable value (only when the asset profile matched the property).",
+    "10m": 250000,
+    "5m": 100000,
+    "strength": "medium",
+    "classes": ["Hotels", "Care", "SEN", "Logistics/Industrial", "Offices", "Retail/Leisure"]
+  },
+
+  "portfolio": {
+    "_assumption": "Portfolio signal (medium). Charges: one facility often registers 2-3 charges on the same day (legal charge, debenture, rent assignment), so charges must also span >= 2 creation dates.",
+    "min_outstanding_charges": 3,
+    "min_distinct_charge_dates": 2,
+    "min_titles_or_properties": 2,
+    "sibling_spvs": true,
+    "strength": "medium"
+  },
+
+  "accounts": {
+    "_assumption": "Latest accounts filing TYPE from the Companies House profile (never the figures).",
+    "group": "medium",
+    "full": "medium",
+    "medium": "medium",
+    "micro-entity": "negative_micro",
+    "dormant": "negative_dormant",
+    "_none": "small, total-exemption, unaudited-abridged, audit-exemption-subsidiary and others score nothing"
+  },
+
+  "parent": {
+    "_assumption": "Parent / PSC names suggesting a listed company, REIT, institutional fund or sovereign-backed group (medium).",
+    "strength": "medium",
+    "patterns": [
+      "\\bplc\\b|public limited company",
+      "\\breit\\b|real estate investment trust",
+      "\\bfunds?\\b|\\bfonds\\b|\\bscsp\\b|s\\.c\\.sp|\\bsicav\\b",
+      "\\bl\\.?p\\.?$|\\blp\\b|limited partnership",
+      "s\\.?\\s?[aà]\\.?\\s?r\\.?\\s?l\\.?",
+      "sovereign|\\badq\\b|investment authority|\\bpif\\b|public investment fund|\\bmubadala\\b|\\bgic\\b|temasek|\\bqia\\b|modon|\\baldar\\b|\\bhassana\\b",
+      "pension|superannuation|\\binsurance\\b|assurance",
+      "blackstone|brookfield|starwood|\\bkkr\\b|\\bpatrizia\\b|\\bnuveen\\b|\\baew\\b|\\blasalle\\b|\\bgreystar\\b|\\bcbre investment\\b"
+    ]
+  },
+
+  "syndication": {
+    "_assumption": "Lender named as agent/trustee for other lenders, or several corporate lenders on one charge = syndicated/club debt (strong).",
+    "agent_regex": "\\bas (the |common )?(security |facility )?(agent|trustee)\\b|\\bsecurity (agent|trustee)\\b|agent (and trustee )?for (the )?(finance|secured|senior) (parties|creditors|lenders)|trustee for the (secured|finance) (parties|creditors)",
+    "min_corporate_persons_on_one_charge": 2,
+    "strength": "strong",
+    "neutral_agent_strength": "medium",
+    "_neutral_agent_note": "ASSUMPTION: when the agent/trustee is a clearing bank, UK challenger or specialist lender (e.g. 'Barclays Security Trustee Limited', 'NatWest as security trustee'), it is usually a bilateral loan with hedging, so it counts as medium, not strong. Keeps 'clearing bank alone never Likely'."
+  },
+
+  "lender_categories": {
+    "_assumption": "Section names in scripts/radar_lenders_10m_plus.txt. Large-ticket specialists score; clearing banks / UK challengers / small-ticket specialists score NOTHING (they lend at every size).",
+    "agent_firm": {"label": "agent/trustee firm", "strength": "medium_strong", "pre_points": 10},
+    "insurer": {"label": "insurer RE debt", "strength": "medium_strong", "pre_points": 10},
+    "debt_fund": {"label": "debt fund", "strength": "medium_strong", "pre_points": 10},
+    "european_bank": {"label": "European bank", "strength": "medium_strong", "pre_points": 10},
+    "international_bank": {"label": "international bank", "strength": "medium_strong", "pre_points": 10},
+    "sovereign_public": {"label": "sovereign/public lender", "strength": "medium_strong", "pre_points": 10},
+    "clearing_bank": {"label": "clearing bank", "strength": "neutral", "pre_points": 3},
+    "uk_challenger": {"label": "UK challenger bank", "strength": "neutral", "pre_points": 3},
+    "specialist_small": {"label": "specialist lender", "strength": "neutral", "pre_points": 1}
+  }
+}
