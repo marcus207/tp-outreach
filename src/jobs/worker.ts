@@ -134,7 +134,12 @@ cron.schedule('0 */6 * * *', async () => {
 });
 
 // Every day at 7:30am UTC: health check + daily report
+// Report emails are off by default (Marcus, Oct 2026: no routine outreach alert emails).
+// Circuit-breaker trip alerts and reply forwards are unaffected.
+const REPORT_EMAILS_ENABLED = process.env.OUTREACH_REPORT_EMAILS_ENABLED === 'true';
+
 cron.schedule('30 7 * * *', async () => {
+  if (!REPORT_EMAILS_ENABLED) return;
   console.log('[Worker Cron] Running daily health check...');
   try {
     await healthCheckService.runAndReport();
@@ -281,6 +286,7 @@ cron.schedule('*/15 * * * *', async () => {
 
 // Weekly deliverability report - Monday 8:00 AM UTC
 cron.schedule('0 8 * * 1', async () => {
+  if (!REPORT_EMAILS_ENABLED) return;
   console.log('[Worker Cron] Running weekly deliverability check...');
   try {
     const { execSync } = require('child_process');
