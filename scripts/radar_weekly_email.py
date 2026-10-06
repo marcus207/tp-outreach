@@ -278,7 +278,7 @@ def credit_lines(cr, inc_fallback=None):
 def card_fields(c, radar, allow_check):
     mo = radar["months_old"]
     dates = c["dates"]
-    shown = ", ".join(f"{d} ({mo(d)}m)" for d in dates[:6]) + (" ..." if len(dates) > 6 else "")
+    shown = ", ".join(f"{d} ({mo(d)} months old)" for d in dates[:6]) + (" ..." if len(dates) > 6 else "")
     lenders = "; ".join(l + (" (check)" if l in allow_check else "") for l in c["lenders"])
     parent = "; ".join(c.get("parents") or []) or "(no corporate PSC)"
     if c.get("psc_people"):
