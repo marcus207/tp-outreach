@@ -33,3 +33,6 @@ __pycache__/
 
 # Image backups
 data/hero_backup_*/
+
+# Maturity radar output (contains personal data: directors names)
+reports/

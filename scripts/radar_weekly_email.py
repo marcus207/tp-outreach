@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""
+Weekly refinancing radar email for Marcus (Monday morning).
+
+  1. Runs scripts/maturity_radar.py (imported) and re-selects the TOP 10 from its
+     balanced shortlist: max 3 per asset class, DO NOT CONTACT entries skipped.
+     Distress list shown separately (max 5), not for cold approach.
+  2. Enriches the 10 with credit data via the existing integration in /root/tp_api_v2
+     (creditsafe_browser.fetch_creditsafe_report). Uses a cached creditsafe_reports row
+     if < 7 days old; otherwise fetches (rate limited ~10s/company inside the module) in
+     a child process with a hard 4 minute total cap. Successful fetches are upserted into
+     creditsafe_reports, matching the existing batch scanner's behaviour.
+  3. Composes HTML + text email and sends via the Gmail API using the OAuth helpers in
+     /root/tp_api_v2/gmail_send.py. There is deliberately NO SMTP/postfix fallback:
+     postfix mail from go.tp.finance would fail authentication. Failure is logged.
+
+NAMING RULE: output text never names the credit provider; it is "credit data".
+DATA GUARD: targeting uses public Companies House data only (via the radar). Loan Intel
+member tables and experian_* are never read.
+
+Usage: python3 scripts/radar_weekly_email.py [--dry-run] [--to addr] [--no-credit]
+"""
+import argparse
+import base64
+import datetime as dt
+import html
+import json
+import multiprocessing as mp
+import os
+import re
+import signal
+import sys
+import time
+
+import psycopg2
+import psycopg2.extras
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+OUT_DIR = os.path.join(ROOT, "reports", "radar")
+API_DIR = "/root/tp_api_v2"
+DSN = "postgresql://tpca@localhost:5432/tpca_platform"  # password via ~/.pgpass
+sys.path.insert(0, HERE)
+
+SENDER = "marcus.emadi@go.tp.finance"
+SENDER_NAME = "Refinancing Radar"
+DEFAULT_TO = "marcus@tp.finance"
+TOP_N, PER_CLASS, DISTRESS_MAX = 10, 3, 5
+CREDIT_CAP_S = 240
+CACHE_DAYS = 7
+CH_LINK = "https://find-and-update.company-information.service.gov.uk/company/{}"
+
+_PROVIDER = re.compile(r"credit\s*safe", re.I)
+
+
+def scrub(s):
+    """Never let the provider name reach any output text."""
+    return _PROVIDER.sub("credit data", str(s)).replace("—", ", ").replace("–", "-")
+
+
+def log(*a):
+    print(scrub(" ".join(str(x) for x in a)), flush=True)
+
+
+# --------------------------------------------------------------------------- selection
+def select(radar):
+    from maturity_radar import norm
+    picked, per, stems, board_sets = [], {}, set(), []
+    for c in radar["picked"]:  # already score-ordered and one per parent group
+        if c.get("dnc"):
+            continue
+        toks = norm(c["name"]).split()
+        stem = " ".join(toks[:2]) if len(toks) >= 2 and len(toks[0]) >= 3 else None
+        if stem and stem in stems:  # sibling SPVs with a shared name stem: show one
+            continue
+        dirs = {d.split(" (appointed")[0] for d in c.get("directors") or []}
+        if any(len(dirs & p) >= 2 for p in board_sets):  # same board = same sponsor group
+            continue
+        if per.get(c["cls"], 0) >= PER_CLASS:
+            continue
+        picked.append(c)
+        if stem:
+            stems.add(stem)
+        board_sets.append(dirs)
+        per[c["cls"]] = per.get(c["cls"], 0) + 1
+        if len(picked) >= TOP_N:
+            break
+    return picked, radar["distress"][:DISTRESS_MAX]
+
+
+# --------------------------------------------------------------------------- credit data
+def _ddmmyyyy(s):
+    if not s:
+        return None
+    if isinstance(s, (dt.date, dt.datetime)):
+        return s if isinstance(s, dt.date) else s.date()
+    m = re.match(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$", str(s).strip())
+    if m:
+        d, mth, y = (int(x) for x in m.groups())
+        y += 2000 if y < 100 else 0
+        try:
+            return dt.date(y, mth, d)
+        except ValueError:
+            return None
+    try:
+        return dt.date.fromisoformat(str(s)[:10])
+    except ValueError:
+        return None
+
+
+def _credit_worker(jobs, queue):
+    """Child process: fetch sequentially, push each result. Own process group so the
+    parent can kill the browser tree on timeout."""
+    try:
+        os.setpgrp()
+    except Exception:
+        pass
+    sys.path.insert(0, API_DIR)
+    try:
+        from creditsafe_browser import fetch_creditsafe_report
+    except Exception as e:
+        queue.put(("__fatal__", {"error": f"import failed: {e}"}))
+        return
+    for cn, name in jobs:
+        try:
+            data = fetch_creditsafe_report(cn, name)
+        except Exception as e:
+            data = {"error": str(e)}
+        queue.put((cn, json.loads(json.dumps(data, default=str))))
+    queue.put(("__done__", {}))
+
+
+def _save(conn, cn, data):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO creditsafe_reports (company_number, creditsafe_id, credit_score, credit_limit,
+                ccj_count, ccj_total_value, payment_days, accounts_overdue, company_status,
+                incorporation_date, latest_accounts_date, contract_limit, international_score,
+                industry_dbt, risk_rating, credit_score_band, raw_report, fetched_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (company_number) DO UPDATE SET
+                creditsafe_id=EXCLUDED.creditsafe_id, credit_score=EXCLUDED.credit_score,
+                credit_limit=EXCLUDED.credit_limit, ccj_count=EXCLUDED.ccj_count,
+                ccj_total_value=EXCLUDED.ccj_total_value, payment_days=EXCLUDED.payment_days,
+                accounts_overdue=EXCLUDED.accounts_overdue, company_status=EXCLUDED.company_status,
+                incorporation_date=EXCLUDED.incorporation_date,
+                latest_accounts_date=EXCLUDED.latest_accounts_date,
+                contract_limit=EXCLUDED.contract_limit, international_score=EXCLUDED.international_score,
+                industry_dbt=EXCLUDED.industry_dbt, risk_rating=EXCLUDED.risk_rating,
+                credit_score_band=EXCLUDED.credit_score_band, raw_report=EXCLUDED.raw_report,
+                fetched_at=NOW()""",
+            (cn, f"GB-0-{cn}", data.get("credit_score"), data.get("credit_limit"),
+             data.get("ccj_count", 0), data.get("ccj_total_value"),
+             data.get("payment_days_beyond_terms") or 0, data.get("accounts_overdue", False),
+             (data.get("company_status") or None) and str(data["company_status"])[:100],
+             _ddmmyyyy(data.get("incorporation_date")), _ddmmyyyy(data.get("last_accounts_date")),
+             data.get("contract_limit"), data.get("international_score"), data.get("industry_dbt"),
+             data.get("risk_rating"), data.get("credit_score_band"), json.dumps(data)))
+
+
+def _norm_row(r, source):
+    return {"source": source, "score": r.get("credit_score"),
+            "band": r.get("credit_score_band") or r.get("risk_rating"),
+            "limit": r.get("credit_limit"), "ccj_count": r.get("ccj_count"),
+            "ccj_value": r.get("ccj_total_value"),
+            "dbt": r.get("payment_days") if "payment_days" in r else r.get("payment_days_beyond_terms"),
+            "industry_dbt": r.get("industry_dbt"), "status": r.get("company_status"),
+            "inc": _ddmmyyyy(r.get("incorporation_date")),
+            "intl": r.get("international_score"), "fetched": r.get("fetched_at")}
+
+
+def enrich(companies, enabled=True):
+    """Returns {company_number: credit dict or None} and a stats dict."""
+    stats = {"cached": 0, "fetched": 0, "failed": 0, "skipped_cap": 0}
+    out = {c["company_number"]: None for c in companies}
+    conn = psycopg2.connect(DSN)
+    conn.autocommit = True
+    nums = list(out)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""select company_number, credit_score, credit_score_band, risk_rating,
+                              credit_limit, ccj_count, ccj_total_value, payment_days, industry_dbt,
+                              company_status, incorporation_date, international_score, fetched_at
+                       from creditsafe_reports
+                       where company_number = any(%s) and fetched_at > now() - interval '%s days'""",
+                    (nums, CACHE_DAYS))
+        for r in cur.fetchall():
+            out[r["company_number"]] = _norm_row(dict(r), "cached")
+            stats["cached"] += 1
+    todo = [(c["company_number"], c["name"]) for c in companies if out[c["company_number"]] is None]
+    if not enabled or not todo:
+        stats["skipped_cap"] = len(todo) if not enabled else 0
+        conn.close()
+        return out, stats
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_credit_worker, args=(todo, queue), daemon=True)
+    deadline = time.time() + CREDIT_CAP_S
+    proc.start()
+    got = set()
+    while time.time() < deadline and len(got) < len(todo):
+        try:
+            cn, data = queue.get(timeout=max(0.5, min(5, deadline - time.time())))
+        except Exception:
+            if not proc.is_alive():
+                break
+            continue
+        if cn == "__done__":
+            break
+        if cn == "__fatal__":
+            log("credit data: integration unavailable:", data.get("error"))
+            break
+        got.add(cn)
+        if data.get("error") or data.get("credit_score") is None and not data.get("credit_limit"):
+            stats["failed"] += 1
+            log(f"credit data: {cn} unavailable ({data.get('error') or 'no score parsed'})")
+            continue
+        try:
+            _save(conn, cn, data)
+        except Exception as e:
+            log(f"credit data: {cn} fetched but not cached ({e})")
+        out[cn] = _norm_row(data, "fetched")
+        stats["fetched"] += 1
+        log(f"credit data: {cn} fetched (score {data.get('credit_score')})")
+    if proc.is_alive():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # child + its browser processes
+        except Exception:
+            proc.kill()
+        proc.join(5)
+    stats["skipped_cap"] = len(todo) - len(got)
+    if stats["skipped_cap"]:
+        log(f"credit data: 4 minute cap reached, {stats['skipped_cap']} not fetched")
+    conn.close()
+    return out, stats
+
+
+# --------------------------------------------------------------------------- formatting
+def e(s):
+    return html.escape(scrub(s if s is not None else ""))
+
+
+def money(v):
+    if v is None or v == "":
+        return "-"
+    v = float(v)
+    if v >= 1e6:
+        return f"£{v / 1e6:.1f}m"
+    if v >= 1e3:
+        return f"£{v / 1e3:,.0f}k"
+    return f"£{v:,.0f}"
+
+
+def fmt_date(d):
+    return d.strftime("%-d %b %Y") if d else "-"
+
+
+def credit_lines(cr, inc_fallback=None):
+    if not cr:
+        return ["Credit data unavailable"]
+    ccj = cr["ccj_count"] or 0
+    dbt = cr["dbt"]
+    if cr["source"] == "cached" and not dbt and cr.get("industry_dbt") is None:
+        dbt = None  # stored 0 = not reported
+    return [
+        f"Score: {cr['score'] if cr['score'] is not None else '-'}"
+        + (f" ({cr['band']})" if cr["band"] else ""),
+        f"Credit limit: {money(cr['limit'])}",
+        f"CCJs: {ccj}" + (f", value {money(cr['ccj_value'])}" if ccj and cr["ccj_value"] else ""),
+        "Payment days (DBT): " + (str(dbt) if dbt is not None else "-")
+        + (f" (industry {cr['industry_dbt']})" if cr.get("industry_dbt") is not None else ""),
+        f"Status: {cr['status'] or '-'}",
+        f"Incorporated: {fmt_date(cr['inc'] or inc_fallback)}",
+        f"International score: {cr['intl'] or '-'}",
+    ]
+
+
+def card_fields(c, radar, allow_check):
+    mo = radar["months_old"]
+    dates = c["dates"]
+    shown = ", ".join(f"{d} ({mo(d)}m)" for d in dates[:6]) + (" ..." if len(dates) > 6 else "")
+    lenders = "; ".join(l + (" (check)" if l in allow_check else "") for l in c["lenders"])
+    parent = "; ".join(c.get("parents") or []) or "(no corporate PSC)"
+    if c.get("psc_people"):
+        parent += " | individuals: " + "; ".join(c["psc_people"])
+    prop = (c["charges"][0]["property_description"] or "-")[:220]
+    contacts = "; ".join(f"{x['name'] or '(no name)'} <{x['email']}>" for x in c["contacts"][:3]) \
+        or "No contact held"
+    if len(c["contacts"]) > 3:
+        contacts += f" (+{len(c['contacts']) - 3} more)"
+    ev = ", ".join(c["evidence"][:4]) or "-"
+    if c.get("sic_note"):
+        ev += "; " + c["sic_note"]
+    return [
+        ("Parent / PSC", parent),
+        ("Asset class", f"{c['cls']} ({ev})"),
+        ("Charges", f"{c['n']} in window, {c['n_total']} outstanding in total; {shown}"),
+        ("Lender(s)", lenders),
+        ("Property", prop + (f" | {c['postcode']}" if c.get("postcode") else "")),
+        ("Accounts", (c.get("acc_type") or "none filed") + (" (overdue)" if c.get("acc_overdue") else "")),
+        ("Directors", "; ".join(c.get("directors") or []) or "-"),
+        ("Existing contact", contacts),
+    ]
+
+
+def build(radar, top, distress, credit, wc):
+    why = radar["why"]
+    subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}"
+    intro = (f"{len(top)} sponsors whose facilities are likely in their refinancing window. "
+             "Reply with the numbers you'd like approached and I'll draft a personal note for each.")
+    method = ("Method: public Companies House charges reaching their 5-year anniversary in the "
+              "next 3 months, still outstanding, with lenders on our £10m+ allowlist; target asset "
+              "classes only (schools: SEN-specific only); maturity is inferred from charge age, "
+              "not known. '(check)' marks a lender on the allowlist pending "
+              "verification. Credit data cached up to 7 days. Directors' names are personal data: "
+              "internal use only.")
+    td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
+    tv = 'style="padding:3px 0;vertical-align:top;font-size:13px"'
+    H = ['<!doctype html><html><body style="margin:0;padding:0;background:#f4f4f2">',
+         '<div style="max-width:720px;margin:0 auto;padding:20px;font-family:Georgia,serif;color:#1a1a1a">',
+         f'<h1 style="font-size:22px;font-weight:normal;margin:0 0 6px">Refinancing radar, w/c {e(fmt_date(wc))}</h1>',
+         f'<p style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;margin:0 0 18px">{e(intro)}</p>']
+    T = [subject, "", intro, ""]
+    for i, c in enumerate(top, 1):
+        cn = c["company_number"]
+        allow_check = {r["lname"] for r in c["charges"] if r["allow"] and r["allow"][1]}
+        fields = card_fields(c, radar, allow_check)
+        H.append('<div style="background:#fff;border:1px solid #ddd;padding:14px 16px;margin:0 0 14px;'
+                 'font-family:Arial,sans-serif">')
+        H.append(f'<div style="font-family:Georgia,serif;font-size:17px;margin:0 0 2px">'
+                 f'{i}. {e(c["name"])}</div>')
+        H.append(f'<div style="font-size:12px;color:#555;margin:0 0 10px">{e(cn)} &middot; '
+                 f'<a href="{CH_LINK.format(cn)}" style="color:#1f3a5f">Companies House</a></div>')
+        H.append(f'<table style="border-collapse:collapse;width:100%">')
+        for k, v in fields:
+            H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{e(v)}</td></tr>")
+        cl = credit_lines(credit.get(cn), _ddmmyyyy((c.get("profile") or {}).get("date_of_creation")))
+        H.append(f"<tr><td {td}>Credit data</td><td {tv}>{'<br>'.join(e(x) for x in cl)}</td></tr>")
+        H.append(f'<tr><td {td}><b>Why now</b></td><td {tv}><b>{e(why(c))}</b></td></tr>')
+        H.append("</table></div>")
+        T += [f"{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
+        T += [f"   {k}: {v}" for k, v in fields]
+        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", ""]
+    H.append('<h2 style="font-size:16px;font-weight:normal;margin:22px 0 6px">'
+             'Distress / not for cold approach</h2>')
+    H.append('<ul style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 18px;padding-left:18px">')
+    T.append("Distress / not for cold approach")
+    for c in distress:
+        line = (f"{c['name']} ({c['company_number']}): status {c['status']}"
+                f"{', insolvency history' if c.get('insolv') else ''}; {c['n']} window charge(s) "
+                f"with {'; '.join(c['lenders'][:3])}")
+        H.append(f"<li>{e(line)}</li>")
+        T.append(f" - {line}")
+    if not distress:
+        H.append("<li>None this week</li>")
+        T.append(" - None this week")
+    H.append(f'<p style="font-family:Arial,sans-serif;font-size:11px;color:#666;line-height:1.5;'
+             f'border-top:1px solid #ccc;padding-top:10px">{e(method)}</p></div></body></html>')
+    T += ["", method]
+    return scrub(subject), scrub("\n".join(H)), scrub("\n".join(T))
+
+
+# --------------------------------------------------------------------------- send
+def send(to, subject, html_body, text_body):
+    """Gmail API only, no SMTP fallback. Returns the Gmail message id."""
+    sys.path.insert(0, API_DIR)
+    import gmail_send as gs
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleRequest
+    from googleapiclient.discovery import build as gbuild
+
+    cid, csec = gs._load_oauth_client()
+    rt = gs._get_refresh_token(SENDER)
+    if not (cid and csec and rt):
+        raise RuntimeError("missing OAuth client or refresh token for sender")
+    # scopes=None: refresh with the scopes originally granted (gmail.modify covers send)
+    creds = Credentials(token=None, refresh_token=rt, token_uri="https://oauth2.googleapis.com/token",
+                        client_id=cid, client_secret=csec)
+    creds.refresh(GoogleRequest())
+    msg = gs._build_message(SENDER, SENDER_NAME, to, subject, html_body, text_body)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    svc = gbuild("gmail", "v1", credentials=creds, cache_discovery=False)
+    res = svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+    return res.get("id")
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--to", default=DEFAULT_TO)
+    ap.add_argument("--no-credit", action="store_true", help="skip live credit fetches (cache only)")
+    a = ap.parse_args()
+    t0 = time.time()
+    log(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] radar weekly email start")
+
+    import maturity_radar
+    radar = maturity_radar.main([])
+    top, distress = select(radar)
+    log(f"selected {len(top)} (distress shown {len(distress)})")
+
+    credit, st = enrich(top, enabled=not a.no_credit)
+    log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "
+        f"not reached (cap) {st['skipped_cap']}")
+
+    run = radar["run"]
+    wc = run - dt.timedelta(days=run.weekday())
+    subject, html_body, text_body = build(radar, top, distress, credit, wc)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    path = os.path.join(OUT_DIR, f"email-{run}.html")
+    open(path, "w").write(html_body)
+    log(f"wrote {path}")
+
+    if a.dry_run:
+        log("dry run: not sent")
+        return 0
+    try:
+        mid = send(a.to, subject, html_body, text_body)
+    except Exception as ex:
+        log(f"SEND FAILED via Gmail API ({type(ex).__name__}: {ex}); no fallback used")
+        return 1
+    log(f"sent '{subject}' from {SENDER} to {a.to}; Gmail message id {mid}; {time.time() - t0:.0f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

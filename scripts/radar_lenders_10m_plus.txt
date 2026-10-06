@@ -1,0 +1,192 @@
+# Maturity radar: LENDER ALLOWLIST (lenders known to write GBP 10m+ commercial real estate loans)
+#
+# Used by scripts/maturity_radar.py as a HARD FILTER: a charge only counts if its lender
+# (raw Companies House name OR normalised trading name) matches one of the lines below.
+#
+# Format:
+#   - one case-insensitive Python regex per line (plain names work as-is)
+#   - lines starting with '#' are comments; blank lines ignored
+#   - anything after whitespace + '#' on a line is a comment
+#   - a trailing '# CHECK' marks an entry we are not sure about. CHECK entries are ACTIVE by
+#     default (the candidate is flagged "lender unverified" in the report); run the radar with
+#     --strict-lenders to ignore them entirely.
+#
+# Edit freely. Remove '# CHECK' once confirmed, delete the line to drop a lender.
+# Data-driven helper for additions: reports/radar/lender-review-YYYY-MM-DD.csv
+#
+# NOTE: allowlisting is lender-level only. Clearing banks also write small SME loans, so a
+# clearing-bank charge does not prove a GBP 10m+ facility; accounts type / charge count help.
+
+# ---- UK clearing banks (corporate / real estate desks) ----
+\blloyds bank\b
+\bbank of scotland\b
+national westminster|\bnatwest\b
+royal bank of scotland
+\bbarclays\b
+\bhsbc\b
+\bsantander\b
+svenska handels?banken|\bhandelsbanken\b
+\bvirgin money\b|\bclydesdale bank\b                 # CHECK (mostly SME/mid-market)
+\bcoutts\b                                          # CHECK (private bank; some large RE loans)
+
+# ---- Specialist / challenger banks with corporate RE lending ----
+\binvestec\b
+\boaknorth\b
+\bclose brothers\b                                  # CHECK (property finance often < 10m)
+\barbuthnot latham\b                                # CHECK
+\bshawbrook\b                                       # CHECK (big BTL book; corporate RE desk does 10m+)
+\bunited trust bank\b                               # CHECK (development, up to ~20m)
+\bhampshire trust bank\b                            # CHECK
+\bcynergy bank\b                                    # CHECK
+\bgatehouse bank\b                                  # CHECK
+\bal rayan bank\b                                   # CHECK
+\bbank of london and (the )?middle east\b           # CHECK
+\bqib\b|qatar islamic bank                          # CHECK
+\bhodge bank\b|julian hodge                         # CHECK
+\bc\.? ?hoare\b                                     # CHECK
+\bweatherbys\b                                      # CHECK
+
+# ---- Irish / European / international banks active in UK CRE ----
+\baib\b|allied irish                                # CHECK
+\bbank of ireland\b                                 # CHECK (also UK residential mortgages)
+\bulster bank\b                                     # CHECK (run-off)
+\bdanske bank\b                                     # CHECK
+\bdeutsche bank\b
+deutsche pfandbriefbank|\bpbb\b
+\baareal\b
+\bhelaba\b|landesbank hessen
+\blbbw\b|landesbank baden
+bayerische landesbank|\bbayernlb\b
+\bberlin hyp\b
+\bdekabank\b
+\bdz hyp\b|\bdz bank\b
+\bmunchener hyp|muenchener hyp
+\bing bank\b|\bing\b
+\babn amro\b
+\brabobank\b
+\bbnp paribas\b
+\bnatixis\b
+societe generale|soci[eé]t[eé] g[eé]n[eé]rale
+credit agricole|cr[eé]dit agricole|\bcacib\b
+\bnordea\b
+\bseb\b|skandinaviska enskilda
+\bsabadell\b|\btsb\b                                 # CHECK
+\bstandard chartered\b                              # CHECK
+\bmizrahi tefahot\b                                 # CHECK
+\bbank leumi\b                                      # CHECK
+\bdbs bank\b                                        # CHECK
+\bunited overseas bank\b|\buob\b                    # CHECK
+\bbank of china\b|\bicbc\b|china construction bank  # CHECK
+\bsumitomo\b|\bmizuho\b|\bmufg\b
+\bnational bank of kuwait\b                         # CHECK
+\babu dhabi commercial\b|\bfirst abu dhabi\b|\bemirates nbd\b  # CHECK
+
+# ---- US / global investment banks (CMBS, balance sheet) ----
+\bcitibank\b|\bcitigroup\b
+j\.? ?p\.? ?morgan|\bjpmorgan\b
+\bgoldman sachs\b
+\bmorgan stanley\b
+bank of america|merrill lynch
+\bwells fargo\b
+\bcredit suisse\b|\bubs\b
+
+# ---- Insurers / pension real estate debt ----
+\brothesay\b
+legal (and|&) general
+\baviva\b
+\bm ?& ?g\b|\bm and g\b|prudential assurance
+\bcanada life\b
+\bpricoa\b|\bpgim\b
+\bmetlife\b|metropolitan life
+pension insurance corporation
+\bphoenix life\b|standard life
+\bjust retirement\b|\bjust group\b                  # CHECK
+\baxa\b
+\ballianz\b
+\bzurich\b                                          # CHECK
+\bscottish widows\b
+\bcanada pension\b|\bcppib\b
+
+# ---- Debt funds / alternative lenders (institutional size) ----
+\bicg\b|icg[- ]longbow|intermediate capital
+\bares (capital|management|real estate)\b                    # CHECK (name collisions with small lenders)
+\bblackstone\b
+\bstarwood\b
+\bapollo (global|management|capital)\b|\bathene\b   # CHECK
+\bkkr\b
+\bcheyne\b
+\bbrookfield\b
+\bcale street\b
+\barrow global\b
+\blasalle\b
+\baew\b
+\bbain capital\b
+\btristan\b
+\bpimco\b
+\bcerberus\b
+\boaktree\b
+\bfortress (investment|credit|real estate)\b
+\blone star\b
+\bdavidson kempner\b
+\bcastlelake\b
+\bpatrizia\b
+\bnuveen\b
+federated hermes|\bhermes\b
+columbia threadneedle
+\bdrc\b|drc capital|\bdrc savills
+\blaxfield\b
+\brevcap\b
+\bcording\b                                          # CHECK
+\bpaloma\b                                          # CHECK
+\bwellesley\b                                       # CHECK
+\boctopus\b                                         # CHECK (Octopus Real Estate: 10m+ some deals)
+\bmaslow\b                                          # CHECK
+\bdowning\b                                         # CHECK
+\bpuma (property|capital|investments?)\b            # CHECK
+\batelier\b                                         # CHECK
+\balchemy\b                                         # CHECK
+\bortus\b                                           # CHECK
+\btuscan capital\b                                  # CHECK
+\bprecede\b                                         # CHECK
+\bpluto\b                                           # CHECK
+\bhilco\b                                           # CHECK
+\ba\.?s\.?k\.? partners\b                           # CHECK
+\bfiduciam\b                                        # CHECK
+\btriple point\b                                    # CHECK
+\bpacific life\b|\bpacific investment\b             # CHECK
+\bsancus\b                                          # CHECK
+\bmagnetar\b
+\bsixth street\b
+\bhayfin\b
+\bpemberton\b
+\bm ?& ?g real estate\b
+\bmount street\b                                    # loan servicer/agent for institutional loans
+\bcbre loan services\b                              # loan servicer/agent for institutional loans
+\bsitus\b                                           # loan servicer/agent for institutional loans
+\bsolutus\b                                         # CHECK (loan servicer)
+
+# ---- Public sector lenders writing large facilities ----
+\bhomes england\b
+greater manchester combined authority               # CHECK
+development bank of wales                           # CHECK
+\bnational wealth fund\b|uk infrastructure bank
+
+# ---- Security agents / trustees (syndicated or club debt) ----
+\bglas\b|global loan agency
+\blucid (trustee|agency|issuer)
+\bwilmington trust\b
+citicorp trustee
+u\.?s\.? bank trustees?
+hsbc corporate trustee
+law debenture
+\bkroll trustee\b                                   # CHECK (also bond / platform trustees)
+\balter domus\b
+\bsanne\b
+\bintertrust\b
+\btmf (trustee|corporate)
+\bocorian\b
+\bapex corporate trustees\b
+deutsche bank trust
+bank of new york mellon|\bbny mellon\b
+\bm ?& ?g trustee\b
+\bas security (agent|trustee)\b
