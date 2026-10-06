@@ -7,7 +7,12 @@ Weekly refinancing radar email for Marcus (Monday morning).
      them (capacity: rooms/beds/units/sq ft; cached), then scores LIKELY LOAN SIZE
      (scripts/radar_size.py, rules in radar_size_rules.json). The email TOP 10 ranks
      Likely £10m+, then Likely £5m-10m, then Possible (max 3 per asset class); Unlikely
-     candidates are excluded and counted. Distress list shown separately (max 5).
+     candidates are excluded and counted.
+     DISTRESSED section (scripts/radar_distress.py): wider 24-72 month universe, formal / receiver /
+     soft distress signals from Companies House, The Gazette and cached credit data; up to 10, ranked
+     by tier then size band; approach via the appointed IP/receiver, never the directors. A company
+     appears in one section only (formal/receiver tiers leave the main list; early-warning main
+     candidates stay in the main list).
   2. Enriches the 10 with credit data via the existing integration in /root/tp_api_v2
      (creditsafe_browser.fetch_creditsafe_report). Uses a cached creditsafe_reports row
      if < 7 days old; otherwise fetches (rate limited ~10s/company inside the module) in
@@ -48,7 +53,8 @@ sys.path.insert(0, HERE)
 SENDER = "marcus.emadi@go.tp.finance"
 SENDER_NAME = "Refinancing Radar"
 DEFAULT_TO = "marcus@tp.finance"
-TOP_N, PER_CLASS, DISTRESS_MAX = 10, 3, 5
+TOP_N, PER_CLASS, DISTRESS_MAX = 10, 3, 10
+DISTRESS_PROFILE_MAX = 14  # distressed candidates given an asset profile (web/LLM cost)
 # Asset profiles cost web search + LLM calls: profile at most PROFILE_MAX candidates
 # (max PROFILE_PER_CLASS per class), cached for PROFILE_CACHE_DAYS.
 PROFILE_MAX, PROFILE_PER_CLASS, PROFILE_CACHE_DAYS = 25, 6, 6
@@ -124,10 +130,26 @@ def select_top(scored):
     return balanced(ok, TOP_N, PER_CLASS)
 
 
-def distress_list(radar):
-    """Distress section rows (administration / liquidation / insolvency history): noted, never
-    for cold approach. Extend here (e.g. a fuller distress section) without touching the top 10."""
-    return radar["distress"][:DISTRESS_MAX]
+def distress_build(radar, main_cands):
+    """Full distress scan (radar_distress.build) over the 24-72 month universe. main_cands are the
+    main radar's profiled candidates: merged into the scan so a company is classed once."""
+    import radar_distress
+    return radar_distress.build(run=radar["run"], extra=list(radar["distress"]) + list(main_cands))
+
+
+def distress_list(dres, top):
+    """Up to DISTRESS_MAX distressed candidates not already in the main top list, with asset
+    profiles and re-scored size. Approach via the appointed IP/receiver, never the directors."""
+    import radar_distress
+    from radar_size import band_rank, score_size
+    shown = {c["company_number"] for c in top}
+    dres = {**dres, "candidates": [c for c in dres["candidates"] if c["company_number"] not in shown]}
+    picked = radar_distress.select(dres, DISTRESS_PROFILE_MAX)
+    prof = asset_profiles(picked)
+    for c in picked:
+        c["size"] = score_size(c)
+    picked.sort(key=lambda c: (radar_distress.TIER_KEYS.index(c["tier"]), band_rank(c["size"]), -c["dscore"]))
+    return picked[:DISTRESS_MAX], prof
 
 
 # --------------------------------------------------------------------------- credit data
@@ -638,29 +660,92 @@ def card_fields(c, radar):
     ]
 
 
-def distress_block(distress):
-    """(html lines, text lines) for the distress section."""
-    H = ['<h2 style="font-size:16px;font-weight:normal;margin:22px 0 6px">'
-         'Distress / not for cold approach</h2>',
-         '<ul style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 18px;padding-left:18px">']
-    T = ["Distress / not for cold approach"]
-    for c in distress:
-        line = (f"{c['name']} ({c['company_number']}): status {c['status']}"
-                f"{', insolvency history' if c.get('insolv') else ''}; {c['n']} window charge(s) "
-                f"with {'; '.join(c['lenders'][:3])}")
-        H.append(f"<li>{e(line)}</li>")
-        T.append(f" - {line}")
+def distress_fields(c, radar):
+    """[(label, text, link, link_label, prebuilt_html)] for one distressed card."""
+    from maturity_radar import lenders_line
+    from radar_size import size_line
+    import radar_distress as rd
+    mo = radar["months_old"]
+    dates = c["dates"]
+    shown = ", ".join(f"{d} ({mo(d)} months old)" for d in dates[:5]) + (" ..." if len(dates) > 5 else "")
+    sig_t, sig_h = [], []
+    for s_ in c["signals"][:7]:
+        when = f" ({rd.fmt(s_['date'])})" if s_.get("date") and rd.fmt(s_["date"]) not in s_["text"] else ""
+        sig_t.append(s_["text"] + when + (f" [{s_['url']}]" if s_.get("url") else ""))
+        sig_h.append("&bull; " + e(s_["text"] + when)
+                     + (f' <a href="{html.escape(s_["url"])}" style="color:#1f3a5f">[source]</a>'
+                        if s_.get("url") else " [credit data]" if s_["kind"] == "credit" else ""))
+    ev = ", ".join(c.get("evidence")[:3]) or "-"
+    if c.get("sic_note"):
+        ev += "; " + c["sic_note"]
+    out = [("Tier", rd.TIER_LABEL[c["tier"]]),
+           ("Size", size_line(c.get("size"))),
+           *asset_fields(c),
+           ("Asset class", f"{c['cls']} ({ev})"),
+           ("Lender(s)", lenders_line(c)),
+           ("Charges", f"{c['n']} in the 24-72 month window, {c.get('n_total', c['n'])} outstanding in total; {shown}"),
+           ("Property charged", __import__("maturity_radar").property_line(c.get("prop"), with_link=False),
+            (c.get("prop") or {}).get("deed_link") or (c.get("prop") or {}).get("charges_link"), "charges"),
+           ("Signals", "; ".join(sig_t) or "-", None, None, "<br>".join(sig_h) or "-"),
+           ("Appointed IP / receiver", rd.appointee_line(c))]
+    if c.get("related"):
+        out.append(("Related SPVs (same process/group)", "; ".join(c["related"][:4])
+                    + (f" (+{len(c['related']) - 4} more)" if len(c["related"]) > 4 else "")))
+    return out
+
+
+def distress_block(distress, credit=None, radar=None, dres=None):
+    """(html lines, text lines) for the DISTRESSED section."""
+    import radar_distress as rd
+    credit = credit or {}
+    title = "Distressed (approach via the appointed IP/receiver where shown)"
+    cnt = (dres or {}).get("counts") or {}
+    mn, mx = (dres or {}).get("window", (rd.MIN_MONTHS, rd.MAX_MONTHS))
+    summ = (f"Found in the {mn}-{mx} month charge universe: {cnt.get('insolvency', 0)} in insolvency, "
+            f"{cnt.get('receiver', 0)} with a receiver, {cnt.get('early', 0)} early warning. "
+            f"Showing {len(distress)}, ranked by tier then likely loan size. Approach is to the appointed "
+            "insolvency practitioner or receiver, not the directors; early-warning names have no appointee yet.")
+    failed = [f"{k}: {v}" for k, v in ((dres or {}).get("sources") or {}).items() if "FAIL" in v]
+    if failed:
+        summ += " Source problems this week: " + "; ".join(failed) + "."
+    td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
+    tv = 'style="padding:3px 0;vertical-align:top;font-size:13px"'
+    H = [f'<h2 style="font-size:18px;font-weight:normal;margin:26px 0 6px;font-family:Georgia,serif">{e(title)}</h2>',
+         f'<p style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 12px">{e(summ)}</p>']
+    T = ["", title, summ, ""]
+    for i, c in enumerate(distress, 1):
+        cn = c["company_number"]
+        fields = distress_fields(c, radar)
+        H.append('<div style="background:#fff;border:1px solid #ddd;border-left:3px solid #8a2f2f;'
+                 'padding:14px 16px;margin:0 0 14px;font-family:Arial,sans-serif">')
+        H.append(f'<div style="font-family:Georgia,serif;font-size:17px;margin:0 0 2px">D{i}. {e(c["name"])}</div>')
+        H.append(f'<div style="font-size:12px;color:#555;margin:0 0 10px">{e(cn)} &middot; '
+                 f'<a href="{CH_LINK.format(cn)}" style="color:#1f3a5f">Companies House</a></div>')
+        H.append('<table style="border-collapse:collapse;width:100%">')
+        for k, v, *lk in fields:
+            if len(lk) >= 3 and lk[2]:
+                H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{lk[2]}</td></tr>")
+                continue
+            link = f' <a href="{html.escape(lk[0])}" style="color:#1f3a5f">[{e(lk[1])}]</a>' if lk and lk[0] else ""
+            H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{e(v)}{link}</td></tr>")
+        cl = credit_lines(credit.get(cn), _ddmmyyyy((c.get("profile") or {}).get("date_of_creation")))
+        H.append(f"<tr><td {td}>Credit data</td><td {tv}>{'<br>'.join(e(x) for x in cl)}</td></tr>")
+        H.append(f'<tr><td {td}><b>Angle</b></td><td {tv}><b>{e(c.get("angle") or "")}</b></td></tr>')
+        H.append("</table></div>")
+        T += [f"D{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
+        T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
+        T += ["   Credit data: " + " | ".join(cl), f"   Angle: {c.get('angle') or ''}", ""]
     if not distress:
-        H.append("<li>None this week</li>")
+        H.append('<p style="font-family:Arial,sans-serif;font-size:13px">None this week</p>')
         T.append(" - None this week")
-    H.append("</ul>")
     return H, T
 
 
-def build(radar, top, distress, credit, wc, size_counts=None):
+def build(radar, top, distress, credit, wc, size_counts=None, dres=None):
     why = radar["why"]
     sc = size_counts or {}
-    subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}"
+    subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}" + (
+        f" (+{len(distress)} distressed)" if distress else "")
     intro = (f"{len(top)} sponsors whose facilities are likely in their refinancing window. "
              "Reply with the numbers you'd like approached and I'll draft a personal note for each.")
     method = ("Method: public Companies House charges reaching their 5-year anniversary in the "
@@ -683,6 +768,12 @@ def build(radar, top, distress, credit, wc, size_counts=None):
               "LinkedIn links come from public web search "
               "and are marked likely, not confirmed. Director work emails are from Apollo: only "
               "'verified' emails are usable; nothing here is added to contacts or sequences. "
+              "Distressed section: same base filters and size score, but charges 24-72 months old; "
+              "signals from Companies House (status, insolvency cases and practitioners, receiver "
+              "filings, overdue filings, compulsory strike-off, director and auditor changes, new "
+              "bridging/specialist charges), The Gazette (appointments, petitions, dividend notices) "
+              "and credit data; tiers In insolvency, Receiver appointed, Early warning; angle lines "
+              "state the signals, not outcomes. "
               "Credit data cached up to 7 days. Directors' names are personal data: "
               "internal use only.")
     td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
@@ -716,7 +807,7 @@ def build(radar, top, distress, credit, wc, size_counts=None):
         T += [f"{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
         T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
         T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", ""]
-    dh, dtx = distress_block(distress)
+    dh, dtx = distress_block(distress, credit, radar, dres)
     H += dh
     T += dtx
     H.append(f'<p style="font-family:Arial,sans-serif;font-size:11px;color:#666;line-height:1.5;'
@@ -899,10 +990,24 @@ def main():
     import maturity_radar
     from radar_size import score_size
     radar = maturity_radar.main(RADAR_ARGS)
-    distress = distress_list(radar)
     cands, micro = profile_set(radar)
     log(f"profile set {len(cands)} (cap {PROFILE_MAX}, max {PROFILE_PER_CLASS}/class); "
-        f"micro-entity skipped before profiling {len(micro)}; distress shown {len(distress)}")
+        f"micro-entity skipped before profiling {len(micro)}")
+    td0 = time.time()
+    try:
+        dres = distress_build(radar, cands)
+    except Exception as ex:  # never lose the main radar on a distress problem
+        log(f"DISTRESS SCAN FAILED ({type(ex).__name__}: {ex}); main list unaffected")
+        dres = {"candidates": [], "counts": {}, "sources": {"distress scan": f"FAILED ({type(ex).__name__})"},
+                "window": (24, 72)}
+    # formal / receiver tiers leave the main list (one section per company)
+    hard = {c["company_number"] for c in dres["candidates"] if c["tier"] in ("insolvency", "receiver")}
+    moved = [c for c in cands if c["company_number"] in hard]
+    cands = [c for c in cands if c["company_number"] not in hard]
+    for k, v in (dres.get("sources") or {}).items():
+        log(f"distress source {k}: {v}")
+    log(f"distress scan: {time.time() - td0:.0f}s; tiers {dres.get('counts')}; moved out of main "
+        f"(formal/receiver) {len(moved)}")
 
     t1 = time.time()
     prof = asset_profiles(cands)
@@ -928,6 +1033,18 @@ def main():
         len(top), sum(1 for c in top if not c["prop"]["generic"]),
         sum(1 for c in top if c["prop"]["generic"])))
 
+    td1 = time.time()
+    try:
+        distress, dprof = distress_list(dres, top) if dres["candidates"] else ([], {})
+    except Exception as ex:
+        log(f"DISTRESS LIST FAILED ({type(ex).__name__}: {ex})")
+        distress = []
+    import radar_distress as rd
+    log(f"distressed shown {len(distress)} ({time.time() - td1:.0f}s incl. asset profiles):")
+    for c in distress:
+        log(f"  [{rd.TIER_LABEL[c['tier']]}] {c['name'][:45]} ({c['company_number']}) {c['cls']} | "
+            f"{c['size']['label']} | {rd.appointee_line(c)[:120]}")
+
     li = linkedin(top)
     log(f"linkedin (search, likely only): directors {li['dir_hit']}/{li['dir_q']}, companies "
         f"{li['co_hit']}/{li['co_q']}; queries {li['queries']}, cached {li['cached']}, "
@@ -938,13 +1055,13 @@ def main():
         f"{ap['email']}, verified {ap['verified']}, errors {ap['errors']}"
         + ("" if ap["enabled"] else " (no API key)"))
 
-    credit, st = enrich(top, enabled=not a.no_credit)
+    credit, st = enrich(top + distress, enabled=not a.no_credit)  # main first: the cap favours it
     log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "
         f"not reached (cap) {st['skipped_cap']}")
 
     run = radar["run"]
     wc = run - dt.timedelta(days=run.weekday())
-    subject, html_body, text_body = build(radar, top, distress, credit, wc, size_counts)
+    subject, html_body, text_body = build(radar, top, distress, credit, wc, size_counts, dres)
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"email-{run}.html")
     open(path, "w").write(html_body)

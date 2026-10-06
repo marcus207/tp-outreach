@@ -1145,7 +1145,7 @@ def main(argv=None):
     L += [f"## Excluded: debt under £10m from accounts ({len(under)})", ""]
     L += [f"- {c['name']} ({c['company_number']}), {c['cls']}: {debt_line(c['debt'])}" for c in under] \
         or ["- none"]
-    L += ["", "## Distress (not targeted; noted only)", ""]
+    L += ["", "## Distress in this window (full distressed section: radar_distress.py / weekly email)", ""]
     for c in distress:
         L.append(f"- {c['name']} ({c['company_number']}): status {c['status']}"
                  f"{', insolvency history' if c['insolv'] else ''}; {c['n']} window charge(s) "
