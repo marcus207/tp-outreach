@@ -570,6 +570,7 @@ def card_fields(c, radar, allow_check):
     if c.get("sic_note"):
         ev += "; " + c["sic_note"]
     return [
+        *asset_fields(c),
         ("Parent / PSC", parent),
         ("Asset class", f"{c['cls']} ({ev})"),
         ("Charges", f"{c['n']} in window, {c['n_total']} outstanding in total; {shown}"),
@@ -678,6 +679,70 @@ def send(to, subject, html_body, text_body):
     return res.get("id")
 
 
+# --------------------------------------------------------------------------- asset profile
+_PC = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.I)
+
+
+def asset_profiles(top):
+    """What each charged asset is and how big (beds / rooms / units / sq ft), via
+    scripts/asset_profile.py. Never raises; a failed profile shows as unknown."""
+    st = {"ok": 0, "errors": 0}
+    try:
+        from asset_profile import build_asset_profile
+    except Exception as ex:
+        log(f"asset profile unavailable: {type(ex).__name__}")
+        st["errors"] = len(top)
+        return st
+    for c in top:
+        pi = c.get("prop") or {}
+        addr = None if pi.get("generic") else pi.get("address")
+        m = _PC.search(addr or "")
+        pc, ro = (m.group(1).upper(), False) if m else (pi.get("ro_postcode") or c.get("postcode"), True)
+        try:
+            c["asset"] = build_asset_profile(addr, pc, c["company_number"], c.get("name") or "",
+                                             c.get("cls") or "", postcode_is_registered_office=ro)
+            cap = (c["asset"].get("capacity") or {})
+            if cap.get("value") not in (None, "unknown"):
+                st["ok"] += 1
+        except Exception as ex:
+            c["asset"] = None
+            st["errors"] += 1
+            log(f"asset profile failed for {c['company_number']}: {type(ex).__name__}")
+    return st
+
+
+def asset_fields(c):
+    """Compact asset block: only lines we actually know. A missing asset is one line."""
+    a = c.get("asset") or {}
+    pi = c.get("prop") or {}
+    cap = a.get("capacity") or {}
+    known_cap = cap.get("value") not in (None, "unknown")
+    names = [x for x in (a.get("brand"), a.get("operator")) if x and x != "unknown"]
+    names = list(dict.fromkeys(names))
+    if not known_cap and not names and pi.get("generic"):
+        return [("The asset", "Not identified yet: the charge is a general debenture with no "
+                              "property address (Land Registry ownership data will fill this in)")]
+    out = []
+    if a.get("summary") and (known_cap or names or not pi.get("generic")):
+        out.append(("The asset", a["summary"]))
+    if known_cap:
+        out.append(("Capacity", f"{cap.get('value')} {cap.get('metric') or ''}".strip()
+                    + (f" (source: {cap['source']})" if cap.get("source") else "")))
+    if names:
+        star = a.get("star_rating")
+        star = None if not star or str(star).lower() == "unknown" else star
+        star = f"{star}-star" if star and str(star).isdigit() else star
+        out.append(("Brand / operator", " / ".join(names) + (f", {star}" if star else "")))
+    fa = a.get("floor_area")
+    if isinstance(fa, dict) and fa.get("sqft"):
+        out.append(("Floor area", f"{fa['sqft']:,} sq ft"))
+    epc = a.get("epc")
+    epc = (epc.get("rating") if isinstance(epc, dict) else epc)
+    if epc and epc != "unknown":
+        out.append(("EPC", str(epc)))
+    return out
+
+
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
@@ -708,6 +773,9 @@ def main():
         f"cached {ap['cached']}, capped {ap['capped']}, matched {ap['matched']}, with email "
         f"{ap['email']}, verified {ap['verified']}, errors {ap['errors']}"
         + ("" if ap["enabled"] else " (no API key)"))
+
+    prof = asset_profiles(top)
+    log(f"asset profiles: {prof['ok']}/{len(top)} with capacity, errors {prof['errors']}")
 
     credit, st = enrich(top, enabled=not a.no_credit)
     log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "
