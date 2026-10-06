@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: tpca
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: tpca_outreach_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U tpca"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      PGPASSWORD: ci-only-password
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: npm ci
+      - run: npm ci
+        working-directory: client
+      - name: Typecheck
+        run: npx tsc --noEmit -p . && npx tsc --noEmit -p client
+      - name: Unit tests
+        run: npx vitest run
+      - name: Integration tests (compliance, sending, security, smoke)
+        run: npx vitest run -c vitest.integration.config.ts

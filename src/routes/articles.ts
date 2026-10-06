@@ -4,6 +4,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
 import { gmailClient } from '../services/gmail-client';
+import { suppressionExclusionSql } from '../services/suppression';
+import { escapeHtml } from '../services/template-engine';
 import { requireAuth } from '../middleware/auth';
 
 const router = Router();
@@ -17,16 +19,11 @@ const BLOG_ARTICLES_PATH = TENANT === 'loan-intel'
 
 // Recipient exclusions (contacts aliased as c). Broadcasts must never go to
 // lenders, held/unsubscribed/bounced contacts, or anything on the tenant's
-// suppression list (exact email or whole domain).
+// suppression list (exact email, or whole domain for manual domain rows).
 export const BROADCAST_RECIPIENT_EXCLUSIONS = `
          AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
          AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
-         AND NOT EXISTS (
-           SELECT 1 FROM suppressed_emails sup
-           WHERE sup.tenant = c.tenant
-             AND (LOWER(sup.email) = LOWER(c.email)
-                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
-         )`;
+         AND ${suppressionExclusionSql('c.email', 'c.tenant')}`;
 
 // Broadcasts only ever send from the cold-outreach subdomain. marcus@tp.finance
 // is reply-scan only.
@@ -68,7 +65,8 @@ export function buildArticleEmailHtml(article: {
   content?: string | null;
   hero_image?: string | null;
 }, contact: { first_name: string | null; company: string | null }, trackingId: string, recentArticles: RecentArticle[]): string {
-  const firstName = contact.first_name || 'there';
+  // Contact-supplied value: HTML-escape before interpolating into markup.
+  const firstName = contact.first_name && contact.first_name.trim() ? escapeHtml(contact.first_name.trim()) : 'there';
   const articleUrl = `https://www.${BRAND_DOMAIN}/insights/${article.slug}`;
 
   // Text + link: short personal note linking to the website article. Best for
@@ -84,7 +82,7 @@ export function buildArticleEmailHtml(article: {
 <p style="margin:0;font-weight:700;">Marcus Emadi</p>
 <p style="margin:2px 0 0;color:#555;">CEO, Turning Point Capital Advisory</p>
 <p style="margin:4px 0 0;font-size:13px;"><a href="mailto:marcus@tp.finance" style="color:#1993C5;">marcus@tp.finance</a> &middot; <a href="https://${BRAND_DOMAIN}" style="color:#1993C5;">www.${BRAND_DOMAIN}</a></p>
-<p style="margin:22px 0 0;font-size:11px;color:#9ca3af;">Turning Point Capital Advisory Ltd, London &middot; <a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
+<p style="margin:22px 0 0;font-size:11px;color:#9ca3af;"><a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
 </td></tr>
 </table>`;
   }
@@ -100,7 +98,7 @@ ${article.content || ''}
 <p style="margin:0;font-weight:700;">Marcus Emadi</p>
 <p style="margin:2px 0 0;color:#555;">CEO, Turning Point Capital Advisory</p>
 <p style="margin:4px 0 0;font-size:13px;"><a href="mailto:marcus@tp.finance" style="color:#1993C5;">marcus@tp.finance</a> &middot; <a href="https://${BRAND_DOMAIN}" style="color:#1993C5;">www.${BRAND_DOMAIN}</a></p>
-<p style="margin:22px 0 0;font-size:11px;color:#9ca3af;">Turning Point Capital Advisory Ltd, London &middot; <a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
+<p style="margin:22px 0 0;font-size:11px;color:#9ca3af;"><a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
 </td></tr>
 </table>`;
   }
@@ -130,7 +128,7 @@ ${article.content || ''}
 <p style="margin:4px 0 0;font-size:12px;"><a href="mailto:marcus@tp.finance" style="color:#9ca3af;text-decoration:none;">marcus@tp.finance</a> | <a href="https://${BRAND_DOMAIN}" style="color:#9ca3af;text-decoration:none;">${BRAND_DOMAIN}</a></p>
 </td></tr>
 <tr><td style="background:#f8f9fb;padding:12px 28px;border-top:1px solid #e5e7eb;text-align:center;">
-<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;">Turning Point Capital Advisory Ltd · London · <a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
+<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;"><a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
 </td></tr>
 </table>
 </td></tr>
@@ -165,7 +163,7 @@ ${article.content || ''}
 <p style="margin:4px 0 0;font-size:12px;"><a href="mailto:marcus@tp.finance" style="color:#9ca3af;text-decoration:none;">marcus@tp.finance</a> · <a href="https://tp.finance" style="color:#9ca3af;text-decoration:none;">tp.finance</a></p>
 </td></tr>
 <tr><td style="background:#f8f9fb;padding:12px 28px;border-top:1px solid #e5e7eb;text-align:center;">
-<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;">Turning Point Capital Advisory Ltd · London · <a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
+<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;"><a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
 </td></tr>
 </table>
 </td></tr>

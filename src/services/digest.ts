@@ -1,6 +1,7 @@
 import { google } from 'googleapis';
 import Anthropic from '@anthropic-ai/sdk';
 import { query, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
+import { safeEqual } from '../middleware/security';
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -378,7 +379,7 @@ class DigestService {
     );
     const digest = digestResult.rows[0];
     if (!digest) throw new Error('Digest not found');
-    if (digest.approval_token !== token) throw new Error('Invalid approval token');
+    if (!safeEqual(token, String(digest.approval_token ?? ''))) throw new Error('Invalid approval token');
     if (digest.status !== 'pending') throw new Error(`Digest is already ${digest.status}`);
     // Approval links expire: refuse anything older than 72 hours
     if (Date.now() - new Date(digest.created_at).getTime() > APPROVAL_MAX_AGE_MS) {

@@ -1,12 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { query, TENANT } from '../db/connection';
+import { uuidParam } from '../middleware/security';
 
 const router = Router();
+
+router.param('id', uuidParam);
+
+// Internal auth state kept in the settings table: never readable or writable here.
+const PROTECTED_KEY_RE = /^(pw_reset_token|session_epoch(:.*)?)$/;
 
 // GET /api/settings — get all settings
 router.get('/', async (_req: Request, res: Response) => {
   try {
-    const result = await query(`SELECT key, value FROM settings ORDER BY key`);
+    const result = await query(`SELECT key, value FROM settings WHERE key <> 'pw_reset_token' AND key NOT LIKE 'session\\_epoch%' ORDER BY key`);
 
     const settings: Record<string, unknown> = {};
     for (const row of result.rows as Array<{ key: string; value: unknown }>) {
@@ -25,8 +31,12 @@ router.put('/', async (req: Request, res: Response) => {
   try {
     const updates = req.body as Record<string, unknown>;
 
-    if (!updates || typeof updates !== 'object' || Object.keys(updates).length === 0) {
+    if (!updates || typeof updates !== 'object' || Array.isArray(updates) || Object.keys(updates).length === 0) {
       res.status(400).json({ error: 'Request body must be a non-empty object' });
+      return;
+    }
+    if (Object.keys(updates).some(k => PROTECTED_KEY_RE.test(k) || k.length > 255)) {
+      res.status(400).json({ error: 'Invalid setting key' });
       return;
     }
 
@@ -39,7 +49,7 @@ router.put('/', async (req: Request, res: Response) => {
     }
 
     // Return updated settings
-    const result = await query(`SELECT key, value FROM settings ORDER BY key`);
+    const result = await query(`SELECT key, value FROM settings WHERE key <> 'pw_reset_token' AND key NOT LIKE 'session\\_epoch%' ORDER BY key`);
     const settings: Record<string, unknown> = {};
     for (const row of result.rows as Array<{ key: string; value: unknown }>) {
       settings[row.key] = row.value;

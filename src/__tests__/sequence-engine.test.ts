@@ -517,6 +517,20 @@ describe('enrollContact — guards', () => {
     await expect(engine.enrollContact('seq-1', 'contact-1')).resolves.toBe('enr-new');
   });
 
+  it.each(['noreply@example.com', 'notifications@example.com', 'jane@enews.publisher.co.uk'])(
+    'role/bulk address %s → refused, no enrollment created', async (email) => {
+      setupEnroll({ contact: { email } });
+      const p = engine.enrollContact('seq-1', 'contact-1');
+      await expect(p).rejects.toThrow('Role/bulk address');
+      await expect(p).rejects.toBeInstanceOf(EnrollmentRefusedError);
+      expect(insertedEnrollments().length).toBe(0);
+    });
+
+  it('info@ / sales@ are not treated as role/bulk → enrolled', async () => {
+    setupEnroll({ contact: { email: 'info@example.com' } });
+    await expect(engine.enrollContact('seq-1', 'contact-1')).resolves.toBe('enr-new');
+  });
+
   it('suppressed email → refused', async () => {
     setupEnroll({ suppressed: true });
     await expect(engine.enrollContact('seq-1', 'contact-1')).rejects.toThrow('Email is permanently suppressed');

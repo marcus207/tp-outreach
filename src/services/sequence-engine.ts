@@ -3,7 +3,7 @@ import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { getRedisConnection } from '../db/redis';
 import { gmailClient } from './gmail-client';
 import { templateEngine } from './template-engine';
-import { isWithinSendWindow, nextSendWindowStart, isSuppressed, isInternalAddress } from './send-gate';
+import { isWithinSendWindow, nextSendWindowStart, isSuppressed, isInternalAddress, isBulkOrRoleAddress } from './send-gate';
 import { Sequence, SequenceStep, SequenceEnrollment, Contact, Template, EmailAccount } from '../types';
 import { SequenceStepJobData } from '../types';
 
@@ -66,6 +66,10 @@ export class SequenceEngine {
     }
     if (tags.includes('bounced')) {
       throw new EnrollmentRefusedError('Contact email has bounced');
+    }
+    // Role / bulk / automated addresses (noreply@, notifications@, x@enews.y.com)
+    if (isBulkOrRoleAddress(contact.email)) {
+      throw new EnrollmentRefusedError('Role/bulk address (noreply, notifications, newsletter...)');
     }
     if (!isInternalAddress(contact.email)) {
       // tp outreach never emails lenders

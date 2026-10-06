@@ -1,0 +1,284 @@
+{
+  "sends": 50,
+  "invariants": [
+    {
+      "check": "recipient is a lender (contact_type)",
+      "count": 0
+    },
+    {
+      "check": "recipient suppressed (exact or manual domain)",
+      "count": 0
+    },
+    {
+      "check": "recipient tagged unsubscribed/bounced/hold",
+      "count": 0
+    },
+    {
+      "check": "previously replied (any 'reply' event ever, or replied enrolment)",
+      "count": 0
+    },
+    {
+      "check": "previously bounced (any bounce event ever)",
+      "count": 0
+    },
+    {
+      "check": "loan-intel tenant contact",
+      "count": 0
+    },
+    {
+      "check": "same contact emailed by the same step within the previous 7 days",
+      "count": 0
+    },
+    {
+      "check": "sender on @tp.finance (root domain)",
+      "count": 0
+    },
+    {
+      "check": "sender not on @go.tp.finance",
+      "count": 0
+    },
+    {
+      "check": "weekend send (Europe/London)",
+      "count": 0
+    },
+    {
+      "check": "outside 08:00-17:00 Europe/London",
+      "count": 0
+    },
+    {
+      "check": "merge-field leftovers '{{' (subject/html/text)",
+      "count": 0
+    },
+    {
+      "check": "empty greeting ('Hey ,' / 'Hi ,' / 'Dear ,')",
+      "count": 0
+    },
+    {
+      "check": "bare 'Turning Point Capital' without 'Advisory'",
+      "count": 0
+    },
+    {
+      "check": "base64 images (data:image / ;base64,)",
+      "count": 0
+    },
+    {
+      "check": "same enrolment+step sent twice (ever)",
+      "count": 0
+    }
+  ],
+  "info": [
+    {
+      "check": "recipient emailed by ANY sequence/step in the previous 7 days (cross-sequence)",
+      "count": 0
+    },
+    {
+      "check": "recipient address also exists as a loan-intel tenant contact",
+      "count": 0
+    },
+    {
+      "check": "recipient looks like a no-reply / notification / newsletter address",
+      "count": 4
+    },
+    {
+      "check": "recipient emailed more than once during the shadow week",
+      "count": 0
+    }
+  ],
+  "preDue": "4867",
+  "preActive": "10197",
+  "preNullDue": "4592",
+  "plannerMs": {
+    "p50": 7665.952697000001,
+    "max": 10177.492915999988
+  },
+  "gateMs": {
+    "p50": 1.8022670000209473,
+    "max": 5.281488000007812
+  },
+  "mostOverdue": [
+    {
+      "id": "569c7f8d-0f4c-404b-91c6-a8ecf8ee21ef",
+      "email": "d.***@smartspaces.app",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T10:58:00.289Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 08:35",
+        "order": 2
+      }
+    },
+    {
+      "id": "63f0d1fb-35b9-4bf8-88c1-97ee650f7ab6",
+      "email": "ha***@sunsethospitality.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T11:05:53.426Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 08:30",
+        "order": 1
+      }
+    },
+    {
+      "id": "6896f6df-9ee5-4f33-a247-08bdeb012097",
+      "email": "in***@enews.wealthmanagement.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T11:15:29.407Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 09:15",
+        "order": 4
+      }
+    },
+    {
+      "id": "1dc79b9f-f407-4f95-b8c9-db35798791f9",
+      "email": "na***@robertwalters.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T11:20:17.691Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 09:10",
+        "order": 3
+      }
+    },
+    {
+      "id": "dba4fd12-4c0f-4064-859e-704bd0a3b59e",
+      "email": "la***@museplaces.com",
+      "contact_type": "developer",
+      "sequence": "Clients — Living",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T12:58:28.694Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 10:35",
+        "order": 5
+      }
+    },
+    {
+      "id": "aa7f52d8-ea8a-4cc7-84f1-78592d16c755",
+      "email": "ne***@neom.com",
+      "contact_type": "developer",
+      "sequence": "Clients — Living",
+      "seq_status": "active",
+      "step": 2,
+      "due": "2026-08-15T13:05:08.303Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 10:40",
+        "order": 6
+      }
+    },
+    {
+      "id": "b87e934d-c096-4d17-b468-63ca6a6b88ca",
+      "email": "he***@fuel.ventures",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T13:07:15.500Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 12:00",
+        "order": 8
+      }
+    },
+    {
+      "id": "fe74a2d7-b904-4cba-8267-bcc551ab7f4a",
+      "email": "ao***@apollojets.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T13:20:30.365Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 11:50",
+        "order": 7
+      }
+    },
+    {
+      "id": "cae5a85e-66f8-424a-9fe1-61941aa99f69",
+      "email": "am***@westlondon.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T13:24:20.366Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 12:15",
+        "order": 9
+      }
+    },
+    {
+      "id": "8ce6f4ea-ff76-454b-bf79-2d2ceced65ea",
+      "email": "se***@brave.com",
+      "contact_type": "introducer",
+      "sequence": "Introducers — Wealth",
+      "seq_status": "active",
+      "step": 6,
+      "due": "2026-08-15T13:45:15.804Z",
+      "days_overdue": "51",
+      "sent": {
+        "at": "Tue, 06/10/2026, 13:10",
+        "order": 10
+      }
+    }
+  ],
+  "overdueBuckets": [
+    {
+      "step": 1,
+      "due_now": "455",
+      "over_30d": "228",
+      "over_90d": "0",
+      "oldest_due": "2026-08-16"
+    },
+    {
+      "step": 2,
+      "due_now": "272",
+      "over_30d": "145",
+      "over_90d": "0",
+      "oldest_due": "2026-08-15"
+    },
+    {
+      "step": 3,
+      "due_now": "684",
+      "over_30d": "71",
+      "over_90d": "0",
+      "oldest_due": "2026-09-02"
+    },
+    {
+      "step": 4,
+      "due_now": "359",
+      "over_30d": "229",
+      "over_90d": "0",
+      "oldest_due": "2026-08-17"
+    },
+    {
+      "step": 5,
+      "due_now": "538",
+      "over_30d": "447",
+      "over_90d": "0",
+      "oldest_due": "2026-08-16"
+    },
+    {
+      "step": 6,
+      "due_now": "2559",
+      "over_30d": "1742",
+      "over_90d": "0",
+      "oldest_due": "2026-08-15"
+    }
+  ]
+}

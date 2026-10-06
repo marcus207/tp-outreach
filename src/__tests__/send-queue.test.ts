@@ -75,7 +75,7 @@ vi.mock('../services/daily-planner', () => ({
 // ── Imports (after mocks) ───────────────────────────────────────────
 
 import { SendQueue } from '../services/send-queue';
-import { isWithinSendWindow, nextSendWindowStart, msUntilSendWindowCloses } from '../services/send-gate';
+import { isWithinSendWindow, nextSendWindowStart, msUntilSendWindowCloses, isBulkOrRoleAddress } from '../services/send-gate';
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -110,6 +110,8 @@ function setupSendMocks(overrides: {
   suppressed?: boolean;
   account?: Record<string, unknown> | null;
   claimSucceeds?: boolean;
+  reserveSucceeds?: boolean;
+  blast?: { sequence_status: string; sequence_type: string; campaign_active: boolean | null };
 } = {}) {
   const send = makeSendRecord(overrides.send || {});
   const account = overrides.account !== null
@@ -126,7 +128,10 @@ function setupSendMocks(overrides: {
     : []);
 
   const responses: Record<string, unknown[]> = {
+    // Atomic slot reservation in the gate (cap check + increment in one UPDATE)
+    'sends_this_hour = sends_this_hour + 1': overrides.reserveSucceeds === false ? [] : [{ id: 'acct-1' }],
     "SET status = 'sending'": overrides.claimSucceeds === false ? [] : [{ id: send.id }],
+    'AS campaign_active': overrides.blast ? [overrides.blast] : [],
     'FROM email_sends WHERE id': [send],
     'FROM contacts': contacts,
     'FROM suppressed_emails': overrides.suppressed ? [{ id: 'supp-1' }] : [],
@@ -379,6 +384,62 @@ describe('processEmailSend — enrollment/contact guards', () => {
     expect(failedUpdates().length).toBe(0);
   });
 
+  it('draft sequence → refused (failed, not permanent), does not send', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' }, sequenceStatus: 'draft' });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Sequence is draft', false);
+  });
+
+  it('archived sequence → refused permanently, does not send', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { enrollment_id: 'enr-1' }, sequenceStatus: 'archived' });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Sequence is archived', true);
+  });
+
+  it('blast send while campaign paused → skipped (stays queued), does not send', async () => {
+    setInsideWindow();
+    setupSendMocks({
+      send: { sequence_step_id: 'step-1' },
+      blast: { sequence_status: 'active', sequence_type: 'blast', campaign_active: false },
+    });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(failedUpdates().length).toBe(0);
+    expect(mockQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it('blast send with campaign active → sends', async () => {
+    setInsideWindow();
+    setupSendMocks({
+      send: { sequence_step_id: 'step-1' },
+      blast: { sequence_status: 'active', sequence_type: 'blast', campaign_active: true },
+    });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('role/bulk recipient (noreply@) → permanent fail, does not send', async () => {
+    setInsideWindow();
+    setupSendMocks({ send: { to_email: 'noreply@example.com', enrollment_id: 'enr-1' } });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockHandleFailedSend).toHaveBeenCalledWith('send-1', 'Role/bulk address', true);
+  });
+
   it('unsubscribed contact → marks failed, does not send', async () => {
     setInsideWindow();
     setupSendMocks({ contactTags: ['unsubscribed'] });
@@ -534,10 +595,17 @@ describe('processEmailSend — rate limits', () => {
     setInsideWindow();
     setupSendMocks({ account: { daily_limit: 80, sends_today: 80 } });
 
-    await processEmail({ emailSendId: 'send-1' });
+    await processEmail({ emailSendId: 'send-1', threadId: 't-1' });
 
     expect(mockSendEmail).not.toHaveBeenCalled();
     expect(failedUpdates().length).toBe(0);
+    // Re-added (full payload) for the next window, not dropped
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    const [, data, opts] = mockQueueAdd.mock.calls[0];
+    expect(data).toEqual({ emailSendId: 'send-1', threadId: 't-1' });
+    const fireAt = new Date(Date.now() + opts.delay);
+    expect(isWithinSendWindow(fireAt)).toBe(true);
+    expect(fireAt.toISOString().slice(0, 10)).not.toBe(new Date().toISOString().slice(0, 10));
   });
 
   it('hourly limit reached → skips, stays queued', async () => {
@@ -548,6 +616,13 @@ describe('processEmailSend — rate limits', () => {
 
     expect(mockSendEmail).not.toHaveBeenCalled();
     expect(failedUpdates().length).toBe(0);
+    // Re-added for the next clock hour, inside the window
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    const opts = mockQueueAdd.mock.calls[0][2];
+    const fireAt = new Date(Date.now() + opts.delay);
+    expect(isWithinSendWindow(fireAt)).toBe(true);
+    expect(opts.delay).toBeLessThanOrEqual(3600000 + 11 * 60000);
+    expect(sqlCalls('sends_this_hour = sends_this_hour + 1').length).toBe(0);
   });
 
   it('within send gap → re-adds the job with full payload instead of dropping it', async () => {
@@ -569,7 +644,7 @@ describe('processEmailSend — rate limits', () => {
 // ═════════════════════════════════════════════════════════════════════
 
 describe('processEmailSend — send + error handling', () => {
-  it('successful send → calls Gmail, marks sent, increments counts', async () => {
+  it('successful send → calls Gmail, marks sent, counts once (atomic reservation, no post-send increment)', async () => {
     setInsideWindow();
     const { account } = setupSendMocks();
 
@@ -586,12 +661,22 @@ describe('processEmailSend — send + error handling', () => {
         fromName: 'Marcus',
       })
     );
-    expect(mockIncrementSendCounts).toHaveBeenCalledWith(account!.id);
+    const reserve = sqlCalls('sends_this_hour = sends_this_hour + 1');
+    expect(reserve.length).toBe(1);
+    expect(reserve[0][0]).toContain('sends_today < daily_limit');
+    expect(reserve[0][0]).toContain('sends_this_hour < hourly_limit');
+    expect(reserve[0][0]).toContain('RETURNING');
+    // Reservation happens before Gmail; never incremented again afterwards
+    const reserveOrder = mockQuery.mock.invocationCallOrder[mockQuery.mock.calls.indexOf(reserve[0])];
+    expect(reserveOrder).toBeLessThan(mockSendEmail.mock.invocationCallOrder[0]);
+    expect(mockIncrementSendCounts).not.toHaveBeenCalled();
+    expect(sqlCalls('GREATEST(sends_today - 1, 0)').length).toBe(0);
+    expect(sqlCalls('SET last_send_at = NOW()').length).toBe(1);
     expect(sqlCalls("status = 'sent'").length).toBe(1);
     expect(failedUpdates().length).toBe(0);
   });
 
-  it('preCounted → does not increment counters again', async () => {
+  it('preCounted → no reservation and no increment (slot taken at queue time)', async () => {
     setInsideWindow();
     setupSendMocks();
 
@@ -599,6 +684,54 @@ describe('processEmailSend — send + error handling', () => {
 
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     expect(mockIncrementSendCounts).not.toHaveBeenCalled();
+    expect(sqlCalls('sends_this_hour = sends_this_hour + 1').length).toBe(0);
+  });
+
+  it('reservation lost to a concurrent job → no send, re-added for the next hour with full payload', async () => {
+    setInsideWindow();
+    setupSendMocks({ reserveSucceeds: false, account: { hourly_limit: 5, sends_this_hour: 4 } });
+
+    await processEmail({ emailSendId: 'send-1', threadId: 't-1', fromName: 'Marcus' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(sqlCalls("SET status = 'sending'").length).toBe(0);
+    expect(failedUpdates().length).toBe(0);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+    const [, data, opts] = mockQueueAdd.mock.calls[0];
+    expect(data).toEqual({ emailSendId: 'send-1', threadId: 't-1', fromName: 'Marcus' });
+    expect(opts.delay).toBeGreaterThanOrEqual(60000);
+  });
+
+  it('Gmail failure → releases the reserved slot (never below 0)', async () => {
+    setInsideWindow();
+    setupSendMocks();
+    mockSendEmail.mockRejectedValue(new Error('Gmail API 500'));
+
+    await expect(processEmail({ emailSendId: 'send-1' })).rejects.toThrow('500');
+
+    const release = sqlCalls('GREATEST(sends_today - 1, 0)');
+    expect(release.length).toBe(1);
+    expect(release[0][0]).toContain('GREATEST(sends_this_hour - 1, 0)');
+  });
+
+  it('claim lost after reservation → releases the slot', async () => {
+    setInsideWindow();
+    setupSendMocks({ claimSucceeds: false });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(sqlCalls('GREATEST(sends_today - 1, 0)').length).toBe(1);
+  });
+
+  it('pushed back by the send gap → releases the slot', async () => {
+    setInsideWindow();
+    setupSendMocks({ account: { last_send_at: new Date(Date.now() - 30000) } });
+
+    await processEmail({ emailSendId: 'send-1' });
+
+    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(sqlCalls('GREATEST(sends_today - 1, 0)').length).toBe(1);
   });
 
   it('sequence send success → schedules next step', async () => {
@@ -611,10 +744,14 @@ describe('processEmailSend — send + error handling', () => {
     expect(mockHandleFailedSend).not.toHaveBeenCalled();
   });
 
-  it('counter increment failure → still sent, never marked failed', async () => {
+  it('last_send_at update failure → still sent, never marked failed', async () => {
     setInsideWindow();
     setupSendMocks();
-    mockIncrementSendCounts.mockRejectedValue(new Error('db blip'));
+    const impl0 = mockQuery.getMockImplementation()!;
+    mockQuery.mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql.includes('SET last_send_at = NOW()')) return Promise.reject(new Error('db blip'));
+      return impl0(sql, params);
+    });
 
     await expect(processEmail({ emailSendId: 'send-1' })).resolves.toBeUndefined();
 
@@ -665,5 +802,30 @@ describe('processEmailSend — send + error handling', () => {
     expect(mockSendEmail).toHaveBeenCalledTimes(2);
     expect(mockSendEmail.mock.calls[1][1].threadId).toBeUndefined();
     expect(sqlCalls("status = 'sent'").length).toBe(1);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Role / bulk address detection
+// ═════════════════════════════════════════════════════════════════════
+
+describe('isBulkOrRoleAddress', () => {
+  it.each([
+    'noreply@example.com', 'no-reply@example.com', 'no_reply@example.co.uk', 'donotreply@example.com',
+    'do-not-reply@example.com', 'notifications@example.com', 'notification@example.com',
+    'newsletter@example.com', 'newsletters@example.com', 'enews@example.com', 'mailer-daemon@example.com',
+    'bounce@example.com', 'bounces+abc@example.com', 'postmaster@example.com', 'info-noreply@example.com',
+    'jane@notifications.platform.com', 'jane@enews.publisher.co.uk', 'x@email.sender.com',
+    'x@mail.sender.com', 'x@news.publisher.com', 'NoReply@Example.com',
+  ])('%s → blocked', (email) => {
+    expect(isBulkOrRoleAddress(email)).toBe(true);
+  });
+
+  it.each([
+    'info@example.com', 'sales@example.com', 'hello@example.com', 'contact@example.com',
+    'jane.smith@example.com', 'news.desk@example.com', 'jane@mail.com', 'jane@email.com',
+    'jane@example.co.uk', 'marcus@go.tp.finance', 'mailroom@example.com', '', null, 'not-an-email',
+  ])('%s → allowed', (email) => {
+    expect(isBulkOrRoleAddress(email as string | null)).toBe(false);
   });
 });

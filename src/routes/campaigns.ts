@@ -4,21 +4,17 @@ import * as path from 'path';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
 import { sequenceEngine } from '../services/sequence-engine';
 import { campaignEngine } from '../services/campaign-engine';
+import { suppressionExclusionSql } from '../services/suppression';
 
 const router = Router();
 
 // Enrollment exclusions (contacts aliased as c). tp outreach must never email
 // lenders, held/unsubscribed/bounced contacts, or anything on the tenant's
-// suppression list (exact email or whole domain).
+// suppression list (exact email, or whole domain for manual domain rows).
 const ENROL_EXCLUSIONS = `
        AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
        AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
-       AND NOT EXISTS (
-         SELECT 1 FROM suppressed_emails sup
-         WHERE sup.tenant = c.tenant
-           AND (LOWER(sup.email) = LOWER(c.email)
-                OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
-       )`;
+       AND ${suppressionExclusionSql('c.email', 'c.tenant')}`;
 
 // ═══════════════════════════════════════════════════════════════
 // Core CRUD — works for both drip and blast sequences

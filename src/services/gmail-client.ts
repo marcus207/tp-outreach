@@ -3,6 +3,7 @@ import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { query, TENANT, BRAND_NAME } from '../db/connection';
 import { EmailAccount, OAuthTokens } from '../types';
+import { escapeHtml, htmlToPlainText } from './template-engine';
 
 interface SendEmailOptions {
   to: string;
@@ -13,6 +14,10 @@ interface SendEmailOptions {
   textBody?: string;
   threadId?: string;
   trackingId?: string;
+  /** RFC 5322 Message-ID of the message being replied to (follow-ups). Resolved from threadId when omitted. */
+  inReplyTo?: string;
+  /** Space-separated Message-IDs for the References header. */
+  references?: string;
 }
 
 interface SendEmailResult {
@@ -121,7 +126,29 @@ export class GmailClient {
     account: EmailAccount,
     options: SendEmailOptions
   ): Promise<SendEmailResult> {
-    const built = buildOutboundMessage(options);
+    // Display name is never empty: send-time fromName, else the account's
+    // display_name, else DEFAULT_FROM_NAME, else the brand.
+    const fromName = (options.fromName || account.display_name || process.env.DEFAULT_FROM_NAME || BRAND_NAME || '').trim();
+    let opts: SendEmailOptions = { ...options, fromName };
+
+    // Follow-ups into an existing thread need In-Reply-To/References pointing
+    // at the previous message's RFC Message-ID, or recipients' clients won't
+    // thread them (Gmail's threadId only threads the sender's own mailbox).
+    if (opts.threadId && !opts.inReplyTo) {
+      const parent = await this.resolveThreadParent(account, opts.threadId);
+      if (parent) {
+        opts = { ...opts, inReplyTo: parent.messageId, references: parent.references };
+        // Gmail only threads a message whose Subject matches the thread, so a
+        // follow-up goes out as "Re: <first subject>". FOLLOWUP_SUBJECT_MODE=template
+        // keeps each step's own template subject instead.
+        if (process.env.FOLLOWUP_SUBJECT_MODE !== 'template' && parent.subject) {
+          opts.subject = replySubject(parent.subject);
+        }
+      }
+    }
+
+    const built = buildOutboundMessage(opts);
+    options = opts;
 
     // SEND_MODE switch: only SEND_MODE=live ever reaches Gmail. Prod .env sets
     // SEND_MODE=live. Anything else is captured (tests) or refused.
@@ -153,6 +180,56 @@ export class GmailClient {
       messageId: response.data.id,
       threadId: response.data.threadId,
     };
+  }
+
+  /**
+   * RFC Message-ID (and References chain) of the latest message in a thread.
+   * Live: read from Gmail (threads.get, metadata only) so we use whatever
+   * Message-ID Gmail actually sent. Fallback / non-live: the deterministic
+   * Message-ID we stamp on every outbound message, rebuilt from the previous
+   * sent email_sends row's tracking_id (no schema change needed).
+   */
+  async resolveThreadParent(account: EmailAccount, threadId: string): Promise<{ messageId: string; references: string; subject: string } | null> {
+    if (process.env.SEND_MODE === 'live') {
+      try {
+        const auth = await this.getAuthenticatedClient(account);
+        const gmail = google.gmail({ version: 'v1', auth });
+        const thread = await gmail.users.threads.get({
+          userId: 'me',
+          id: threadId,
+          format: 'metadata',
+          metadataHeaders: ['Message-ID', 'References', 'Subject'],
+        });
+        const msgs = thread.data.messages || [];
+        const header = (m: (typeof msgs)[number] | undefined, n: string) =>
+          (m?.payload?.headers || []).find(h => (h.name || '').toLowerCase() === n.toLowerCase())?.value || '';
+        const firstSubject = header(msgs[0], 'Subject').trim();
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const mid = header(msgs[i], 'Message-ID').trim();
+          if (mid) {
+            const refs = [header(msgs[i], 'References').trim(), mid].filter(Boolean).join(' ');
+            return { messageId: mid, references: refs, subject: firstSubject };
+          }
+        }
+      } catch (err) {
+        console.warn(`[Gmail Client] Could not read thread ${threadId} for In-Reply-To: ${(err as Error).message}`);
+      }
+    }
+
+    try {
+      const prev = await query<{ tracking_id: string; from_email: string; subject: string | null }>(
+        `SELECT tracking_id, from_email, subject FROM email_sends
+         WHERE gmail_thread_id = $1 AND tenant = $2 AND status = 'sent' AND tracking_id IS NOT NULL
+         ORDER BY sent_at ASC NULLS LAST, created_at ASC`,
+        [threadId, TENANT]
+      );
+      if (prev.rows.length === 0) return null;
+      const ids = prev.rows.map(r => buildMessageId(r.tracking_id, r.from_email));
+      return { messageId: ids[ids.length - 1], references: ids.join(' '), subject: fixBareBrand(prev.rows[0].subject || '').trim() };
+    } catch (err) {
+      console.warn(`[Gmail Client] Could not resolve parent for thread ${threadId}: ${(err as Error).message}`);
+      return null;
+    }
   }
 
   async checkForReplies(
@@ -297,6 +374,7 @@ export class GmailClient {
 
 interface BuiltMessage {
   fromLine: string;
+  subject: string;
   htmlBody: string;
   textBody: string;
   headerLines: string[];
@@ -304,16 +382,58 @@ interface BuiltMessage {
   encodedMessage: string;
 }
 
+/** UK Companies Act trading disclosure, appended to every outbound email. */
+export const DEFAULT_LEGAL_FOOTER =
+  'Turning Point Capital Advisory is a trading name of TPCommercialFinance Ltd ' +
+  '(Co. No. 14537704, registered office: 187 Brooklands Road, Sale, M33 3PJ).';
+
+function legalFooterText(): string {
+  return (process.env.LEGAL_FOOTER || DEFAULT_LEGAL_FOOTER).trim();
+}
+
+/** Never ship the bare brand: "Turning Point Capital" must be followed by " Advisory". */
+const BARE_BRAND_RE = /Turning Point Capital(?! Advisory)/g;
+export function fixBareBrand(value: string): string {
+  return value.replace(BARE_BRAND_RE, 'Turning Point Capital Advisory');
+}
+
+/** "Re: <subject>" without stacking prefixes. */
+function replySubject(subject: string): string {
+  const base = subject.replace(/^\s*((re|fw|fwd)\s*:\s*)+/i, '').trim();
+  return base ? `Re: ${base}` : subject;
+}
+
+/** Deterministic RFC 5322 Message-ID for an outbound send. */
+export function buildMessageId(trackingId: string, fromEmail: string): string {
+  const domain = (fromEmail.split('@')[1] || 'go.tp.finance').toLowerCase().replace(/[^a-z0-9.-]/g, '');
+  const local = trackingId.replace(/[^A-Za-z0-9._-]/g, '');
+  return `<tp.${local}@${domain}>`;
+}
+
+const oneLine = (v: string) => v.replace(/[\r\n]+/g, ' ');
+
+function formatFrom(name: string, email: string): string {
+  const clean = oneLine(name).replace(/["\\]/g, '').trim();
+  if (!clean) return email;
+  if (/^[\x20-\x7E]*$/.test(clean)) return `"${clean}" <${email}>`;
+  return `${encodeHeaderValue(clean)} <${email}>`;
+}
+
 /**
  * Build the exact RFC 822 message sendEmail() hands to Gmail (tracking pixel,
- * unsubscribe rewrite/footer, List-Unsubscribe headers, multipart body).
+ * unsubscribe rewrite/footer, legal footer, List-Unsubscribe headers,
+ * threading headers, multipart body).
  * Pure: no I/O. Shared by the live path and the non-live capture path so the
  * test outbox sees byte-for-byte what production would send.
+ * Throws (so the send is failed, never sent) when the subject is empty.
  */
 function buildOutboundMessage(options: SendEmailOptions): BuiltMessage {
-  const fromLine = options.fromName
-    ? `"${options.fromName}" <${options.from}>`
-    : options.from;
+  const subject = fixBareBrand(oneLine(options.subject || '')).trim();
+  if (!subject) {
+    throw new Error(`Refusing to send to ${options.to}: subject is empty after rendering`);
+  }
+
+  const fromLine = options.fromName ? formatFrom(options.fromName, options.from) : options.from;
 
   // Build tracking pixel URL if tracking domain configured
   const trackingDomain = process.env.TRACKING_DOMAIN || '';
@@ -322,18 +442,19 @@ function buildOutboundMessage(options: SendEmailOptions): BuiltMessage {
   // via TRACK_OPENS / TRACK_CLICKS. Unsubscribe handling is always applied.
   const trackOpens = process.env.TRACK_OPENS === 'true';
   const trackClicks = process.env.TRACK_CLICKS === 'true';
+  const unsubscribeUrl = options.trackingId && trackingDomain
+    ? `${trackingDomain}/t/${options.trackingId}/unsubscribe`
+    : '';
   let htmlBody = options.htmlBody;
-  if (options.trackingId && trackingDomain) {
+  if (unsubscribeUrl) {
     if (trackOpens) {
       const trackingPixel = `<img src="${trackingDomain}/t/${options.trackingId}/open" width="1" height="1" style="display:none" alt="" />`;
       htmlBody = htmlBody + trackingPixel;
     }
 
-    const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
-
     // Replace placeholder unsubscribe URLs from template engine
     htmlBody = htmlBody.replace(/href="#unsubscribe"/gi, `href="${unsubscribeUrl}"`);
-    htmlBody = htmlBody.replace(/\{\{unsubscribe_url\}\}/gi, unsubscribeUrl);
+    htmlBody = htmlBody.replace(/\{\{\s*unsubscribe_url\s*\}\}/gi, unsubscribeUrl);
     // Fix empty href="" on unsubscribe links (from records created before template engine fix)
     htmlBody = htmlBody.replace(/href=""([^>]*>)\s*Unsubscribe\s*<\/a>/gi, `href="${unsubscribeUrl}"$1Unsubscribe</a>`);
 
@@ -348,28 +469,52 @@ function buildOutboundMessage(options: SendEmailOptions): BuiltMessage {
         return pre + `${trackingDomain}/t/${options.trackingId}/click?url=${encodeURIComponent(url)}` + post;
       });
     }
-
-    // Only append unsubscribe footer if template doesn't already have one
-    const hasUnsubscribe = htmlBody.toLowerCase().includes('unsubscribe</a>');
-    if (!hasUnsubscribe) {
-      htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;"><p>You're receiving this because you're a contact of ${BRAND_NAME}.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a></p></div>`;
-    }
   }
 
-  // Build plain text body (with unsubscribe notice if tracking)
-  let textBody = options.textBody || stripHtml(htmlBody);
-  if (options.trackingId && trackingDomain) {
-    const unsubscribeUrl = `${trackingDomain}/t/${options.trackingId}/unsubscribe`;
-    textBody = textBody + `\n\n---\nTo unsubscribe: ${unsubscribeUrl}`;
+  // The ONE footer for every outbound email: unsubscribe line (unless the
+  // template already has its own unsubscribe link) + the legal disclosure.
+  const legal = legalFooterText();
+  const hasUnsubscribe = htmlBody.toLowerCase().includes('unsubscribe</a>');
+  const footerLines: string[] = [];
+  if (unsubscribeUrl && !hasUnsubscribe) {
+    footerLines.push(`You're receiving this because you're a contact of ${escapeHtml(BRAND_NAME)}.<br><a href="${unsubscribeUrl}" style="color:#999;">Unsubscribe</a>`);
   }
+  if (legal && !htmlBody.includes(escapeHtml(legal))) {
+    footerLines.push(escapeHtml(legal));
+  }
+  if (footerLines.length) {
+    htmlBody = htmlBody + `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e0e0e0;font-family:Arial,sans-serif;font-size:11px;color:#999;text-align:center;">${footerLines.map(l => `<p style="margin:0 0 8px;">${l}</p>`).join('')}</div>`;
+  }
+  htmlBody = fixBareBrand(htmlBody);
+
+  // Plain text part: keeps link targets ("text (https://...)"), then the same footer.
+  let textBody = options.textBody || htmlToPlainText(htmlBody);
+  const textFooter: string[] = [];
+  if (legal && !textBody.includes(legal)) textFooter.push(legal);
+  if (unsubscribeUrl) textFooter.push(`To unsubscribe: ${unsubscribeUrl}`);
+  if (textFooter.length) textBody = textBody + `\n\n---\n${textFooter.join('\n')}`;
+  textBody = fixBareBrand(textBody);
+
+  // List-Unsubscribe: https one-click first, then a mailto to the sending
+  // mailbox. Subject "Re: <subject>" + body "unsubscribe" is what reply-watcher
+  // matches (sender + subject) and classifies as an unsubscribe.
+  const listUnsubscribe = unsubscribeUrl
+    ? `<${unsubscribeUrl}>, <mailto:${options.from}?subject=${encodeURIComponent(`Re: ${subject}`)}&body=unsubscribe>`
+    : '';
+
+  const messageId = buildMessageId(options.trackingId || randomUUID(), options.from);
+  const inReplyTo = options.inReplyTo ? oneLine(options.inReplyTo).trim() : '';
+  const references = options.references ? oneLine(options.references).trim() : inReplyTo;
 
   const messageParts = [
     `From: ${fromLine}`,
-    `To: ${options.to}`,
+    `To: ${oneLine(options.to)}`,
     `Reply-To: Marcus Emadi <marcus@tp.finance>`,
-    `Subject: ${encodeHeaderValue(options.subject)}`,
-    ...(options.trackingId && trackingDomain ? [
-      `List-Unsubscribe: <${trackingDomain}/t/${options.trackingId}/unsubscribe>`,
+    `Subject: ${encodeHeaderValue(subject)}`,
+    `Message-ID: ${messageId}`,
+    ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`, `References: ${references}`] : []),
+    ...(listUnsubscribe ? [
+      `List-Unsubscribe: ${listUnsubscribe}`,
       `List-Unsubscribe-Post: List-Unsubscribe=One-Click`,
     ] : []),
     'MIME-Version: 1.0',
@@ -398,7 +543,7 @@ function buildOutboundMessage(options: SendEmailOptions): BuiltMessage {
   const blank = messageParts.indexOf('');
   const headerLines = blank >= 0 ? messageParts.slice(0, blank) : [];
 
-  return { fromLine, htmlBody, textBody, headerLines, rawMessage, encodedMessage };
+  return { fromLine, subject, htmlBody, textBody, headerLines, rawMessage, encodedMessage };
 }
 
 // ── Test seams ─────────────────────────────────────────────────────────
@@ -457,7 +602,7 @@ async function captureNonLiveSend(
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
     [
       account.id || null, account.email, built.fromLine, options.from, options.to,
-      headers['Reply-To'] || null, options.subject, built.htmlBody, built.textBody,
+      headers['Reply-To'] || null, built.subject, built.htmlBody, built.textBody,
       JSON.stringify(headers), built.rawMessage, options.threadId || null,
       options.trackingId || null, fakeMessageId, fakeThreadId,
     ]
@@ -465,15 +610,6 @@ async function captureNonLiveSend(
   console.log(`[Gmail Client] SEND_MODE=${process.env.SEND_MODE ?? '(unset)'} (test): captured ${options.from} -> ${options.to} in test_outbox`);
 
   return { messageId: fakeMessageId, threadId: fakeThreadId };
-}
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
 }
 
 // RFC 2047 encode a header value (e.g. Subject) when it contains non-ASCII

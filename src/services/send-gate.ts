@@ -19,7 +19,10 @@ import { query, TENANT } from '../db/connection';
 
 export type SendDecision =
   | { action: 'send' }
-  | { action: 'skip'; reason: string }   // Leave as 'queued' — retry later (e.g. paused, outside window)
+  // Leave as 'queued' — retry later (e.g. paused, outside window, at cap).
+  // retryAt (when set) is when the send worker should re-add the job so it is
+  // never silently dropped (window closed / hourly or daily cap reached).
+  | { action: 'skip'; reason: string; retryAt?: Date }
   // Mark as 'failed'. permanent=true means the RECIPIENT must never get this
   // sequence (unsubscribed, suppressed, lender...) so the enrollment should be
   // cancelled; permanent=false/undefined means the enrollment may be retried.
@@ -32,6 +35,7 @@ interface EmailSendRow {
   contact_id: string | null;
   email_account_id: string;
   to_email: string | null;
+  sequence_step_id?: string | null;
 }
 
 // ── Send window: Mon-Fri 08:00-17:00 Europe/London ──────────────────────
@@ -157,6 +161,84 @@ export async function isSuppressed(email: string | null | undefined): Promise<bo
   return suppressed.rows.length > 0;
 }
 
+// ── Role / bulk addresses ───────────────────────────────────────────────
+
+/** Local parts that are never a person (exact, or followed by a +/-/_/. suffix). */
+const ROLE_LOCAL_RE = new RegExp(
+  '^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|notifications?|newsletters?|enews|e-news|' +
+  'mailer(?:[-_.]?daemon)?|bounces?|postmaster)(?:[+\\-_.].*)?$'
+);
+/** Local parts containing these anywhere are automated senders. */
+const ROLE_LOCAL_CONTAINS = ['noreply', 'no-reply', 'no_reply', 'donotreply', 'do-not-reply', 'do_not_reply', 'mailer-daemon'];
+/**
+ * First label of a SUBDOMAIN used by sending platforms (notifications.x.com,
+ * enews.x.co.uk, email.x.com, mail.x.com, news.x.com). Only applied when the
+ * domain has 3+ labels, so consumer domains like mail.com are never blocked.
+ */
+const BULK_SUBDOMAIN_LABELS = new Set([
+  'notifications', 'notification', 'notify', 'enews', 'email', 'emails', 'mail', 'mailer',
+  'news', 'newsletter', 'newsletters', 'bounce', 'bounces',
+]);
+
+/**
+ * True for role/bulk/automated addresses that must never be enrolled or emailed
+ * (noreply@, notifications@, newsletter@, bounce@, postmaster@, anything@enews.x.com ...).
+ * Deliberately conservative: info@, sales@, hello@, contact@ are NOT blocked.
+ */
+export function isBulkOrRoleAddress(email: string | null | undefined): boolean {
+  const e = (email || '').trim().toLowerCase();
+  const at = e.lastIndexOf('@');
+  if (at <= 0) return false;
+  const local = e.slice(0, at);
+  const domain = e.slice(at + 1);
+  if (ROLE_LOCAL_RE.test(local)) return true;
+  if (ROLE_LOCAL_CONTAINS.some(t => local.includes(t))) return true;
+  const labels = domain.split('.').filter(Boolean);
+  if (labels.length >= 3 && BULK_SUBDOMAIN_LABELS.has(labels[0])) return true;
+  return false;
+}
+
+// ── Retry times for skipped sends ───────────────────────────────────────
+
+function jitterMs(maxMs: number): number {
+  return Math.floor(Math.random() * maxMs);
+}
+
+/** Start of the next window (with up to 30 min jitter so a backlog does not burst at 08:00). */
+export function nextWindowRetryAt(now: Date = new Date()): Date {
+  const start = isWithinSendWindow(now) ? now : nextSendWindowStart(now);
+  return new Date(start.getTime() + 60000 + jitterMs(30 * 60000));
+}
+
+/** Early in the next clock hour (after the hourly counter reset), inside the window. */
+export function nextHourRetryAt(now: Date = new Date()): Date {
+  const nextHour = new Date(Math.floor(now.getTime() / 3600000) * 3600000 + 3600000);
+  const candidate = new Date(nextHour.getTime() + 60000 + jitterMs(10 * 60000));
+  if (isWithinSendWindow(candidate)) return candidate;
+  return nextWindowRetryAt(candidate);
+}
+
+/** The next day's window (after the daily counter reset). */
+export function nextDayRetryAt(now: Date = new Date()): Date {
+  const afterClose = new Date(now.getTime() + msUntilSendWindowCloses(now) + 1000);
+  return nextWindowRetryAt(afterClose);
+}
+
+/**
+ * Give back a slot reserved by canSend({ reserveSlot: true }) when the email
+ * did not go out (Gmail failure, pushed back, claim lost). Never below 0.
+ */
+export async function releaseSendSlot(accountId: string): Promise<void> {
+  await query(
+    `UPDATE email_accounts
+     SET sends_today = GREATEST(sends_today - 1, 0),
+         sends_this_hour = GREATEST(sends_this_hour - 1, 0),
+         updated_at = NOW()
+     WHERE id = $1 AND tenant = $2`,
+    [accountId, TENANT]
+  );
+}
+
 /**
  * Decide whether emailSendId should be sent right now.
  *
@@ -164,15 +246,22 @@ export async function isSuppressed(email: string | null | undefined): Promise<bo
  * @param checkWindow  Whether to enforce send window (default true).
  *                     requeueStuckSends already has its own window guard,
  *                     so it passes false to avoid double-checking.
+ * @param reserveSlot  Atomically take one hourly+daily slot on the account as
+ *                     part of the cap check (send worker only). If the result
+ *                     is 'send' the caller owns the slot and must call
+ *                     releaseSendSlot() if the email does not go out.
+ * @param checkLimits  Enforce the caps (default true). The legacy step path
+ *                     reserves at queue time (preCounted) and passes false.
  */
 export async function canSend(
   emailSendId: string,
-  { checkWindow = true }: { checkWindow?: boolean } = {}
+  { checkWindow = true, reserveSlot = false, checkLimits = true }:
+    { checkWindow?: boolean; reserveSlot?: boolean; checkLimits?: boolean } = {}
 ): Promise<SendDecision> {
 
   // 1. Fetch the email_sends record
   const sendResult = await query<EmailSendRow>(
-    `SELECT id, status, enrollment_id, contact_id, email_account_id, to_email
+    `SELECT id, status, enrollment_id, contact_id, email_account_id, to_email, sequence_step_id
      FROM email_sends WHERE id = $1 AND tenant = $2`,
     [emailSendId, TENANT]
   );
@@ -189,6 +278,8 @@ export async function canSend(
 
   // 3. The single send window (Mon-Fri 08:00-17:00 Europe/London) for ALL sends
   if (checkWindow && !isWithinSendWindow(new Date())) {
+    // No retryAt: the row stays queued and the re-queue cron (inside the
+    // window only) re-enqueues it, spaced, once the window opens.
     return { action: 'skip', reason: 'Outside send window (Mon-Fri 08:00-17:00 Europe/London)' };
   }
 
@@ -211,6 +302,33 @@ export async function canSend(
     }
     if (row.sequence_status === 'paused') {
       return { action: 'skip', reason: 'Sequence is paused' };
+    }
+    if (row.sequence_status === 'archived') {
+      return { action: 'fail', reason: 'Sequence is archived', permanent: true };
+    }
+    if (row.sequence_status !== 'active') {
+      // draft / inactive / anything else: refuse, enrollment may resume later
+      return { action: 'fail', reason: `Sequence is ${row.sequence_status || 'not active'}` };
+    }
+  } else if (send.sequence_step_id) {
+    // 4b. Blast / campaign send (step of a sequence but no enrollment): obey the
+    // campaign Pause switch (no settings row = paused) and the sequence status.
+    const blast = await query<{ sequence_status: string | null; sequence_type: string | null; campaign_active: boolean | null }>(
+      `SELECT s.status AS sequence_status, s.type AS sequence_type,
+              (SELECT cs.is_active FROM campaign_settings cs WHERE cs.tenant = $2 LIMIT 1) AS campaign_active
+       FROM sequence_steps ss
+       LEFT JOIN sequences s ON s.id = ss.sequence_id
+       WHERE ss.id = $1`,
+      [send.sequence_step_id, TENANT]
+    );
+    const b = blast.rows[0];
+    if (b && b.sequence_type === 'blast') {
+      if (b.campaign_active !== true) {
+        return { action: 'skip', reason: 'Campaign paused (campaign_settings.is_active = false)' };
+      }
+      if (b.sequence_status && b.sequence_status !== 'active') {
+        return { action: 'skip', reason: `Campaign sequence is ${b.sequence_status}` };
+      }
     }
   }
 
@@ -250,6 +368,13 @@ export async function canSend(
     }
   }
 
+  // 6b. Role / bulk / automated addresses (noreply@, notifications@, x@enews.y.com)
+  for (const addr of addresses) {
+    if (isBulkOrRoleAddress(addr)) {
+      return { action: 'fail', reason: 'Role/bulk address', permanent: true };
+    }
+  }
+
   // 7. Lender / hold — tp outreach never emails lenders. Internal mailboxes bypass.
   if (!isInternalAddress(toEmail)) {
     if (contacts.some(c => (c.contact_type || '').toLowerCase() === 'lender')) {
@@ -277,12 +402,45 @@ export async function canSend(
     return { action: 'fail', reason: `Sender ${account.email} is not on ${COLD_SENDER_DOMAIN}` };
   }
 
-  // 9. Rate limits
-  if (account.sends_today >= account.daily_limit) {
-    return { action: 'skip', reason: 'Daily send limit reached' };
-  }
-  if (account.sends_this_hour >= account.hourly_limit) {
-    return { action: 'skip', reason: 'Hourly send limit reached' };
+  if (!checkLimits) return { action: 'send' };
+
+  // 9. Rate limits (fast path on the snapshot we just read)
+  const limitSkip = (acct: { sends_today: number; daily_limit: number; sends_this_hour: number; hourly_limit: number }): SendDecision | null => {
+    const now = new Date();
+    if (Number(acct.sends_today) >= Number(acct.daily_limit)) {
+      return { action: 'skip', reason: 'Daily send limit reached', retryAt: nextDayRetryAt(now) };
+    }
+    if (Number(acct.sends_this_hour) >= Number(acct.hourly_limit)) {
+      return { action: 'skip', reason: 'Hourly send limit reached', retryAt: nextHourRetryAt(now) };
+    }
+    return null;
+  };
+  const snapshotSkip = limitSkip(account);
+  if (snapshotSkip) return snapshotSkip;
+
+  // 10. Atomic reservation: the cap check and the increment are ONE statement,
+  // so N concurrent jobs can never all pass a stale check (20 parallel sends
+  // vs hourly_limit 5 => exactly 5 go out).
+  if (reserveSlot) {
+    const reserved = await query<{ id: string }>(
+      `UPDATE email_accounts
+       SET sends_today = sends_today + 1,
+           sends_this_hour = sends_this_hour + 1,
+           updated_at = NOW()
+       WHERE id = $1 AND tenant = $2 AND is_active = true
+         AND sends_today < daily_limit AND sends_this_hour < hourly_limit
+       RETURNING id`,
+      [send.email_account_id, TENANT]
+    );
+    if (reserved.rows.length === 0) {
+      const again = await query<{ sends_today: number; daily_limit: number; sends_this_hour: number; hourly_limit: number }>(
+        `SELECT sends_today, daily_limit, sends_this_hour, hourly_limit
+         FROM email_accounts WHERE id = $1 AND tenant = $2`,
+        [send.email_account_id, TENANT]
+      );
+      return (again.rows[0] && limitSkip(again.rows[0]))
+        || { action: 'skip', reason: 'Hourly send limit reached', retryAt: nextHourRetryAt(new Date()) };
+    }
   }
 
   return { action: 'send' };

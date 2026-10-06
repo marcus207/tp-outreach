@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { query, TENANT } from '../db/connection';
+import { suppressionMatchSql } from '../services/suppression';
 
 const router = Router();
 
@@ -35,22 +36,50 @@ function verifyApolloSignature(rawBody: Buffer, signature: string, secret: strin
   }
 }
 
+// Tags that must survive every webhook update, whatever Apollo says
+const PROTECTED_TAGS = ['unsubscribed', 'bounced', 'hold'];
+
+/**
+ * Mirrors ApolloSyncService.upsertContact (whose method is private):
+ *  - never insert or update a suppressed address (exact lower(email), or a
+ *    deliberate domain block: source='manual' AND domain IS NOT NULL)
+ *  - tags are MERGED (union); protected tags are never dropped
+ *  - contact_type / subsector / list membership never touched on update
+ *  - new contacts get contact_type NULL (classifier decides), no list, no enrolment
+ *  - every query tenant-scoped
+ */
 async function upsertContact(c: ApolloContact): Promise<'added' | 'updated' | 'skipped'> {
   if (!c.email) return 'skipped';
   const email = c.email.toLowerCase().trim();
+  if (!email.includes('@')) return 'skipped';
   const phone = c.phone_numbers?.length ? c.phone_numbers[0].raw_number : null;
-  const tags = c.label_names || [];
+  const apolloTags = (c.label_names || []).filter(t => !!t);
   const emailVerified = c.email_status === 'verified';
 
-  const existing = await query<{ id: string }>(
-    `SELECT id FROM contacts WHERE LOWER(email) = $1 AND tenant = $2`,
+  const suppressed = await query<{ id: string }>(
+    `SELECT 1 AS id WHERE ${suppressionMatchSql('$1::text', '$2')}`,
+    [email, TENANT]
+  );
+  if (suppressed.rows.length > 0) return 'skipped';
+
+  const existing = await query<{ id: string; tags: string[] | null }>(
+    `SELECT id, tags FROM contacts WHERE LOWER(email) = $1 AND tenant = $2`,
     [email, TENANT]
   );
 
   if (existing.rows[0]) {
-    await query(
+    const current = existing.rows[0].tags || [];
+    const merged = Array.from(new Set([...current, ...apolloTags]));
+    for (const t of PROTECTED_TAGS) {
+      if (current.includes(t) && !merged.includes(t)) merged.push(t);
+    }
+    const upd = await query(
       `UPDATE contacts SET
-        apollo_id         = COALESCE($1,  apollo_id),
+        apollo_id = COALESCE(
+          CASE WHEN $1::text IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM contacts c2 WHERE c2.apollo_id = $1 AND c2.id <> $14)
+               THEN $1::text ELSE NULL END,
+          apollo_id),
         first_name        = COALESCE($2,  first_name),
         last_name         = COALESCE($3,  last_name),
         title             = COALESCE($4,  title),
@@ -60,11 +89,11 @@ async function upsertContact(c: ApolloContact): Promise<'added' | 'updated' | 's
         phone             = COALESCE($8,  phone),
         city              = COALESCE($9,  city),
         country           = COALESCE($10, country),
-        tags              = $11,
+        tags              = ARRAY(SELECT DISTINCT t FROM unnest(COALESCE(tags, '{}'::text[]) || $11::text[]) AS t),
         email_verified    = $12,
         last_synced_at    = NOW(),
         updated_at        = NOW()
-       WHERE LOWER(email) = $13 AND tenant = $14`,
+       WHERE id = $14 AND tenant = $13`,
       [
         c.id || null,
         c.first_name || null,
@@ -76,39 +105,41 @@ async function upsertContact(c: ApolloContact): Promise<'added' | 'updated' | 's
         phone,
         c.city || null,
         c.country || null,
-        tags,
-        emailVerified,
-        email,
-        TENANT,
-      ]
-    );
-    return 'updated';
-  } else {
-    await query(
-      `INSERT INTO contacts (
-        apollo_id, email, first_name, last_name, title, company,
-        company_domain, linkedin_url, phone, city, country, tags,
-        email_verified, source, last_synced_at, tenant
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'apollo',NOW(),$14)`,
-      [
-        c.id || null,
-        email,
-        c.first_name || null,
-        c.last_name || null,
-        c.title || null,
-        c.organization_name || null,
-        c.organization?.primary_domain || null,
-        c.linkedin_url || null,
-        phone,
-        c.city || null,
-        c.country || null,
-        tags,
+        merged,
         emailVerified,
         TENANT,
+        existing.rows[0].id,
       ]
     );
-    return 'added';
+    return (upd.rowCount || 0) > 0 ? 'updated' : 'skipped';
   }
+
+  const ins = await query<{ id: string }>(
+    `INSERT INTO contacts (
+      apollo_id, email, first_name, last_name, title, company,
+      company_domain, linkedin_url, phone, city, country, tags,
+      email_verified, source, last_synced_at, tenant, contact_type
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'apollo',NOW(),$14,NULL)
+     ON CONFLICT DO NOTHING
+     RETURNING id`,
+    [
+      c.id && !(await query(`SELECT 1 FROM contacts WHERE apollo_id = $1`, [c.id])).rows.length ? c.id : null,
+      email,
+      c.first_name || null,
+      c.last_name || null,
+      c.title || null,
+      c.organization_name || null,
+      c.organization?.primary_domain || null,
+      c.linkedin_url || null,
+      phone,
+      c.city || null,
+      c.country || null,
+      apolloTags,
+      emailVerified,
+      TENANT,
+    ]
+  );
+  return ins.rows.length > 0 ? 'added' : 'skipped';
 }
 
 // ---- POST /api/webhooks/apollo ----

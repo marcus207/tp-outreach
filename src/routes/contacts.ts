@@ -1,11 +1,39 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { google } from 'googleapis';
-import { query, TENANT } from '../db/connection';
+import { query, getClient, TENANT } from '../db/connection';
 import { sequenceEngine } from '../services/sequence-engine';
 import { gmailClient } from '../services/gmail-client';
 import { EmailAccount } from '../types';
+import { suppressionMatchSql, suppressionExclusionSql } from '../services/suppression';
 
 const router = Router();
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isUuid(v: unknown): v is string {
+  return typeof v === 'string' && UUID_RE.test(v);
+}
+
+/** Integer query param: non-numeric => default; clamped to [min, max]. */
+export function intParam(raw: unknown, def: number, min: number, max: number): number {
+  const s = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof s !== 'string' || !/^\s*-?\d+\s*$/.test(s)) return def;
+  const n = parseInt(s, 10);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(Math.max(n, min), max);
+}
+
+/** Max rows per page (security test SEC-07 caps bulk export at 200). */
+const MAX_PAGE_LIMIT = 200;
+
+// Every :id in this router is a uuid column: reject anything else up front
+// (400, no DB error text).
+router.param('id', (req: Request, res: Response, next: NextFunction, id: string) => {
+  if (!isUuid(id)) {
+    res.status(400).json({ error: 'Invalid id' });
+    return;
+  }
+  next();
+});
 
 // Auto-enroll a new contact into the active intro series sequence (if one exists).
 // Runs in the background — does not block the response.
@@ -22,12 +50,7 @@ async function autoEnrollInIntroSeries(contactId: string): Promise<void> {
          AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
          AND LOWER(c.email) NOT LIKE '%@tp.finance'
          AND LOWER(c.email) NOT LIKE '%@go.tp.finance'
-         AND NOT EXISTS (
-           SELECT 1 FROM suppressed_emails sup
-           WHERE sup.tenant = c.tenant
-             AND (LOWER(sup.email) = LOWER(c.email)
-                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
-         )`,
+         AND ${suppressionExclusionSql('c.email', 'c.tenant')}`,
       [contactId, TENANT]
     );
     if (!eligible.rows[0]) return;
@@ -48,13 +71,14 @@ async function autoEnrollInIntroSeries(contactId: string): Promise<void> {
 // GET /api/contacts — list with pagination, search, filter by tag/company
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const page = parseInt(String(req.query.page || '1'), 10);
-    const limit = Math.min(parseInt(String(req.query.limit || '50'), 10), 200);
+    const page = intParam(req.query.page, 1, 1, 1_000_000);
+    const limit = intParam(req.query.limit, 50, 1, MAX_PAGE_LIMIT);
     const offset = (page - 1) * limit;
-    const search = req.query.search as string | undefined;
-    const tag = req.query.tag as string | undefined;
-    const company = req.query.company as string | undefined;
-    const source = req.query.source as string | undefined;
+    const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+    const search = str(req.query.search);
+    const tag = str(req.query.tag);
+    const company = str(req.query.company);
+    const source = str(req.query.source);
     const sortCol = ['email', 'first_name', 'company', 'title', 'city', 'created_at'].includes(req.query.sort as string)
       ? (req.query.sort as string) : 'created_at';
     const sortDir = req.query.dir === 'asc' ? 'ASC' : 'DESC';
@@ -99,7 +123,7 @@ router.get('/', async (req: Request, res: Response) => {
       conditions.push(`c.contact_type IS NULL`);
     }
 
-    const subsector = req.query.subsector as string | undefined;
+    const subsector = str(req.query.subsector);
     if (subsector) {
       params.push(subsector);
       conditions.push(`c.subsector = $${params.length}`);
@@ -164,8 +188,14 @@ router.post('/', async (req: Request, res: Response) => {
 
     // Block permanently suppressed emails
     const suppCheck = await query<{ id: string; reason: string }>(
-      `SELECT id, reason FROM suppressed_emails WHERE LOWER(email) = $1 AND tenant = $2 LIMIT 1`,
-      [email.toLowerCase().trim(), TENANT]
+      `SELECT sup.id, sup.reason FROM suppressed_emails sup
+       WHERE sup.tenant = $2
+         AND (LOWER(sup.email) = $1
+              OR (sup.source = 'manual' AND sup.domain IS NOT NULL AND sup.domain <> ''
+                  AND LOWER(sup.domain) = SPLIT_PART($1, '@', 2)))
+       ORDER BY (LOWER(sup.email) = $1) DESC
+       LIMIT 1`,  /* same rule as services/suppression.ts; needs the row's reason */
+      [String(email).toLowerCase().trim(), TENANT]
     );
     if (suppCheck.rows.length > 0) {
       res.status(409).json({ error: `Email is permanently suppressed: ${suppCheck.rows[0].reason}` });
@@ -270,7 +300,7 @@ router.post('/import', async (req: Request, res: Response) => {
 
       // Skip permanently suppressed emails during import
       const suppRow = await query<{ id: string }>(
-        `SELECT id FROM suppressed_emails WHERE LOWER(email) = $1 AND tenant = $2 LIMIT 1`,
+        `SELECT 1 AS id WHERE ${suppressionMatchSql('$1::text', '$2')}`,
         [row.email.toLowerCase(), TENANT]
       );
       if (suppRow.rows.length > 0) {
@@ -516,6 +546,10 @@ router.post('/bulk-assign', async (req: Request, res: Response) => {
     const { contact_ids, contact_type, subsector } = req.body;
     if (!Array.isArray(contact_ids) || !contact_type) {
       res.status(400).json({ error: 'contact_ids and contact_type required' });
+      return;
+    }
+    if (!contact_ids.every(isUuid)) {
+      res.status(400).json({ error: 'contact_ids must be UUIDs' });
       return;
     }
     const result = await query(
@@ -859,26 +893,36 @@ router.delete('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    // Suppress the address first so Apollo/Dripify/imports can't re-add it
-    if (check.rows[0].email) {
-      await query(
-        `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
-         VALUES (LOWER($1), NULL, 'deleted by user', 'manual-delete', $2)
-         ON CONFLICT (lower(email), tenant) DO NOTHING`,
-        [check.rows[0].email, TENANT]
-      );
+    // One transaction: suppression first (so Apollo/Dripify/imports can't re-add
+    // it), then detach send history (email_sends / email_events are KEPT, with
+    // contact_id = NULL, like the Oct 5 cleanup), then remove enrollments, list
+    // memberships and campaign_sends rows, then the contact. Any failure rolls
+    // everything back so history is never half-destroyed.
+    // campaign_sends has no tenant column; it is scoped via the tenant-checked contact id.
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+      if (check.rows[0].email) {
+        await client.query(
+          `INSERT INTO suppressed_emails (email, domain, reason, source, tenant)
+           VALUES (LOWER($1), NULL, 'deleted by user', 'manual-delete', $2)
+           ON CONFLICT (lower(email), tenant) DO NOTHING`,
+          [check.rows[0].email, TENANT]
+        );
+      }
+      await client.query(`UPDATE email_sends SET contact_id = NULL WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
+      await client.query(`DELETE FROM campaign_sends WHERE contact_id = $1`, [id]);
+      await client.query(`DELETE FROM sequence_enrollments WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
+      await client.query(`DELETE FROM contact_list_members WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
+      const del = await client.query(`DELETE FROM contacts WHERE id = $1 AND tenant = $2`, [id, TENANT]);
+      if ((del.rowCount || 0) === 0) throw new Error('contact vanished during delete');
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
     }
-
-    // Clean up FK references
-    await query(`DELETE FROM email_events WHERE email_send_id IN (SELECT id FROM email_sends WHERE contact_id = $1)`, [id]);
-    await query(`DELETE FROM email_events WHERE email_send_id IN (SELECT id FROM email_sends WHERE contact_id = $1 AND tenant = $2)`, [id, TENANT]);
-    await query(`DELETE FROM email_sends WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
-    await query(`DELETE FROM campaign_sends WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
-    await query(`DELETE FROM sequence_enrollments WHERE contact_id = $1 AND tenant = $2`, [id, TENANT]);
-    await query(`DELETE FROM contact_list_members WHERE contact_id = $1`, [id]);
-
-    // Now delete the contact
-    await query(`DELETE FROM contacts WHERE id = $1 AND tenant = $2`, [id, TENANT]);
 
     res.json({ success: true });
   } catch (err) {
@@ -950,21 +994,40 @@ router.post('/lists/:id/members', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'contact_ids must be a non-empty array' });
       return;
     }
-
-    let added = 0;
-    for (const contactId of contact_ids) {
-      try {
-        await query(
-          `INSERT INTO contact_list_members (list_id, contact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-          [id, contactId]
-        );
-        added++;
-      } catch {
-        // skip invalid contact ids
-      }
+    if (!contact_ids.every(isUuid)) {
+      res.status(400).json({ error: 'contact_ids must be UUIDs' });
+      return;
     }
 
-    res.json({ added });
+    // The list must belong to this tenant.
+    const list = await query<{ id: string }>(
+      `SELECT id FROM contact_lists WHERE id = $1 AND tenant = $2`,
+      [id, TENANT]
+    );
+    if (!list.rows[0]) {
+      res.status(404).json({ error: 'List not found' });
+      return;
+    }
+
+    // Every contact must belong to this tenant too.
+    const owned = await query<{ id: string }>(
+      `SELECT id FROM contacts WHERE id = ANY($1::uuid[]) AND tenant = $2`,
+      [contact_ids, TENANT]
+    );
+    if (owned.rows.length !== new Set(contact_ids.map((c: string) => c.toLowerCase())).size) {
+      res.status(404).json({ error: 'Contact not found' });
+      return;
+    }
+
+    const ins = await query(
+      `INSERT INTO contact_list_members (list_id, contact_id, tenant)
+       SELECT $1, c.id, c.tenant FROM contacts c
+       WHERE c.id = ANY($2::uuid[]) AND c.tenant = $3
+       ON CONFLICT DO NOTHING`,
+      [id, contact_ids, TENANT]
+    );
+
+    res.json({ added: ins.rowCount || 0 });
   } catch (err) {
     console.error('[Contacts] Error adding list members:', err);
     res.status(500).json({ error: 'Failed to add list members' });

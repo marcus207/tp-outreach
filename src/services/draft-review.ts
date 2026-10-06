@@ -1,6 +1,7 @@
 import { google } from 'googleapis';
 import Anthropic from '@anthropic-ai/sdk';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
+import { safeEqual } from '../middleware/security';
 import fs from 'fs';
 import path from 'path';
 
@@ -262,7 +263,7 @@ export function buildEmailHtml(
 <table width="580" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;">
 <tr><td style="background:#0f1a2e;padding:16px 28px;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital</span></td>
+<td style="vertical-align:middle;"><span style="color:#ffffff;font-size:16px;font-weight:700;letter-spacing:2px;font-family:Arial,sans-serif;">TP</span><span style="color:#9ca3af;font-size:12px;margin-left:8px;font-family:Arial,sans-serif;">Turning Point Capital Advisory</span></td>
 </tr></table>
 </td></tr>
 <tr><td style="height:3px;background:linear-gradient(90deg,#4db8a4,#74DFF6);font-size:0;">&nbsp;</td></tr>
@@ -1234,7 +1235,7 @@ Return JSON only (no markdown fences):
     );
     const draft = result.rows[0];
     if (!draft) throw new Error('Draft not found');
-    if (draft.approval_token !== token) throw new Error('Invalid approval token');
+    if (!safeEqual(token, String(draft.approval_token ?? ''))) throw new Error('Invalid approval token');
     if (!['awaiting_approval', 'drafting'].includes(draft.status)) {
       throw new Error(`Draft is already ${draft.status}`);
     }
@@ -1263,7 +1264,14 @@ Return JSON only (no markdown fences):
     );
     const draft = result.rows[0];
     if (!draft) throw new Error('Draft not found');
-    if (draft.skip_token !== token) throw new Error('Invalid skip token');
+    if (!safeEqual(token, String(draft.skip_token ?? ''))) throw new Error('Invalid skip token');
+    if (!['awaiting_approval', 'drafting'].includes(draft.status)) {
+      throw new Error(`Draft is already ${draft.status}`);
+    }
+    // Emailed skip links expire like approve links: refuse anything older than 72 hours
+    if (Date.now() - new Date(draft.created_at).getTime() > 72 * 60 * 60 * 1000) {
+      throw new Error('This skip link has expired (older than 72 hours). Skip from the platform instead.');
+    }
 
     // Atomic transition: only skip a draft that is still pending
     const updated = await query<{ id: string }>(

@@ -8,8 +8,12 @@ import session from 'express-session';
 import connectPgSimple from 'connect-pg-simple';
 import cors from 'cors';
 import helmet from 'helmet';
+import bcrypt from 'bcryptjs';
 import { pool, query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from './db/connection';
-import { requireAuth } from './middleware/auth';
+import { requireAuth, currentSessionEpoch, bumpSessionEpoch, isSessionValid } from './middleware/auth';
+import {
+  isUuid, publicError, csrfProtection, sanitizeNumericQuery, scrubErrorResponses, sendPublicHtml,
+} from './middleware/security';
 import { gmailClient } from './services/gmail-client';
 import { dripifyMonitor } from './services/dripify-monitor';
 import { apolloSyncService } from './services/apollo-sync';
@@ -30,13 +34,20 @@ import { healthCheckService } from './services/health-check';
 
 export const app = express();
 const PORT = parseInt(process.env.PORT || '3105', 10);
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// Session secret: required in production (fail closed). Outside production a
+// random per-process secret is used (sessions do not survive a restart).
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (IS_PROD && (!SESSION_SECRET || SESSION_SECRET.length < 16)) {
+  throw new Error('SESSION_SECRET must be set (>= 16 chars) when NODE_ENV=production');
+}
+const sessionSecret = SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 // Trust nginx proxy so secure cookies work over HTTPS
 app.set('trust proxy', 1);
 
 // ---- Security helpers ----
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -46,9 +57,11 @@ function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
-// Constant-time string comparison (hash both sides so buffers are equal length)
-function safeEqual(provided: unknown, expected: string): boolean {
-  if (typeof provided !== 'string') return false;
+// Constant-time string comparison (hash both sides so buffers are equal length).
+// Same implementation as middleware/security.ts safeEqual, kept here for the
+// auth/ingest paths in this file.
+function safeEqual(provided: unknown, expected: unknown): boolean {
+  if (typeof provided !== 'string' || typeof expected !== 'string' || expected.length === 0) return false;
   const a = crypto.createHash('sha256').update(provided).digest();
   const b = crypto.createHash('sha256').update(expected).digest();
   return crypto.timingSafeEqual(a, b);
@@ -127,38 +140,113 @@ app.use(cors({
   credentials: true,
 }));
 
-// Webhook routes use express.raw() — MUST be registered BEFORE express.json()
-// so the raw body is available for HMAC signature verification
-app.use('/api/webhooks', express.raw({ type: '*/*', limit: '1mb' }), webhookRoutes);
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+// Never echo DB / stack text in a JSON error body (defence in depth).
+app.use('/api', scrubErrorResponses);
 
 // Session — use a unique table name per tenant to avoid session conflicts
+const SESSION_COOKIE = 'connect.sid';
+const SESSION_COOKIE_OPTIONS = {
+  secure: IS_PROD,
+  httpOnly: true,
+  sameSite: 'lax' as const,
+  path: '/',
+};
 const PgSession = connectPgSimple(session);
 app.use(
   session({
+    name: SESSION_COOKIE,
     store: new PgSession({
       pool,
       tableName: 'session',
       createTableIfMissing: true,
     }),
-    secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
+    secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
     cookie: {
-      secure: process.env.NODE_ENV === 'production',
-      httpOnly: true,
-      sameSite: 'lax',
+      ...SESSION_COOKIE_OPTIONS,
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
 );
 
+// The Apollo test endpoint lives in routes/webhooks.ts (public router): gate it here.
+app.use('/api/webhooks/apollo/test', requireAuth);
+
+// Webhook routes use express.raw() — MUST be registered BEFORE express.json()
+// so the raw body is available for HMAC signature verification
+app.use('/api/webhooks', express.raw({ type: '*/*', limit: '1mb' }), webhookRoutes);
+
+// Body limits: 100kb everywhere, except these AUTHENTICATED routes that carry
+// CSV imports or HTML with inline images (templates, drafts, articles, ...).
+const LARGE_BODY_PATHS = [
+  '/api/contacts/import',
+  '/api/templates',
+  '/api/draft-reviews',
+  '/api/articles',
+  '/api/press-releases',
+  '/api/campaigns',
+  '/api/campaign-planner/schedule',
+];
+const largeJson = express.json({ limit: '10mb' });
+for (const p of LARGE_BODY_PATHS) {
+  app.use(p, (req: Request, res: Response, next: NextFunction) => {
+    if (req.session?.authenticated) { largeJson(req, res, next); return; }
+    next();
+  });
+}
+app.use(express.json({ limit: '100kb' }));
+app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+// Global bounds for page/limit/days/... query params (malformed => route default)
+app.use('/api', sanitizeNumericQuery);
+
+// CSRF: state-changing /api requests must come from our own origin. Exempt: the
+// public token routes (HTML forms on our own pages), dripify ingest (key-auth,
+// posted from a userscript on dripify.io). Webhooks are mounted above, so never
+// reach this. /t/* (one-click unsubscribe) is outside /api.
+app.use('/api', csrfProtection({
+  exempt: [
+    /^\/dripify\/ingest\/?$/,
+    /^\/digest\/[^/]+\/approve\/confirm\/?$/,
+    /^\/draft-reviews\/[^/]+\/(approve|skip)\/?$/,
+  ],
+  formAllowed: [
+    /^\/digest\/[^/]+\/approve\/confirm\/?$/,
+    /^\/draft-reviews\/[^/]+\/(approve|skip)\/?$/,
+  ],
+}));
+
 // ---- Auth Routes ----
-app.post('/api/auth/login', (req: Request, res: Response) => {
+// Password verification. Preferred: DASHBOARD_PASSWORD_HASH (bcrypt). Legacy:
+// plaintext DASHBOARD_PASSWORD is still accepted, with a one-time warning.
+const BCRYPT_COST = 12;
+let warnedPlaintextPassword = false;
+
+function authConfigured(): boolean {
+  return !!process.env.DASHBOARD_EMAIL && !!(process.env.DASHBOARD_PASSWORD_HASH || process.env.DASHBOARD_PASSWORD);
+}
+
+async function verifyPassword(password: unknown): Promise<boolean> {
+  const candidate = typeof password === 'string' ? password : '';
+  const hash = process.env.DASHBOARD_PASSWORD_HASH;
+  if (hash) {
+    try {
+      return await bcrypt.compare(candidate, hash);
+    } catch {
+      return false;
+    }
+  }
+  if (!warnedPlaintextPassword) {
+    warnedPlaintextPassword = true;
+    console.warn('[Auth] DASHBOARD_PASSWORD is stored in plaintext. Set DASHBOARD_PASSWORD_HASH (bcrypt) and remove DASHBOARD_PASSWORD from .env.');
+  }
+  return safeEqual(candidate, process.env.DASHBOARD_PASSWORD || '');
+}
+
+app.post('/api/auth/login', async (req: Request, res: Response) => {
   const { email, password } = req.body || {};
-  if (!process.env.DASHBOARD_PASSWORD || !process.env.DASHBOARD_EMAIL) {
+  if (!authConfigured()) {
     res.status(500).json({ error: 'Auth not configured' });
     return;
   }
@@ -167,29 +255,48 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
     res.status(429).json({ error: 'Too many failed attempts. Try again in 15 minutes.' });
     return;
   }
-  // Evaluate both comparisons (no short-circuit) to keep timing uniform
+  // Evaluate both checks (no short-circuit) to keep timing uniform
   const emailOk = safeEqual(email, process.env.DASHBOARD_EMAIL);
-  const passwordOk = safeEqual(password, process.env.DASHBOARD_PASSWORD);
-  if (emailOk && passwordOk) {
-    loginLimiter.reset(ip);
-    req.session.authenticated = true;
-    req.session.email = email;
-    res.json({ success: true, email });
-  } else {
+  const passwordOk = await verifyPassword(password);
+  if (!(emailOk && passwordOk)) {
     loginLimiter.hit(ip);
     console.warn(`[Auth] Failed login from ${ip}`);
     res.status(401).json({ error: 'Invalid email or password' });
+    return;
+  }
+  loginLimiter.reset(ip);
+  try {
+    const epoch = await currentSessionEpoch();
+    // New session id on login (session fixation): drop any pre-login session.
+    await new Promise<void>((resolve, reject) => req.session.regenerate(err => (err ? reject(err) : resolve())));
+    req.session.authenticated = true;
+    req.session.email = email;
+    req.session.epoch = epoch;
+    await new Promise<void>((resolve, reject) => req.session.save(err => (err ? reject(err) : resolve())));
+    res.json({ success: true, email });
+  } catch (err) {
+    console.error('[Auth] Login session error:', err);
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
 app.post('/api/auth/logout', (req: Request, res: Response) => {
-  req.session.destroy(() => {
+  const done = () => {
+    res.clearCookie(SESSION_COOKIE, SESSION_COOKIE_OPTIONS);
     res.json({ success: true });
+  };
+  if (!req.session) { done(); return; }
+  req.session.destroy(err => {
+    if (err) console.error('[Auth] Logout destroy error:', err);
+    done();
   });
 });
 
-app.get('/api/auth/me', (req: Request, res: Response) => {
-  res.json({ authenticated: !!req.session?.authenticated, email: req.session?.email });
+app.get('/api/auth/me', async (req: Request, res: Response) => {
+  let valid = false;
+  try { valid = await isSessionValid(req); } catch { valid = false; }
+  if (!valid) { res.json({ authenticated: false }); return; }
+  res.json({ authenticated: true, email: req.session.email });
 });
 
 // Public health check endpoint (for uptime monitoring)
@@ -198,7 +305,8 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     await query('SELECT 1');
     res.json({ ok: true, ts: new Date().toISOString(), tenant: TENANT });
   } catch (err) {
-    res.status(503).json({ ok: false, error: (err as Error).message });
+    console.error('[Health] DB check failed:', (err as Error).message);
+    res.status(503).json({ ok: false, ts: new Date().toISOString(), tenant: TENANT });
   }
 });
 
@@ -209,7 +317,8 @@ app.get('/api/health/full', requireAuth, async (_req: Request, res: Response) =>
     const allOk = results.every(r => r.ok);
     res.status(allOk ? 200 : 207).json({ ok: allOk, checks: results });
   } catch (err) {
-    res.status(500).json({ ok: false, error: (err as Error).message });
+    console.error('[Health] Full check failed:', err);
+    res.status(500).json({ ok: false, error: 'Health check failed' });
   }
 });
 
@@ -317,20 +426,30 @@ app.post('/api/auth/reset-password', async (req: Request, res: Response) => {
       return;
     }
 
-    // Update password in memory and .env file
-    process.env.DASHBOARD_PASSWORD = new_password;
-    const envPath = path.join(process.cwd(), '.env');
-    if (fs.existsSync(envPath)) {
-      let envContent = fs.readFileSync(envPath, 'utf8');
-      if (/^DASHBOARD_PASSWORD=.*/m.test(envContent)) {
-        envContent = envContent.replace(/^DASHBOARD_PASSWORD=.*/m, `DASHBOARD_PASSWORD=${new_password}`);
-      } else {
-        envContent += `\nDASHBOARD_PASSWORD=${new_password}`;
-      }
-      fs.writeFileSync(envPath, envContent);
+    // Single use: consume the token before anything else
+    const consumed = await query(`DELETE FROM settings WHERE key = 'pw_reset_token' AND value->>'token' = $1`, [storedToken]);
+    if (!consumed.rowCount) {
+      res.status(400).json({ error: 'Invalid reset token' });
+      return;
     }
 
-    await query(`DELETE FROM settings WHERE key = 'pw_reset_token'`);
+    // Store only a bcrypt hash: in memory and in .env (plaintext line removed)
+    const hash = await bcrypt.hash(new_password, BCRYPT_COST);
+    process.env.DASHBOARD_PASSWORD_HASH = hash;
+    delete process.env.DASHBOARD_PASSWORD;
+    const envPath = path.join(process.cwd(), '.env');
+    if (fs.existsSync(envPath)) {
+      const lines = fs.readFileSync(envPath, 'utf8').split('\n')
+        .filter(l => !/^\s*DASHBOARD_PASSWORD(_HASH)?\s*=/.test(l));
+      while (lines.length && lines[lines.length - 1] === '') lines.pop();
+      // Single-quoted so dotenv takes the $-laden hash literally
+      lines.push(`DASHBOARD_PASSWORD_HASH='${hash}'`, '');
+      fs.writeFileSync(envPath, lines.join('\n'), { mode: 0o600 });
+    }
+
+    // Log out every existing session
+    await bumpSessionEpoch();
+    console.log(`[Auth] Dashboard password reset (from ${ip}); all sessions invalidated`);
     res.json({ success: true });
   } catch (err) {
     console.error('[Auth] Reset password error:', err);
@@ -413,21 +532,62 @@ app.get('/t/:trackingId/open', async (req: Request, res: Response) => {
 
 const CLICK_FALLBACK_URL = 'https://www.tp.finance';
 
-// Only redirect to http(s) URLs for a known send, and (when the stored body is
-// available) only to hosts that actually appear in that email. Prevents the
-// tracking endpoint being used as an open redirect.
-function isAllowedClickTarget(rawUrl: string, bodyHtml: string | null): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    return false;
+// Own hosts a click may always redirect to (exact hostname match).
+const CLICK_BRAND_HOSTS = new Set(
+  ['tp.finance', 'www.tp.finance', 'go.tp.finance', BRAND_DOMAIN, `www.${BRAND_DOMAIN}`]
+    .map(h => h.toLowerCase())
+);
+
+// Strict absolute http(s) URL parse: no backslashes / whitespace / control chars,
+// no protocol-relative or scheme-less forms, no userinfo. Hostname comes back
+// lowercased and punycode-normalised by the WHATWG URL parser.
+function parseClickUrl(raw: string): URL | null {
+  if (!raw || raw.length > 2048) return null;
+  if (/[\\\s\u0000-\u001f\u007f]/.test(raw)) return null;
+  if (!/^https?:\/\/[^/]/i.test(raw)) return null;
+  let u: URL;
+  try { u = new URL(raw); } catch { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (u.username || u.password || !u.hostname) return null;
+  return u;
+}
+
+function decodeHtmlAttr(v: string): string {
+  return v
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_m, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_m, d) => String.fromCodePoint(parseInt(d, 10)));
+}
+
+/** Exact hostnames of every http(s) link (href) in a stored email body. */
+function linkHostsInBody(bodyHtml: string): Set<string> {
+  const hosts = new Set<string>();
+  const re = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(bodyHtml))) {
+    const u = parseClickUrl(decodeHtmlAttr((m[1] ?? m[2] ?? m[3] ?? '').trim()));
+    if (!u) continue;
+    hosts.add(u.hostname);
+    // An already-wrapped tracking link: its destination counts too
+    if (/\/t\/[^/]+\/click$/.test(u.pathname)) {
+      const inner = parseClickUrl(u.searchParams.get('url') || '');
+      if (inner) hosts.add(inner.hostname);
+    }
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-  const host = parsed.hostname.toLowerCase();
-  if (host === BRAND_DOMAIN.toLowerCase() || host.endsWith(`.${BRAND_DOMAIN.toLowerCase()}`)) return true;
-  if (!bodyHtml) return true; // no stored body to check against: known send + http(s) only
-  return bodyHtml.toLowerCase().includes(`//${host}`);
+  return hosts;
+}
+
+// Only redirect to http(s) URLs for a known send whose host is ours or exactly
+// matches a link host in that send's stored body. Prevents the tracking
+// endpoint being used as an open redirect.
+function isAllowedClickTarget(rawUrl: string, bodyHtml: string | null): boolean {
+  const u = parseClickUrl(rawUrl);
+  if (!u) return false;
+  if (CLICK_BRAND_HOSTS.has(u.hostname)) return true;
+  if (!bodyHtml) return false;
+  return linkHostsInBody(bodyHtml).has(u.hostname);
 }
 
 app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
@@ -444,7 +604,7 @@ app.get('/t/:trackingId/click', async (req: Request, res: Response) => {
     const send = sendResult.rows[0];
     if (send) {
       const allowed = !!redirectUrl && isAllowedClickTarget(redirectUrl, send.body_html);
-      if (allowed) target = redirectUrl;
+      if (allowed) target = redirectUrl; // parseClickUrl rejected whitespace/control chars
       else if (redirectUrl) console.warn(`[Tracking] Blocked click redirect for ${trackingId} to ${redirectUrl.slice(0, 200)}`);
 
       await query(
@@ -508,14 +668,39 @@ async function processUnsubscribe(trackingId: string, req: Request): Promise<boo
   return true;
 }
 
+// RFC 8058 allows the one-click POST as multipart/form-data. Tiny parser for the
+// single field we care about (no new dependency); bodies capped at 10kb.
+const oneClickRawBody = express.text({ type: ['multipart/form-data', 'text/plain'], limit: '10kb' });
+
+function multipartField(body: string, contentType: string, field: string): string | null {
+  const bm = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType);
+  const boundary = bm ? (bm[1] || bm[2]) : '';
+  if (!boundary || boundary.length > 200) return null;
+  for (const part of body.split(`--${boundary}`)) {
+    const sep = part.indexOf('\r\n\r\n') >= 0 ? '\r\n\r\n' : '\n\n';
+    const idx = part.indexOf(sep);
+    if (idx < 0) continue;
+    const headers = part.slice(0, idx);
+    const nm = /content-disposition:\s*form-data;[^\r\n]*\bname="([^"]*)"/i.exec(headers);
+    if (!nm || nm[1] !== field) continue;
+    return part.slice(idx + sep.length).replace(/\r?\n$/, '').trim();
+  }
+  return null;
+}
+
 // RFC 8058 one-click unsubscribe (email client UI button)
-app.post('/t/:trackingId/unsubscribe', async (req: Request, res: Response) => {
+app.post('/t/:trackingId/unsubscribe', oneClickRawBody, async (req: Request, res: Response) => {
   const trackingId = String(req.params.trackingId);
 
-  // RFC 8058 requires body to contain List-Unsubscribe=One-Click
+  // RFC 8058 requires the body to carry List-Unsubscribe=One-Click (urlencoded
+  // or multipart). Anything else (e.g. link scanners) is ignored.
+  const contentType = String(req.headers['content-type'] || '');
   const body = typeof req.body === 'string' ? req.body : '';
-  const formBody = req.body?.['List-Unsubscribe'] || '';
-  const isValidRfc8058 = body.includes('List-Unsubscribe=One-Click') || formBody === 'One-Click';
+  const formBody = (req.body && typeof req.body === 'object') ? req.body['List-Unsubscribe'] : undefined;
+  const isValidRfc8058 =
+    formBody === 'One-Click' ||
+    (/^multipart\/form-data/i.test(contentType) && multipartField(body, contentType, 'List-Unsubscribe') === 'One-Click') ||
+    (/^text\/plain/i.test(contentType) && /(^|&)List-Unsubscribe=One-Click(&|\s*$)/.test(body.trim()));
 
   if (!isValidRfc8058) {
     console.log(`[Tracking] Rejected non-RFC-8058 POST unsubscribe for ${trackingId} ua=${req.headers['user-agent']}`);
@@ -657,6 +842,7 @@ app.get('/api/dripify/latest', requireAuth, async (_req: Request, res: Response)
 });
 
 app.put('/api/dripify/alerts/:id/read', requireAuth, async (req: Request, res: Response) => {
+  if (!isUuid(req.params.id)) { res.status(400).json({ error: 'Invalid id' }); return; }
   try {
     await dripifyMonitor.markAlertRead(String(req.params.id));
     res.json({ success: true });
@@ -678,7 +864,7 @@ app.put('/api/dripify/alerts/read-all', requireAuth, async (_req: Request, res: 
 
 // ---- Apollo Sync Endpoint ----
 app.post('/api/apollo/sync', requireAuth, async (req: Request, res: Response) => {
-  const { type = 'incremental' } = req.body;
+  const type = req.body?.type === 'full' ? 'full' : 'incremental';
   try {
     apolloSyncService.syncContacts(type as 'full' | 'incremental').catch((err) => {
       console.error('[Apollo] Background sync error:', err);
@@ -716,7 +902,7 @@ function readDigestIdAndToken(req: Request): [string, string] | null {
   const id = String(req.params.id || '');
   const raw = (req.body && typeof req.body.token === 'string') ? req.body.token : req.query.token;
   const token = typeof raw === 'string' ? raw : '';
-  if (!UUID_RE.test(id) || !UUID_RE.test(token)) return null;
+  if (!isUuid(id) || !isUuid(token)) return null;
   return [id, token];
 }
 
@@ -725,17 +911,17 @@ const INVALID_DIGEST_LINK = publicMessagePage('Invalid link', '#dc2626', 'Invali
 app.get('/api/digest/:id/approve', async (req: Request, res: Response) => {
   const parsed = readDigestIdAndToken(req);
   if (!parsed) {
-    res.status(400).send(INVALID_DIGEST_LINK);
+    sendPublicHtml(res, 400, INVALID_DIGEST_LINK);
     return;
   }
   try {
     const digest = await digestService.get(parsed[0]);
     if (!digest || !safeEqual(parsed[1], String(digest.approval_token))) {
-      res.status(400).send(INVALID_DIGEST_LINK);
+      sendPublicHtml(res, 400, INVALID_DIGEST_LINK);
       return;
     }
     const count = (digest.approved_contacts || digest.contacts || []).length;
-    res.send(publicMessagePage('Confirm approval', '#1a1a2e', 'Approve this digest?',
+    sendPublicHtml(res, 200, publicMessagePage('Confirm approval', '#1a1a2e', 'Approve this digest?',
       `<p style="font-size:18px;color:#555">${escapeHtml(count)} emails will be queued for sending between 9am–5pm UTC.</p>
   <form method="POST" action="approve/confirm" style="margin-top:24px">
     <input type="hidden" name="token" value="${escapeHtml(parsed[1])}" />
@@ -743,14 +929,14 @@ app.get('/api/digest/:id/approve', async (req: Request, res: Response) => {
   </form>`));
   } catch (err) {
     console.error('[Digest] Approve page error:', err);
-    res.status(500).send(publicMessagePage('Error', '#dc2626', 'Error', '<p>Something went wrong. Please try again.</p>'));
+    sendPublicHtml(res, 500, publicMessagePage('Error', '#dc2626', 'Error', '<p>Something went wrong. Please try again.</p>'));
   }
 });
 
 app.post('/api/digest/:id/approve/confirm', async (req: Request, res: Response) => {
   const parsed = readDigestIdAndToken(req);
   if (!parsed) {
-    res.status(400).send(INVALID_DIGEST_LINK);
+    sendPublicHtml(res, 400, INVALID_DIGEST_LINK);
     return;
   }
   try {
@@ -759,12 +945,12 @@ app.post('/api/digest/:id/approve/confirm', async (req: Request, res: Response) 
       console.error('[Digest] Execute error:', err.message)
     );
     const count = (digest.approved_contacts || digest.contacts).length;
-    res.send(publicMessagePage('Approved', '#16a34a', 'Approved!',
+    sendPublicHtml(res, 200, publicMessagePage('Approved', '#16a34a', 'Approved!',
       `<p style="font-size:18px;color:#555">${escapeHtml(count)} emails queued — sending between 9am–5pm UTC today.</p>
   <p style="margin-top:32px"><a href="/outreach/" style="color:#1a1a2e;text-decoration:none;font-weight:600">Open ${escapeHtml(BRAND_NAME)} Outreach →</a></p>`));
   } catch (err) {
-    const msg = (err as Error).message;
-    res.status(400).send(publicMessagePage('Error', '#dc2626', 'Error', `<p>${escapeHtml(msg)}</p>`));
+    console.error('[Digest] Public approve error:', (err as Error).message);
+    sendPublicHtml(res, 400, publicMessagePage('Error', '#dc2626', 'Error', `<p>${escapeHtml(publicError(err, 'This approval could not be completed.'))}</p>`));
   }
 });
 
@@ -802,10 +988,14 @@ app.get('*', (req: Request, res: Response) => {
 // Prod runs `tsx src/index.ts` with NODE_ENV=production, so this always listens there.
 const isEntrypoint = typeof require !== 'undefined' && typeof module !== 'undefined' && require.main === module;
 if (process.env.NODE_ENV !== 'test' || isEntrypoint) {
-  app.listen(PORT, () => {
-    console.log(`[Index] ${BRAND_NAME} Outreach Engine running on port ${PORT} (tenant: ${TENANT})`);
+  // Bind loopback by default: only nginx should reach the app (trust proxy = 1
+  // keys rate limits on X-Forwarded-For, which a direct client could spoof).
+  const onListen = (host: string) => () => {
+    console.log(`[Index] ${BRAND_NAME} Outreach Engine running on ${host}:${PORT} (tenant: ${TENANT})`);
     console.log(`[Index] Dashboard: https://www.${BRAND_DOMAIN}/outreach/`);
-  });
+  };
+  if (process.env.HOST) app.listen(PORT, process.env.HOST, onListen(process.env.HOST));
+  else app.listen(PORT, '127.0.0.1', onListen('127.0.0.1'));
 }
 
 export default app;

@@ -2,8 +2,17 @@ import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth';
 import { draftReviewService } from '../services/draft-review';
 import { query, TENANT } from '../db/connection';
+import { isUuid, safeEqual, publicError, sendPublicHtml, intParam } from '../middleware/security';
 
 const router = Router();
+
+// Every :id is a UUID. Public approve/skip links get the HTML invalid-link page,
+// everything else a JSON 400, before any DB call.
+router.param('id', (req: Request, res: Response, next, id: string) => {
+  if (isUuid(id)) { next(); return; }
+  if (/\/(approve|skip)\/?$/.test(req.path)) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
+  res.status(400).json({ error: 'Invalid id' });
+});
 
 // GET /api/draft-reviews — list all drafts (auth required)
 router.get('/', requireAuth, async (_req: Request, res: Response) => {
@@ -108,14 +117,14 @@ router.get('/:id', requireAuth, async (req: Request, res: Response) => {
 // POST /api/draft-reviews/generate-bulk — generate all upcoming bi-weekly drafts for next N weeks
 router.post('/generate-bulk', requireAuth, async (req: Request, res: Response) => {
   try {
-    const weeks = Math.min(parseInt(req.body?.weeks || '13', 10), 26);
+    const weeks = intParam(req.body?.weeks, 13, 1, 26);
     // Run async — client polls the list to see progress
     draftReviewService.generateBulk(weeks).catch(err =>
       console.error('[DraftReviews] Bulk gen error:', err)
     );
     res.json({ success: true, message: `Generating up to ${weeks} drafts in background — refresh the list to see progress` });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -128,7 +137,7 @@ router.post('/:id/feedback', requireAuth, async (req: Request, res: Response) =>
     const newDraft = await draftReviewService.applyFeedback(id, feedback.trim());
     res.json(newDraft);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -140,7 +149,7 @@ router.post('/generate', requireAuth, async (_req: Request, res: Response) => {
     res.json({ success: true, draft });
   } catch (err) {
     console.error('[DraftReviews] Error generating draft:', err);
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -155,7 +164,7 @@ router.post('/:id/regenerate', requireAuth, async (req: Request, res: Response) 
     await draftReviewService.sendDraftEmail(newDraft.id);
     res.json({ success: true, draft: newDraft });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -166,7 +175,7 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
     await draftReviewService.deleteDraft(id);
     res.json({ success: true });
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -181,7 +190,7 @@ router.patch('/:id', requireAuth, async (req: Request, res: Response) => {
     const draft = await draftReviewService.updateDraft(id, email_subject, email_html);
     res.json(draft);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -195,7 +204,7 @@ router.post('/:id/approve-direct', requireAuth, async (req: Request, res: Respon
     );
     res.json({ success: true, draft });
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -206,15 +215,13 @@ router.post('/:id/skip-direct', requireAuth, async (req: Request, res: Response)
     await draftReviewService.skipDraftDirect(id);
     res.json({ success: true });
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
 // ---- Public approve/skip (token-validated, linked from email) ----
 // GET only shows a confirmation page; the action happens on POST so that email
 // link scanners (which follow GETs) cannot trigger sends.
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function escapeHtml(value: unknown): string {
   return String(value ?? '')
@@ -230,7 +237,7 @@ function readIdAndToken(req: Request): [string, string] | null {
   const id = String(req.params.id || '');
   const raw = (req.body && typeof req.body.token === 'string') ? req.body.token : req.query.token;
   const token = typeof raw === 'string' ? raw : '';
-  if (!UUID_RE.test(id) || !UUID_RE.test(token)) return null;
+  if (!isUuid(id) || !isUuid(token)) return null;
   return [id, token];
 }
 
@@ -283,21 +290,21 @@ function confirmPage(action: 'approve' | 'skip', token: string, theme: string): 
 // GET /api/draft-reviews/:id/approve?token= — public, shows confirmation page only
 router.get('/:id/approve', async (req: Request, res: Response) => {
   const parsed = readIdAndToken(req);
-  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  if (!parsed) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
   try {
     const draft = await draftReviewService.get(parsed[0]);
-    if (!draft || draft.approval_token !== parsed[1]) { res.status(400).send(invalidLinkPage()); return; }
-    res.send(confirmPage('approve', parsed[1], draft.theme));
+    if (!draft || !safeEqual(parsed[1], String(draft.approval_token ?? ''))) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
+    sendPublicHtml(res, 200, confirmPage('approve', parsed[1], draft.theme));
   } catch (err) {
     console.error('[DraftReviews] Approve page error:', err);
-    res.status(500).send(errorPage('Something went wrong. Please try again.'));
+    sendPublicHtml(res, 500, errorPage('Something went wrong. Please try again.'));
   }
 });
 
 // POST /api/draft-reviews/:id/approve — public (token-validated), performs the approval
 router.post('/:id/approve', async (req: Request, res: Response) => {
   const parsed = readIdAndToken(req);
-  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  if (!parsed) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
   try {
     const draft = await draftReviewService.approveDraft(parsed[0], parsed[1]);
 
@@ -306,39 +313,41 @@ router.post('/:id/approve', async (req: Request, res: Response) => {
       console.error('[DraftReviews] Error executing send:', err)
     );
 
-    res.send(publicPage('Approved', '#0F2744', '✓', 'Outreach Approved',
+    sendPublicHtml(res, 200, publicPage('Approved', '#0F2744', '✓', 'Outreach Approved',
       `<p>The <strong>${escapeHtml(draft.theme)}</strong> campaign has been approved. Emails are being queued and will send from 9am UTC tomorrow.</p>
   <a href="https://tp.finance/outreach/#/drafts">View in Platform</a>`));
   } catch (err) {
-    res.status(400).send(errorPage((err as Error).message));
+    console.error('[DraftReviews] Public approve error:', (err as Error).message);
+    sendPublicHtml(res, 400, errorPage(publicError(err, 'This approval could not be completed.')));
   }
 });
 
 // GET /api/draft-reviews/:id/skip?token= — public, shows confirmation page only
 router.get('/:id/skip', async (req: Request, res: Response) => {
   const parsed = readIdAndToken(req);
-  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  if (!parsed) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
   try {
     const draft = await draftReviewService.get(parsed[0]);
-    if (!draft || draft.skip_token !== parsed[1]) { res.status(400).send(invalidLinkPage()); return; }
-    res.send(confirmPage('skip', parsed[1], draft.theme));
+    if (!draft || !safeEqual(parsed[1], String(draft.skip_token ?? ''))) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
+    sendPublicHtml(res, 200, confirmPage('skip', parsed[1], draft.theme));
   } catch (err) {
     console.error('[DraftReviews] Skip page error:', err);
-    res.status(500).send(errorPage('Something went wrong. Please try again.'));
+    sendPublicHtml(res, 500, errorPage('Something went wrong. Please try again.'));
   }
 });
 
 // POST /api/draft-reviews/:id/skip — public (token-validated), performs the skip
 router.post('/:id/skip', async (req: Request, res: Response) => {
   const parsed = readIdAndToken(req);
-  if (!parsed) { res.status(400).send(invalidLinkPage()); return; }
+  if (!parsed) { sendPublicHtml(res, 400, invalidLinkPage()); return; }
   try {
     await draftReviewService.skipDraft(parsed[0], parsed[1]);
-    res.send(publicPage('Skipped', '#374151', '—', 'Week Skipped',
+    sendPublicHtml(res, 200, publicPage('Skipped', '#374151', '—', 'Week Skipped',
       `<p>This week's outreach has been skipped. The next draft will be generated automatically in two weeks.</p>
   <a href="https://tp.finance/outreach/#/drafts" style="background:#6b7280">Back to Platform</a>`));
   } catch (err) {
-    res.status(400).send(errorPage((err as Error).message));
+    console.error('[DraftReviews] Public skip error:', (err as Error).message);
+    sendPublicHtml(res, 400, errorPage(publicError(err, 'This skip could not be completed.')));
   }
 });
 
@@ -351,7 +360,7 @@ router.patch('/:id/poster', requireAuth, async (req: Request, res: Response) => 
     const draft = await draftReviewService.updatePoster(id, headline, subline || '');
     res.json(draft);
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -365,7 +374,7 @@ router.get('/:id/poster', requireAuth, async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/html');
     res.send(draft.linkedin_poster_html);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: publicError(err, 'Request failed') });
   }
 });
 
@@ -376,7 +385,7 @@ router.post('/seed-intro', requireAuth, async (_req: Request, res: Response) => 
     res.json(result);
   } catch (err) {
     console.error('[DraftReviews] Seed intro error:', err);
-    res.status(500).json({ error: (err as Error).message });
+    res.status(500).json({ error: publicError(err, 'Request failed') });
   }
 });
 

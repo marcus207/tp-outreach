@@ -116,6 +116,22 @@ export function collectPayloadText(payload: GmailPart | null | undefined): strin
   return out.join('\n');
 }
 
+/** Sender is a mail system (mailer-daemon / postmaster / MAILER-DAEMON@...). */
+export function isDsnFrom(from: string): boolean {
+  const f = (from || '').toLowerCase();
+  const m = f.match(/<([^>]+)>/) || f.match(/([^\s<]+@[^\s>]+)/);
+  const addr = m ? m[1] : f;
+  const local = addr.split('@')[0];
+  return local === 'mailer-daemon' || local === 'postmaster' || /mail delivery (subsystem|system)/.test(f);
+}
+
+function hasDeliveryStatusPart(part: GmailPart | null | undefined): boolean {
+  if (!part) return false;
+  const mime = (part.mimeType || '').toLowerCase();
+  if (mime === 'multipart/report' || mime === 'message/delivery-status') return true;
+  return (part.parts || []).some(hasDeliveryStatusPart);
+}
+
 export class ReplyWatcher {
   async pollAllAccounts(): Promise<void> {
     console.log('[Reply Watcher] Polling all active accounts for replies and bounces...');
@@ -207,28 +223,39 @@ export class ReplyWatcher {
       return 'soft';
     }
 
+    await this.applyHardBounce(send.id, send.to_email, send.contact_id, threadId);
+    return 'hard';
+  }
+
+  /**
+   * Hard-bounce handling shared by the bounce poll and the reply path: one
+   * 'bounce' event per send, send marked bounced, address suppressed, contact
+   * tagged 'bounced', enrollments cancelled. Contact and history are kept.
+   */
+  private async applyHardBounce(sendId: string, toEmail: string, contactId: string | null, threadId: string): Promise<void> {
     const existing = await query<{ id: string }>(
       `SELECT id FROM email_events WHERE email_send_id = $1 AND event_type = 'bounce'`,
-      [send.id]
+      [sendId]
     );
-    if (existing.rows.length > 0) return 'hard';
+    if (existing.rows.length > 0) return;
 
-    console.log(`[Reply Watcher] Hard bounce detected: ${send.to_email} (thread ${threadId})`);
+    console.log(`[Reply Watcher] Hard bounce detected: ${toEmail} (thread ${threadId})`);
 
     await query(
       `INSERT INTO email_events (email_send_id, event_type) VALUES ($1, 'bounce')`,
-      [send.id]
+      [sendId]
     );
 
     await query(
       `UPDATE email_sends SET status = 'bounced' WHERE id = $1 AND tenant = $2`,
-      [send.id, TENANT]
+      [sendId, TENANT]
     );
 
-    await this.suppressEmail(send.to_email, 'bounce');
-    await this.tagContact(send.contact_id, 'bounced');
-    await this.cancelContactEnrollments(send.contact_id, 'bounced');
-    return 'hard';
+    await this.suppressEmail(toEmail, 'bounce');
+    if (contactId) {
+      await this.tagContact(contactId, 'bounced');
+      await this.cancelContactEnrollments(contactId, 'bounced');
+    }
   }
 
   private async pollAccount(account: EmailAccount): Promise<void> {
@@ -258,6 +285,16 @@ export class ReplyWatcher {
     threadId: string,
     payload?: { headers?: Array<{ name: string; value: string }> }
   ): Promise<void> {
+    // DSNs (mailer-daemon / postmaster / multipart/report delivery-status) land
+    // in the INBOX on the outbound thread. They are routed to the bounce
+    // classifier BEFORE any human-reply / left-company classification, so a
+    // bounce is never suppressed as a "reply" nor forwarded to marcus@.
+    const dsn = await this.detectDsn(account, messageId, payload);
+    if (dsn) {
+      await this.handleDsnInReplyPath(account, threadId, dsn);
+      return;
+    }
+
     let match = await this.matchReply(threadId, messageId);
 
     if (!match && payload) {
@@ -304,6 +341,7 @@ export class ReplyWatcher {
       if (!firstTime) await this.recordEventOnce(match.emailSendId, 'left_company');
       console.log(`[Reply Watcher] Left company / undeliverable: ${match.contactEmail} — removing from sequencing`);
       await this.suppressEmail(match.contactEmail, 'left company');
+      await this.tagContact(match.contactId, 'left_company');
       await this.cancelContactEnrollments(match.contactId, 'left_company');
       await this.archiveThread(account, threadId);
     } else if (replyType === 'ooo') {
@@ -324,6 +362,77 @@ export class ReplyWatcher {
       await this.cancelContactEnrollments(match.contactId, 'replied', match.enrollmentId);
       await this.suppressEmail(match.contactEmail, 'replied - removed from automation');
       await this.maybeForwardReply(account, messageId, match);
+    }
+  }
+
+  /**
+   * Decide whether an inbox message is a delivery status notification. Returns
+   * the DSN text (subject + all inline parts, incl. message/delivery-status) when
+   * it is, otherwise null. Signals: From mailer-daemon/postmaster, a
+   * multipart/report (report-type=delivery-status) content type, or
+   * Auto-Submitted from a mailer-daemon.
+   */
+  private async detectDsn(
+    account: EmailAccount,
+    messageId: string,
+    payload?: { headers?: Array<{ name: string; value: string }> },
+  ): Promise<string | null> {
+    const metaHeaders = payload?.headers || [];
+    const metaFrom = metaHeaders.find(h => h.name?.toLowerCase() === 'from')?.value || '';
+    let full: GmailPart & { headers?: Array<{ name?: string | null; value?: string | null }> | null } | null | undefined;
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+      const msg = await gmail.users.messages.get({ userId: 'me', id: messageId, format: 'full' });
+      full = msg.data.payload as typeof full;
+    } catch (err) {
+      // Could not fetch the body: fall back to metadata headers only.
+      if (!isDsnFrom(metaFrom)) return null;
+      const subj = metaHeaders.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
+      return subj;
+    }
+    const headers = full?.headers || [];
+    const get = (n: string) => headers.find(h => h.name?.toLowerCase() === n.toLowerCase())?.value || '';
+    const from = get('From') || metaFrom;
+    const contentType = (get('Content-Type') || '').toLowerCase();
+    const mime = (full?.mimeType || '').toLowerCase();
+    const isReport =
+      mime === 'multipart/report' ||
+      contentType.includes('multipart/report') ||
+      contentType.includes('report-type=delivery-status') ||
+      hasDeliveryStatusPart(full);
+    if (!isDsnFrom(from) && !isReport) return null;
+    return (get('Subject') || '') + '\n' + collectPayloadText(full);
+  }
+
+  /**
+   * Reply-path DSN handling: hard => bounce handling on the matched send; soft or
+   * unknown => no action (no suppression, sequence continues, left in place so
+   * the bounce poll can still see a later final DSN).
+   */
+  private async handleDsnInReplyPath(account: EmailAccount, threadId: string, dsnText: string): Promise<void> {
+    const kind = classifyDsn(dsnText);
+    if (kind === 'soft') {
+      console.log(`[Reply Watcher] Soft/unknown DSN on thread ${threadId} (${account.email}) - no action`);
+      return;
+    }
+    const sendResult = await query<{ id: string; contact_id: string | null; to_email: string }>(
+      `SELECT es.id, es.contact_id, es.to_email
+       FROM email_sends es
+       WHERE es.gmail_thread_id = $1 AND es.tenant = $2 AND es.status IN ('sent', 'bounced')
+       ORDER BY es.sent_at DESC NULLS LAST
+       LIMIT 1`,
+      [threadId, TENANT]
+    );
+    const send = sendResult.rows[0];
+    if (!send) return;
+    await this.applyHardBounce(send.id, send.to_email, send.contact_id, threadId);
+    try {
+      const auth = await gmailClient.getAuthenticatedClient(account);
+      const gmail = google.gmail({ version: 'v1', auth });
+      await this.trashThread(gmail, threadId);
+    } catch (err) {
+      console.error(`[Reply Watcher] Failed to trash DSN thread ${threadId}:`, err);
     }
   }
 

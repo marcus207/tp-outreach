@@ -10,7 +10,7 @@
 #   TEST_DATABASE_URL=postgresql://... scripts/test-db-reset.sh
 set -euo pipefail
 
-URL="${TEST_DATABASE_URL:-postgresql://tpca:tpca_secure_2026@localhost:5432/tpca_outreach_test}"
+URL="${TEST_DATABASE_URL:-postgresql://tpca@localhost:5432/tpca_outreach_test}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA_FILE="${SCRIPT_DIR}/../test/schema.sql"
 

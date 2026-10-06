@@ -1,7 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { digestService } from '../services/digest';
+import { query } from '../db/connection';
+import { uuidParam, publicError, safeEqual } from '../middleware/security';
 
 const router = Router();
+
+router.param('id', uuidParam);
 
 // List digests
 router.get('/', async (_req: Request, res: Response) => {
@@ -9,7 +13,8 @@ router.get('/', async (_req: Request, res: Response) => {
     const digests = await digestService.list();
     res.json(digests);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] List error:', err);
+    res.status(500).json({ error: 'Failed to list digests' });
   }
 });
 
@@ -20,7 +25,8 @@ router.get('/:id', async (req: Request, res: Response) => {
     if (!digest) { res.status(404).json({ error: 'Not found' }); return; }
     res.json(digest);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] Get error:', err);
+    res.status(500).json({ error: 'Failed to get digest' });
   }
 });
 
@@ -30,7 +36,8 @@ router.post('/generate', async (_req: Request, res: Response) => {
     const digest = await digestService.generate();
     res.json(digest);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] Generate error:', err);
+    res.status(500).json({ error: publicError(err, 'Failed to generate digest') });
   }
 });
 
@@ -41,7 +48,8 @@ router.post('/generate-and-send', async (_req: Request, res: Response) => {
     await digestService.sendDigestEmail(digest.id);
     res.json({ success: true, digest_id: digest.id });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] Generate-and-send error:', err);
+    res.status(500).json({ error: publicError(err, 'Failed to generate and send digest') });
   }
 });
 
@@ -51,42 +59,44 @@ router.post('/:id/send-email', async (req: Request, res: Response) => {
     await digestService.sendDigestEmail(String(req.params.id));
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] Send-email error:', err);
+    res.status(500).json({ error: publicError(err, 'Failed to send digest email') });
   }
 });
 
 // Approve a digest (via platform — authenticated)
 router.post('/:id/approve', async (req: Request, res: Response) => {
   try {
-    const { token, contacts } = req.body;
-    if (!token) { res.status(400).json({ error: 'token required' }); return; }
-    const digest = await digestService.approve(String(req.params.id), String(token), contacts);
+    const { token, contacts } = req.body || {};
+    if (typeof token !== 'string' || !token) { res.status(400).json({ error: 'token required' }); return; }
+    if (contacts !== undefined && !Array.isArray(contacts)) { res.status(400).json({ error: 'contacts must be an array' }); return; }
+    const digest = await digestService.approve(String(req.params.id), token, contacts);
     digestService.executeApproved(digest.id).catch((err: Error) =>
       console.error('[Digest] Execute error:', err.message)
     );
     res.json({ success: true, digest });
   } catch (err) {
-    res.status(400).json({ error: (err as Error).message });
+    res.status(400).json({ error: publicError(err, 'Failed to approve digest') });
   }
 });
 
 // Reject / cancel a digest
 router.post('/:id/reject', async (req: Request, res: Response) => {
   try {
-    const { token } = req.body;
-    if (!token) { res.status(400).json({ error: 'token required' }); return; }
-    const { query } = await import('../db/connection');
+    const { token } = req.body || {};
+    if (typeof token !== 'string' || !token) { res.status(400).json({ error: 'token required' }); return; }
     const digestResult = await query<{ approval_token: string; status: string }>(
       `SELECT approval_token, status FROM daily_digest WHERE id = $1`, [String(req.params.id)]
     );
     const d = digestResult.rows[0];
     if (!d) { res.status(404).json({ error: 'Not found' }); return; }
-    if (d.approval_token !== String(token)) { res.status(403).json({ error: 'Invalid token' }); return; }
+    if (!safeEqual(token, String(d.approval_token ?? ''))) { res.status(403).json({ error: 'Invalid token' }); return; }
     if (d.status !== 'pending') { res.status(400).json({ error: `Already ${d.status}` }); return; }
-    await query(`UPDATE daily_digest SET status = 'rejected' WHERE id = $1`, [String(req.params.id)]);
+    await query(`UPDATE daily_digest SET status = 'rejected' WHERE id = $1 AND status = 'pending'`, [String(req.params.id)]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[Digest] Reject error:', err);
+    res.status(500).json({ error: 'Failed to reject digest' });
   }
 });
 

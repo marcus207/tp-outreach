@@ -15,22 +15,18 @@
 
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
 import { templateEngine } from './template-engine';
+import { suppressionExclusionSql } from './suppression';
 import { sendQueue } from './send-queue';
 import { isWithinSendWindow, COLD_SENDER_DOMAIN } from './send-gate';
 import { Contact, Template, EmailAccount } from '../types';
 
 // Recipient exclusions for blast sends (contacts aliased as c). tp outreach must
 // never email lenders, held/unsubscribed/bounced contacts, or anything on the
-// tenant's suppression list (exact email or whole domain).
+// tenant's suppression list (exact email, or whole domain for manual domain rows).
 const BLAST_RECIPIENT_EXCLUSIONS = `
          AND (c.contact_type IS NULL OR c.contact_type <> 'lender')
          AND NOT (COALESCE(c.tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[])
-         AND NOT EXISTS (
-           SELECT 1 FROM suppressed_emails sup
-           WHERE sup.tenant = c.tenant
-             AND (LOWER(sup.email) = LOWER(c.email)
-                  OR LOWER(sup.domain) = LOWER(SPLIT_PART(c.email, '@', 2)))
-         )`;
+         AND ${suppressionExclusionSql('c.email', 'c.tenant')}`;
 
 const BLAST_BATCH_SIZE = 50;
 
@@ -385,16 +381,12 @@ export class CampaignEngine {
     contact: Contact,
     baseTemplate: Template | null
   ): { subject: string; bodyHtml: string } {
+    // Same renderer as the sequence path: unresolved {{x}} render empty (or
+    // their {{x|default}}), contact values are HTML-escaped in the body, and
+    // empty greetings ("Hi ,") become "Hi there,". Subject stays plain text.
     const mergeData = templateEngine.buildMergeData(contact);
-    let subject = step.subject_line || '';
-    for (const [key, val] of Object.entries(mergeData)) {
-      if (val) subject = subject.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), val);
-    }
-
-    let body = step.body_copy || '';
-    for (const [key, val] of Object.entries(mergeData)) {
-      if (val) body = body.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), val);
-    }
+    const subject = templateEngine.render(step.subject_line || '', mergeData).replace(/\s+/g, ' ').trim();
+    const body = templateEngine.render(step.body_copy || '', mergeData, { html: true });
 
     return {
       subject,
@@ -431,7 +423,7 @@ ${renderedBody}
 <img src="https://res.cloudinary.com/dfqfrd5l0/image/upload/v1779917807/tp-outreach/marcus-signature.gif" width="400" alt="Marcus Emadi - Director - Turning Point Capital Advisory" style="display:block;max-width:400px;width:100%;height:auto;" />
 </td></tr>
 <tr><td style="background:#f8f9fb;padding:12px 28px;border-top:1px solid #e5e7eb;text-align:center;">
-<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;">Turning Point Capital Advisory Ltd · London · <a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
+<p style="margin:0;font-size:11px;color:#9ca3af;font-family:Arial,sans-serif;"><a href="{{unsubscribe_url}}" style="color:#9ca3af;">Unsubscribe</a></p>
 </td></tr>
 </table>
 </td></tr>

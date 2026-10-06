@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
 import { sendQueue } from '../services/send-queue';
 import { requireAuth } from '../middleware/auth';
+import { suppressionMatchSql } from '../services/suppression';
 
 const router = Router();
 router.use(requireAuth);
@@ -29,18 +30,16 @@ async function getPressSenderAccount(): Promise<{ id: string; email: string; dis
  * contact_id, so send-gate can't check this for us.
  */
 async function isSuppressedRecipient(email: string): Promise<boolean> {
-  const domain = (email.split('@')[1] || '').toLowerCase();
-  const res = await query<{ id: string }>(
-    `SELECT id FROM suppressed_emails
-     WHERE tenant = $1 AND (LOWER(email) = LOWER($2) OR LOWER(domain) = $3)
-     UNION ALL
-     SELECT id FROM contacts
-     WHERE tenant = $1 AND LOWER(email) = LOWER($2)
-       AND COALESCE(tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[]
-     LIMIT 1`,
-    [TENANT, email, domain]
+  const res = await query<{ hit: boolean }>(
+    `SELECT (${suppressionMatchSql('$2::text', '$1::text')}
+             OR EXISTS (
+               SELECT 1 FROM contacts
+               WHERE tenant = $1 AND LOWER(email) = LOWER($2)
+                 AND COALESCE(tags, '{}'::text[]) && ARRAY['hold', 'unsubscribed', 'bounced']::text[]
+             )) AS hit`,
+    [TENANT, email.trim()]
   );
-  return res.rows.length > 0;
+  return res.rows[0]?.hit === true;
 }
 
 const NO_PRESS_SENDER_ERROR = `No active ${PRESS_SENDER_DOMAIN} sending account. Connect/activate one before sending press releases.`;
@@ -271,20 +270,21 @@ router.post('/generate', async (req: Request, res: Response) => {
       const result = await query(
         `INSERT INTO press_releases
           (announcement_title, publication, press_contact_id, headline, subheadline, dateline, body,
-           spokesperson_name, spokesperson_title, spokesperson_quote, tenant)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '${TENANT}')
+           spokesperson_name, spokesperson_title, spokesperson_quote, boilerplate, tenant)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '${TENANT}')
          RETURNING *`,
         [
           announcement_title,
           pub.publication,
           pub.id,
           body.headline,
-          body.subheadline,
+          body.subheadline || null,
           dateline,
           body.body,
           'Marcus Emadi',
           `CEO, ${BRAND_NAME}`,
-          body.quote,
+          body.quote || null,
+          pressBoilerplate(),
         ]
       );
 
@@ -299,12 +299,77 @@ router.post('/generate', async (req: Request, res: Response) => {
   }
 });
 
+// "About" paragraph written onto every generated release. The press_releases
+// table's column DEFAULT is the Loan Intel boilerplate, so /generate must always
+// set it explicitly. PRESS_BOILERPLATE env overrides.
+const TP_PRESS_BOILERPLATE =
+  `${BRAND_NAME} is an independent advisory firm working with property owners, developers, ` +
+  `lenders and funds across UK commercial real estate finance. ` +
+  `For more information visit www.${BRAND_DOMAIN} or contact ${BRAND_EMAIL}.`;
+
+const LOAN_INTEL_PRESS_BOILERPLATE =
+  'Loan Intel is a lender intelligence platform purpose-built for UK commercial real estate lending. ' +
+  'For more information visit www.loan-intel.com or contact support@loan-intel.com.';
+
+export function pressBoilerplate(): string {
+  if (process.env.PRESS_BOILERPLATE) return process.env.PRESS_BOILERPLATE;
+  return TENANT === 'loan-intel' ? LOAN_INTEL_PRESS_BOILERPLATE : TP_PRESS_BOILERPLATE;
+}
+
+// press_releases column DEFAULTs (Loan Intel era). On tp a row still carrying
+// them was never given its own value, so treat them as unset.
+const LEGACY_DEFAULT_BOILERPLATE_PREFIX = 'Loan Intel is a lender intelligence platform purpose-built';
+const LEGACY_DEFAULT_SPOKESPERSON = { name: 'Kassi Emadi', title: 'CEO, Loan Intel' };
+
+/** tp: swap untouched Loan Intel column defaults for the TP equivalents. */
+export function normalisePressRelease<T extends Record<string, any>>(pr: T): T {
+  if (TENANT === 'loan-intel') return pr;
+  const out: Record<string, any> = { ...pr };
+  if (!out.boilerplate || String(out.boilerplate).startsWith(LEGACY_DEFAULT_BOILERPLATE_PREFIX)) {
+    out.boilerplate = pressBoilerplate();
+  }
+  if (out.spokesperson_name === LEGACY_DEFAULT_SPOKESPERSON.name && out.spokesperson_title === LEGACY_DEFAULT_SPOKESPERSON.title) {
+    out.spokesperson_name = 'Marcus Emadi';
+    out.spokesperson_title = `CEO, ${BRAND_NAME}`;
+  }
+  return out as T;
+}
+
+/**
+ * tp tenant: refuse to send a release whose copy still mentions Loan Intel
+ * (custom boilerplate, headline, body, quote or spokesperson). Run after
+ * normalisePressRelease(). Returns a reason or null.
+ */
+export function pressBrandProblem(pr: Record<string, unknown>): string | null {
+  if (TENANT === 'loan-intel') return null;
+  const fields = ['boilerplate', 'headline', 'subheadline', 'body', 'spokesperson_name', 'spokesperson_title', 'spokesperson_quote'];
+  for (const f of fields) {
+    const v = pr[f];
+    if (typeof v === 'string' && /loan[\s-]?intel/i.test(v)) {
+      return `press release ${f} mentions Loan Intel; fix the copy before sending`;
+    }
+  }
+  if (typeof pr.spokesperson_name === 'string' && /Kassi Emadi/i.test(pr.spokesperson_name)) {
+    return 'press release spokesperson is the Loan Intel default (Kassi Emadi); fix before sending';
+  }
+  return null;
+}
+
 function generatePressReleaseBody(
   title: string,
   announcement: string,
   publication: string,
   focusNotes: string
 ): { headline: string; subheadline: string; body: string; quote: string } {
+  // The publication-angle copy below is Loan Intel platform messaging. tp gets
+  // a neutral advisory-firm release built only from the supplied announcement.
+  if (TENANT !== 'loan-intel') {
+    // No invented spokesperson quote: add one by editing the draft (PUT /:id).
+    const body = `${announcement}
+
+For more information, visit www.${BRAND_DOMAIN} or contact ${BRAND_EMAIL}.`;
+    return { headline: `${title} | ${BRAND_NAME}`, subheadline: '', body, quote: '' };
+  }
   // Publication-specific angles
   const angles: Record<string, { focus: string; tone: string }> = {
     'The Intermediary': {
@@ -421,7 +486,7 @@ router.post('/:id/send', async (req: Request, res: Response) => {
       return;
     }
 
-    const pr = prResult.rows[0] as any;
+    const pr = normalisePressRelease(prResult.rows[0] as any);
 
     if (pr.status === 'sent') {
       res.status(400).json({ error: 'Press release has already been sent' });
@@ -430,6 +495,12 @@ router.post('/:id/send', async (req: Request, res: Response) => {
 
     if (!pr.contact_email) {
       res.status(400).json({ error: 'No press contact email linked to this release' });
+      return;
+    }
+
+    const brandProblem = pressBrandProblem(pr);
+    if (brandProblem) {
+      res.status(409).json({ error: brandProblem });
       return;
     }
 
@@ -507,6 +578,7 @@ router.post('/send-all', async (req: Request, res: Response) => {
 
     let sent = 0;
     const suppressed: string[] = [];
+    const refused: { id: string; error: string }[] = [];
 
     for (const row of drafts.rows) {
       const draft = row as any;
@@ -526,7 +598,12 @@ router.post('/send-all', async (req: Request, res: Response) => {
       );
       if (!fullPr.rows[0]) continue;
 
-      const pr = fullPr.rows[0] as any;
+      const pr = normalisePressRelease(fullPr.rows[0] as any);
+      const brandProblem = pressBrandProblem(pr);
+      if (brandProblem) {
+        refused.push({ id: draft.id, error: brandProblem });
+        continue;
+      }
       const trackingId = crypto.randomUUID();
       const emailHtml = buildPressReleaseEmail(pr);
       const subject = pr.headline ? `Press Release: ${pr.headline}` : (pr.subheadline || 'Following up on our press release');
@@ -548,8 +625,8 @@ router.post('/send-all', async (req: Request, res: Response) => {
       sent++;
     }
 
-    console.log(`[PressReleases] Queued ${sent} press releases for: ${announcement_title} (skipped ${suppressed.length} suppressed)`);
-    res.json({ success: true, sent_count: sent, suppressed_count: suppressed.length, suppressed });
+    console.log(`[PressReleases] Queued ${sent} press releases for: ${announcement_title} (skipped ${suppressed.length} suppressed, ${refused.length} refused)`);
+    res.json({ success: true, sent_count: sent, suppressed_count: suppressed.length, suppressed, refused });
   } catch (err) {
     console.error('[PressReleases] Error sending all press releases:', err);
     res.status(500).json({ error: 'Failed to send press releases' });
@@ -572,7 +649,7 @@ ${pr.subheadline ? `<p style="color:#555;font-style:italic;">${pr.subheadline}</
 <p>${pr.dateline ? `<strong>${pr.dateline}</strong> — ` : ''}${body}</p>
 ${pr.spokesperson_quote ? `<p style="border-left:3px solid #1993C5;padding-left:16px;font-style:italic;">${pr.spokesperson_quote}<br><span style="font-style:normal;font-size:13px;color:#555;">— <strong>${pr.spokesperson_name || 'Marcus Emadi'}</strong>, ${pr.spokesperson_title || `CEO, ${BRAND_NAME}`}</span></p>` : ''}
 <p style="text-align:center;color:#999;font-size:12px;">— ENDS —</p>
-<p style="font-size:12px;color:#666;"><strong>About ${BRAND_NAME}:</strong> ${pr.boilerplate || `Specialist advisory firm focused on UK commercial real estate finance.`}</p>
+<p style="font-size:12px;color:#666;"><strong>About ${BRAND_NAME}:</strong> ${pr.boilerplate || pressBoilerplate()}</p>
 <p style="font-size:12px;color:#666;"><strong>Media contact:</strong> Marcus Emadi, CEO, ${BRAND_NAME}<br><a href="mailto:${BRAND_EMAIL}" style="color:#1993C5;">${BRAND_EMAIL}</a> | <a href="https://www.${BRAND_DOMAIN}" style="color:#1993C5;">www.${BRAND_DOMAIN}</a></p>
 </div>`;
 }

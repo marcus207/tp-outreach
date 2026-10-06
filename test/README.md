@@ -122,3 +122,14 @@ file. If new code references a new table, add it to the list.
 
 Prod `.env` contains `SEND_MODE=live`. Without it, the API and worker will refuse to send after
 their next restart. That is the intended fail-safe.
+
+## Database credentials
+
+No password is stored in this repository. Test tooling connects as `postgresql://tpca@localhost/...`
+and libpq / node-postgres read the password from `~/.pgpass` (mode 600):
+
+```
+localhost:5432:*:tpca:<password>
+```
+
+In CI the Postgres service container provides its own throwaway credentials via `PGPASSWORD`.

@@ -16,7 +16,7 @@ const TEST_ENV: Record<string, string> = {
   NODE_ENV: 'test',
   SEND_MODE: 'dryrun',
   TENANT: 'tp',
-  DATABASE_URL: `postgresql://tpca:tpca_secure_2026@localhost:5432/${LANE_DB}`,
+  DATABASE_URL: `postgresql://tpca@localhost:5432/${LANE_DB}`,
   REDIS_URL: 'redis://127.0.0.1:6379/15',
   BULL_PREFIX: `bull-test-${LANE}`,
   TRACKING_DOMAIN: 'https://track.test.invalid',

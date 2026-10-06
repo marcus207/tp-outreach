@@ -2,7 +2,7 @@ import { Queue, Worker, Job } from 'bullmq';
 import { query, TENANT, BULL_PREFIX } from '../db/connection';
 import { getRedisConnection } from '../db/redis';
 import { gmailClient } from './gmail-client';
-import { canSend } from './send-gate';
+import { canSend, releaseSendSlot } from './send-gate';
 import { dailyPlanner } from './daily-planner';
 import { EmailAccount } from '../types';
 
@@ -10,9 +10,10 @@ export interface EmailSendJobData {
   emailSendId: string;
   threadId?: string;
   fromName?: string;
-  // Set by the sequence engine, which now reserves (increments) the account's
-  // send counters atomically at queue time. When true, the send worker must
-  // NOT increment again or the daily/hourly caps would be double-counted.
+  // Set by the legacy sequence-step path, which reserves (increments) the
+  // account's send counters atomically at queue time. When true the gate does
+  // not reserve (or cap-check) again, so the caps are never double-counted.
+  // Every other send reserves its slot atomically in canSend({ reserveSlot }).
   preCounted?: boolean;
 }
 
@@ -90,8 +91,12 @@ export class SendQueue {
   async processEmailSend(data: EmailSendJobData): Promise<void> {
     const { emailSendId, threadId, fromName } = data;
 
-    // Centralised pre-send gate — all checks in one place (send-gate.ts)
-    const decision = await canSend(emailSendId);
+    // Centralised pre-send gate — all checks in one place (send-gate.ts).
+    // reserveSlot: the cap check and the counter increment are one atomic
+    // UPDATE, so concurrent jobs can never overshoot hourly/daily limits. From
+    // here on, every path where the email does NOT go out must release it.
+    const preCounted = data.preCounted === true;
+    const decision = await canSend(emailSendId, { reserveSlot: !preCounted, checkLimits: !preCounted });
 
     if (decision.action === 'fail') {
       console.log(`[Send Queue] ${emailSendId} failed gate: ${decision.reason}`);
@@ -106,8 +111,28 @@ export class SendQueue {
 
     if (decision.action === 'skip') {
       console.log(`[Send Queue] ${emailSendId} skipped: ${decision.reason}`);
+      // Window closed / cap reached: push the job (full payload) to the next
+      // hour slot or window instead of dropping it. Never re-add immediately.
+      if (decision.retryAt) {
+        const retryDelay = Math.max(60000, decision.retryAt.getTime() - Date.now());
+        await this.pushBack(data, retryDelay);
+      }
       return;
     }
+
+    // From here the account slot is ours (unless preCounted). Release it on
+    // every path that does not end with Gmail accepting the message.
+    let slotHeld = true;
+    let slotAccountId: string | null = null;
+    const releaseSlot = async () => {
+      if (!slotHeld || !slotAccountId) return;
+      slotHeld = false;
+      try {
+        await releaseSendSlot(slotAccountId);
+      } catch (err) {
+        console.error(`[Send Queue] Failed to release send slot for ${emailSendId}:`, (err as Error).message);
+      }
+    };
 
     // Gate passed — fetch full record and send
     const sendResult = await query<EmailSendRecord>(
@@ -116,6 +141,7 @@ export class SendQueue {
     );
     const send = sendResult.rows[0];
     if (!send) return;
+    slotAccountId = send.email_account_id;
 
     const accountResult = await query<EmailAccount>(
       `SELECT * FROM email_accounts WHERE id = $1 AND is_active = true AND tenant = $2`,
@@ -124,6 +150,7 @@ export class SendQueue {
     const account = accountResult.rows[0];
     if (!account) {
       // Deactivated between gate and now — transient for the enrollment
+      await releaseSlot();
       await query(
         `UPDATE email_sends SET status = 'failed', error_message = 'Email account inactive'
          WHERE id = $1 AND tenant = $2 AND status = 'queued'`,
@@ -147,12 +174,9 @@ export class SendQueue {
         if (elapsed < gapMs) {
           // Too soon after this account's last send — push the job back rather
           // than dropping it (which left it for the re-queue cron).
+          await releaseSlot();
           const retryDelay = gapMs - elapsed + Math.floor(Math.random() * 60000) + 30000;
-          await this.add(data, retryDelay);
-          await query(
-            `UPDATE email_sends SET last_enqueued_at = NOW() + ($1::int * INTERVAL '1 millisecond') WHERE id = $2`,
-            [retryDelay, emailSendId]
-          );
+          await this.pushBack(data, retryDelay);
           return;
         }
       }
@@ -170,6 +194,7 @@ export class SendQueue {
     );
     if (claim.rows.length === 0) {
       console.log(`[Send Queue] ${emailSendId} already claimed by another job, skipping`);
+      await releaseSlot();
       return;
     }
 
@@ -206,6 +231,7 @@ export class SendQueue {
       // Gmail did NOT accept the message — safe to mark failed and retry later
       const error = err as Error;
       console.error(`[Send Queue] Failed to send email ${emailSendId}:`, error.message);
+      await releaseSlot();
 
       await query(
         `UPDATE email_sends SET status = 'failed', error_message = $1 WHERE id = $2 AND tenant = $3`,
@@ -233,14 +259,17 @@ export class SendQueue {
       return;
     }
 
-    // Increment send counts — unless the sequence engine already reserved
-    // the slot atomically at queue time (avoids double-counting the cap).
-    if (!data.preCounted) {
-      try {
-        await gmailClient.incrementSendCounts(account.id);
-      } catch (err) {
-        console.error(`[Send Queue] Sent ${emailSendId} but failed to increment counters for ${account.email}:`, (err as Error).message);
-      }
+    // The counters were already incremented by the gate's atomic reservation
+    // (or at queue time for preCounted jobs) — never increment again here.
+    // Only record the send time used by the per-account gap.
+    slotHeld = false;
+    try {
+      await query(
+        `UPDATE email_accounts SET last_send_at = NOW(), updated_at = NOW() WHERE id = $1 AND tenant = $2`,
+        [account.id, TENANT]
+      );
+    } catch (err) {
+      console.error(`[Send Queue] Sent ${emailSendId} but failed to update last_send_at for ${account.email}:`, (err as Error).message);
     }
 
     console.log(`[Send Queue] Email sent successfully: ${send.to_email} via ${send.from_email}`);
@@ -253,6 +282,16 @@ export class SendQueue {
         console.error(`[Send Queue] Error scheduling next step for ${emailSendId}:`, (nextErr as Error).message);
       }
     }
+  }
+
+  /** Re-add a job (full payload) after delayMs and record its new fire time. */
+  private async pushBack(data: EmailSendJobData, delayMs: number): Promise<void> {
+    await this.add(data, delayMs);
+    await query(
+      `UPDATE email_sends SET last_enqueued_at = NOW() + ($1::int * INTERVAL '1 millisecond')
+       WHERE id = $2 AND tenant = $3 AND status = 'queued'`,
+      [Math.round(delayMs), data.emailSendId, TENANT]
+    );
   }
 
   /** Never let enrollment bookkeeping errors mask the send outcome. */

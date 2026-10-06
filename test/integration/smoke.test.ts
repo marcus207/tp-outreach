@@ -64,7 +64,7 @@ describe('harness smoke: developer contact, 2-step sequence, human reply', () =>
     expect(mail.from_header).toBe('"Marcus Emadi" <marcus.emadi@go.tp.finance>');
     expect(mail.to_email).toBe('dana@harbourside-dev.test');
     expect(mail.subject).toBe('Funding for Example Developments Ltd');
-    expect(mail.headers['List-Unsubscribe']).toMatch(/^<https:\/\/track\.test\.invalid\/t\/[0-9a-f]+\/unsubscribe>$/);
+    expect(mail.headers['List-Unsubscribe']).toMatch(/^<https:\/\/track\.test\.invalid\/t\/[0-9a-f]+\/unsubscribe>(, <mailto:[^>]+>)?$/);
     expect(mail.headers['List-Unsubscribe-Post']).toBe('List-Unsubscribe=One-Click');
     expect(mail.headers['Reply-To']).toBe('Marcus Emadi <marcus@tp.finance>');
     expect(mail.html_body).toContain('Hi Dana,');

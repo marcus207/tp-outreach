@@ -1,0 +1,204 @@
+{
+  "warmup_10_2": {
+    "limits": {
+      "daily": 10,
+      "hourly": 2
+    },
+    "scenarioMs": 10659,
+    "counts": [
+      {
+        "k": "contacts",
+        "n": "15100"
+      },
+      {
+        "k": "enrollments",
+        "n": "15100"
+      },
+      {
+        "k": "due_at_start",
+        "n": "13590"
+      }
+    ],
+    "invariants": {
+      "totalSends": 100,
+      "perDay": [
+        {
+          "day": "2026-10-12 Mon",
+          "sends": 20,
+          "budget": 20
+        },
+        {
+          "day": "2026-10-13 Tue",
+          "sends": 20,
+          "budget": 20
+        },
+        {
+          "day": "2026-10-14 Wed",
+          "sends": 20,
+          "budget": 20
+        },
+        {
+          "day": "2026-10-15 Thu",
+          "sends": 20,
+          "budget": 20
+        },
+        {
+          "day": "2026-10-16 Fri",
+          "sends": 20,
+          "budget": 20
+        }
+      ],
+      "perDayAccountOver": 0,
+      "perHourAccountOver": 0,
+      "maxPerHourAccount": 2,
+      "toLenders": 0,
+      "toSuppressed": 0,
+      "toHold": 0,
+      "toUnsubscribed": 0,
+      "toLoanIntel": 0,
+      "fromRoot": 0,
+      "fromNonGo": 0,
+      "weekendOrOutOfWindow": 0,
+      "duplicateStepSends": 0,
+      "emptyGreeting": 0,
+      "leftoverMerge": 0
+    },
+    "timing": {
+      "plannerPasses": 45,
+      "plannerMsMax": 172,
+      "plannerMsP50": 96,
+      "plannerMsFirst": 172,
+      "gateCalls": 100,
+      "gateMsMax": 3.33,
+      "gateMsP50": 1.75,
+      "gateMsP99": 3.33,
+      "maxQueuedRows": 2,
+      "maxRedisJobs": 2,
+      "totalPlanned": 100,
+      "firstPass": {
+        "at": "2026-10-12T07:05:00.000Z",
+        "ms": 171.60719599999993,
+        "planned": 4,
+        "overflow": 15073,
+        "skipped": 23,
+        "alreadySent": 0
+      }
+    },
+    "endQueued": 0,
+    "statusMix": [
+      {
+        "status": "active",
+        "n": "15050"
+      },
+      {
+        "status": "cancelled",
+        "n": "50"
+      }
+    ],
+    "failReasons": [],
+    "seed": {
+      "sequences": 18
+    }
+  },
+  "ramp_50_10": {
+    "limits": {
+      "daily": 50,
+      "hourly": 10
+    },
+    "scenarioMs": 18027,
+    "counts": [
+      {
+        "k": "contacts",
+        "n": "15100"
+      },
+      {
+        "k": "enrollments",
+        "n": "15100"
+      },
+      {
+        "k": "due_at_start",
+        "n": "13590"
+      }
+    ],
+    "invariants": {
+      "totalSends": 500,
+      "perDay": [
+        {
+          "day": "2026-10-12 Mon",
+          "sends": 100,
+          "budget": 100
+        },
+        {
+          "day": "2026-10-13 Tue",
+          "sends": 100,
+          "budget": 100
+        },
+        {
+          "day": "2026-10-14 Wed",
+          "sends": 100,
+          "budget": 100
+        },
+        {
+          "day": "2026-10-15 Thu",
+          "sends": 100,
+          "budget": 100
+        },
+        {
+          "day": "2026-10-16 Fri",
+          "sends": 100,
+          "budget": 100
+        }
+      ],
+      "perDayAccountOver": 0,
+      "perHourAccountOver": 0,
+      "maxPerHourAccount": 10,
+      "toLenders": 0,
+      "toSuppressed": 0,
+      "toHold": 0,
+      "toUnsubscribed": 0,
+      "toLoanIntel": 0,
+      "fromRoot": 0,
+      "fromNonGo": 0,
+      "weekendOrOutOfWindow": 0,
+      "duplicateStepSends": 0,
+      "emptyGreeting": 0,
+      "leftoverMerge": 0
+    },
+    "timing": {
+      "plannerPasses": 45,
+      "plannerMsMax": 179,
+      "plannerMsP50": 142,
+      "plannerMsFirst": 158,
+      "gateCalls": 570,
+      "gateMsMax": 3.69,
+      "gateMsP50": 1.65,
+      "gateMsP99": 3.11,
+      "maxQueuedRows": 2,
+      "maxRedisJobs": 2,
+      "totalPlanned": 500,
+      "firstPass": {
+        "at": "2026-10-12T07:05:00.000Z",
+        "ms": 157.84179100000074,
+        "planned": 20,
+        "overflow": 15058,
+        "skipped": 22,
+        "alreadySent": 0
+      }
+    },
+    "endQueued": 0,
+    "statusMix": [
+      {
+        "status": "active",
+        "n": "14964"
+      },
+      {
+        "status": "cancelled",
+        "n": "136"
+      }
+    ],
+    "failReasons": [],
+    "seed": {
+      "sequences": 18
+    }
+  }
+}

@@ -3,6 +3,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { query, TENANT, BRAND_NAME } from '../db/connection';
 import { templateEngine } from '../services/template-engine';
 import { Template, Contact } from '../types';
+import { uuidParam, isUuid } from '../middleware/security';
 import {
   buildEmailHtml, buildLinkedInPosterHtml, EmailContent,
   IMAGE_URLS, heroDataUri, TP_BASE as LI_BASE, THEMES,
@@ -11,6 +12,8 @@ import {
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY, timeout: 120_000 });
 
 const router = Router();
+
+router.param('id', uuidParam);
 
 // GET /api/templates — list all, joined with sequence step info
 router.get('/', async (_req: Request, res: Response) => {
@@ -41,8 +44,12 @@ router.get('/', async (_req: Request, res: Response) => {
 router.put('/reorder', async (req: Request, res: Response) => {
   try {
     const { ids, sequence_id } = req.body as { ids: string[]; sequence_id?: string };
-    if (!Array.isArray(ids) || ids.length === 0) {
-      res.status(400).json({ error: 'ids array required' });
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1000 || !ids.every(isUuid)) {
+      res.status(400).json({ error: 'ids array of template ids required' });
+      return;
+    }
+    if (sequence_id !== undefined && sequence_id !== null && !isUuid(sequence_id)) {
+      res.status(400).json({ error: 'Invalid sequence_id' });
       return;
     }
 
@@ -276,7 +283,11 @@ Rules:
 router.post('/:id/preview', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { contact_id } = req.body;
+    const { contact_id } = req.body || {};
+    if (contact_id !== undefined && contact_id !== null && contact_id !== '' && !isUuid(contact_id)) {
+      res.status(400).json({ error: 'Invalid contact_id' });
+      return;
+    }
 
     const templateResult = await query<Template>(`SELECT * FROM templates WHERE id = $1 AND tenant = $2`, [id, TENANT]);
     if (!templateResult.rows[0]) {

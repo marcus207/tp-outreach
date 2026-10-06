@@ -1,13 +1,14 @@
 import { Router, Request, Response } from 'express';
 import { query, TENANT } from '../db/connection';
 import { dmarcScanner } from '../services/dmarc-scanner';
+import { intParam } from '../middleware/security';
 
 const router = Router();
 
 // GET /api/analytics/overview
 router.get('/overview', async (req: Request, res: Response) => {
   try {
-    const rangeDays = Math.max(parseInt(String(req.query.days || '7'), 10), 1);
+    const rangeDays = intParam(req.query.days, 7, 1, 3650);
     const interval = `${rangeDays} days`;
 
     const [sendsResult, eventsResult, enrollmentsResult, broadcastResult] = await Promise.all([
@@ -225,7 +226,7 @@ router.get('/stale-contacts', async (req: Request, res: Response) => {
 // GET /api/analytics/daily — daily send volume for last N days
 router.get('/daily', async (req: Request, res: Response) => {
   try {
-    const days = Math.min(parseInt(String(req.query.days || '30'), 10), 90);
+    const days = intParam(req.query.days, 30, 1, 90);
 
     const result = await query(
       `SELECT
@@ -269,7 +270,7 @@ router.get('/daily', async (req: Request, res: Response) => {
 // GET /api/analytics/accounts — per-account send health
 router.get('/accounts', async (req: Request, res: Response) => {
   try {
-    const days = req.query.days ? parseInt(String(req.query.days), 10) : 7;
+    const days = intParam(req.query.days, 7, 1, 3650);
     const result = await query(`
       SELECT
         ea.id,
@@ -304,7 +305,7 @@ router.get('/accounts', async (req: Request, res: Response) => {
 // GET /api/analytics/campaigns — per-campaign stats
 router.get('/campaigns', async (req: Request, res: Response) => {
   try {
-    const days = req.query.days ? parseInt(String(req.query.days), 10) : 7;
+    const days = intParam(req.query.days, 7, 1, 3650);
     const result = await query(`
       SELECT
         s.id,
@@ -417,7 +418,7 @@ router.post('/deliverability/run', async (_req: Request, res: Response) => {
 // GET /api/analytics/failed-emails — recent failed sends with contact details
 router.get('/failed-emails', async (req: Request, res: Response) => {
   try {
-    const days = Math.min(parseInt(String(req.query.days || '7'), 10), 90);
+    const days = intParam(req.query.days, 7, 1, 90);
     const result = await query(`
       SELECT
         es.id, es.to_email, es.from_email, es.subject, es.error_message,
@@ -455,7 +456,7 @@ router.get('/failed-emails', async (req: Request, res: Response) => {
 // GET /api/analytics/dmarc — DMARC report summary
 router.get('/dmarc', async (req: Request, res: Response) => {
   try {
-    const days = parseInt(String(req.query.days || '30'), 10);
+    const days = intParam(req.query.days, 30, 1, 3650);
     const data = await dmarcScanner.getSummary(days);
     res.json(data);
   } catch (err) {

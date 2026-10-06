@@ -16,7 +16,11 @@ import { Router, Request, Response } from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { query, TENANT, BRAND_NAME, BRAND_DOMAIN, BRAND_EMAIL } from '../db/connection';
+import { uuidParam, intParam } from '../middleware/security';
 const router = Router();
+
+router.param('id', uuidParam);
+router.param('templateId', uuidParam);
 
 // ─── Hero image helpers ────────────────────────────────────────────────────────
 
@@ -57,7 +61,8 @@ router.get('/settings', async (_req: Request, res: Response) => {
     );
     res.json(result.rows[0] || { frequency_days: 30, start_date: '2026-05-01', is_active: false });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -81,7 +86,8 @@ router.put('/settings', async (req: Request, res: Response) => {
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -121,7 +127,8 @@ router.get('/sectors', async (_req: Request, res: Response) => {
 
     res.json(sectors);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -158,7 +165,8 @@ router.get('/schedule', async (req: Request, res: Response) => {
 
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -171,7 +179,8 @@ router.get('/schedule/:id', async (req: Request, res: Response) => {
     if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -197,7 +206,8 @@ router.put('/schedule/:id', async (req: Request, res: Response) => {
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -231,7 +241,8 @@ router.get('/preview/:id', async (req: Request, res: Response) => {
       preview_html: previewHtml,
     });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -325,7 +336,8 @@ router.get('/template-hero/:templateId', async (req: Request, res: Response) => 
     res.set('Cache-Control', 'no-cache, must-revalidate');
     res.send(buffer);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -336,7 +348,8 @@ router.get('/hero-images', async (_req: Request, res: Response) => {
     const images = listHeroImages();
     res.json(images);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -351,7 +364,8 @@ router.get('/engine/status', async (_req: Request, res: Response) => {
     const stats = await campaignEngine.getStats();
     res.json({ ...status, ...stats });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -361,7 +375,8 @@ router.post('/engine/run', async (_req: Request, res: Response) => {
     const result = await campaignEngine.tick();
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -374,7 +389,8 @@ router.post('/engine/pause', async (_req: Request, res: Response) => {
     );
     res.json({ is_active: false });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -387,18 +403,20 @@ router.post('/engine/resume', async (_req: Request, res: Response) => {
     );
     res.json({ is_active: true });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // GET /engine/log — recent send activity
 router.get('/engine/log', async (req: Request, res: Response) => {
   try {
-    const limit = parseInt(req.query.limit as string) || 50;
+    const limit = intParam(req.query.limit, 50, 1, 500);
     const log = await campaignEngine.getLog(limit);
     res.json(log);
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -412,7 +430,8 @@ router.post('/engine/approve-all', async (_req: Request, res: Response) => {
     );
     res.json({ approved: result.rowCount });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    console.error('[CampaignPlanner] Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
