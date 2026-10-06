@@ -576,7 +576,6 @@ def card_fields(c, radar, allow_check):
         ("Lender(s)", lenders),
         ("Property charged", property_line(pi, with_link=False), prop_link,
          "charge deed" if pi and pi.get("deed_link") else "charges"),
-        ("Debt (from accounts)", debt_line(di, with_link=False), debt_link or None, "filing history"),
         ("Accounts", (c.get("acc_type") or "none filed") + (" (overdue)" if c.get("acc_overdue") else "")
          + (f", made up to {fmt_date(_ddmmyyyy(di['made_up']))}" if di and di.get("made_up") else "")),
         ("Directors", dir_text, None, None, dir_html),

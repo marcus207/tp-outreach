@@ -522,6 +522,9 @@ def _dlong(iso):
         return iso or "?"
 
 
+USE_ACCOUNTS_DEBT = False
+
+
 def debt_from_accounts(ch, cn):
     """Estimate debt from the latest filed accounts. Never raises.
     Returns dict: status (ixbrl|pdf|none|error), debt (float|None), basis, made_up,
@@ -964,9 +967,12 @@ def main(argv=None):
     stages.append(("Deep-checked (officers + PSC)", len(deep), len(deep)))
 
     # ---- estimated debt from latest filed accounts (deep set only) ----
+    # Off by default (Marcus, Oct 2026: filed accounts aren't reliable enough to filter on).
     acc_stats = Counter()
     for c in deep:
-        c["debt"] = debt_from_accounts(ch, c["company_number"])
+        c["debt"] = (debt_from_accounts(ch, c["company_number"]) if USE_ACCOUNTS_DEBT
+                     else {"debt": None, "status": "off", "basis": None, "made_up": None, "link": None,
+                        "inv_prop": None, "total_assets": None})
         d = c["debt"]["debt"]
         acc_stats[c["debt"]["status"]] += 1
         c["debt_known10"] = d is not None and d >= DEBT_MIN
@@ -1131,8 +1137,9 @@ def main(argv=None):
               f"- Accounts: {c['acc_type'] or 'none filed'}"
               + (" (OVERDUE)" if c["acc_overdue"] else ""),
               f"- Property charged: {property_line(c.get('prop'))}",
-              f"- Debt (from accounts): {debt_line(c.get('debt'))}"
-              + (f" | accounts made up to {c['debt']['made_up']}" if (c.get('debt') or {}).get('made_up') else ""),
+              *([f"- Debt (from accounts): {debt_line(c.get('debt'))}"
+                 + (f" | accounts made up to {c['debt']['made_up']}" if (c.get('debt') or {}).get('made_up') else "")]
+                if USE_ACCOUNTS_DEBT else []),
               f"- Directors: {'; '.join(c.get('directors') or []) or '-'}",
               "- Existing contact: " + ("; ".join(
                   f"{x['name']} <{x['email']}> [{x['how']}]"
