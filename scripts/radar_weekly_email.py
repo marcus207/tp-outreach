@@ -64,7 +64,8 @@ DISTRESS_PROFILE_MAX = 14  # distressed candidates given an asset profile (web/L
 # Asset profiles cost web search + LLM calls: profile at most PROFILE_MAX candidates
 # (max PROFILE_PER_CLASS per class), cached for PROFILE_CACHE_DAYS.
 PROFILE_MAX, PROFILE_PER_CLASS, PROFILE_CACHE_DAYS = 25, 6, 6
-RADAR_ARGS = ["--deep", "70", "--top", "60", "--per-class", "10"]  # wide radar shortlist to profile from
+RADAR_ARGS = ["--deep", "120", "--top", "60", "--per-class", "10"]  # wide radar shortlist to profile from
+# (deep 120: institutional-owner exclusion over all, refinance check on the top 60 survivors)
 CREDIT_CAP_S = 240
 CACHE_DAYS = 7
 CH_LINK = "https://find-and-update.company-information.service.gov.uk/company/{}"
@@ -124,15 +125,22 @@ def profile_set(radar):
     cands = dedupe(radar["picked"])
     micro = [c for c in cands if (c.get("acc_type") or "") == "micro-entity"]
     rest = [c for c in cands if c not in micro]
-    rest.sort(key=lambda c: (band_rank(c.get("size")), -c["score"]))
+    rest.sort(key=lambda c: (band_rank(c.get("size")), _flagged(c), -c.get("months_old", 0), -c["score"]))
     return balanced(rest, PROFILE_MAX, PROFILE_PER_CLASS), micro
 
 
+def _flagged(c):
+    return (c.get("refi_check") or {}).get("status") == "flag"
+
+
 def select_top(scored):
-    """Email top N: Likely £10m+, then Likely £5m-10m, then Possible; never Unlikely."""
+    """Email top N (Marcus, 7 Oct 2026): size band first (Likely £10m+, Likely £5m-10m, Possible; never
+    Unlikely), then months elapsed (closer to 5 years first); 'possible group refinance' flags ranked
+    down within their band; max 3 per class."""
     from radar_size import band_rank
     ok = [c for c in scored if c["size"]["band"] != "unlikely"]
-    ok.sort(key=lambda c: (band_rank(c["size"]), -(c["size"]["score10"] + c["score"])))
+    ok.sort(key=lambda c: (band_rank(c["size"]), _flagged(c), -c.get("months_old", 0),
+                           -(c["size"]["score10"] + c["score"])))
     return balanced(ok, TOP_N, PER_CLASS)
 
 
@@ -674,10 +682,11 @@ def card_fields(c, radar):
         *asset_fields(c),
         ("Parent / PSC", parent),
         ("Asset class", cls_txt),
-        ("Charges", f"{c['n']} in window, {c['n_total']} outstanding in total; {shown}"),
+        ("Charges", f"{c['n']} in the 48-60 month window, {c['n_total']} outstanding in total; {shown}"),
         ("Lender(s)", lenders),
         ("Property charged", property_line(pi, with_link=False), prop_link,
          "charge deed" if pi and pi.get("deed_link") else "charges"),
+        ("Refinance check", c.get("refi_line") or "not checked"),
         ("Accounts", (c.get("acc_type") or "none filed") + (" (overdue)" if c.get("acc_overdue") else "")
          + (f", made up to {fmt_date(_ddmmyyyy(di['made_up']))}" if di and di.get("made_up") else "")),
         ("Directors", dir_text, None, None, dir_html),
@@ -759,11 +768,16 @@ def sub_block(sub, credit=None, radar=None, sres=None):
     sres = sres or {}
     mn, mx = sres.get("window", (60, 96))
     live = next((v for k, v in (sres.get("steps") or []) if k.startswith("Live pool")), 0)
-    refi = next((v for k, v in (sres.get("steps") or []) if k.startswith("Excluded: new charge")), 0)
+    refi = next((v for k, v in (sres.get("steps") or []) if k.startswith("Excluded (own company)")), 0)
+    rs = sres.get("refi") or {}
     summ = (f"Charges more than {mn} months old (up to {mx}) with no refinance found: {live} companies in the "
             f"target classes are past their 5-year point with the charge still outstanding and no new charge "
-            f"from a different lender ({refi} excluded as likely refinanced; companies already in formal "
-            f"insolvency excluded). Showing {len(sub)}, ranked by months past 5 years, likely loan size, "
+            f"from a different lender on the company ({refi} excluded as likely refinanced; companies already "
+            f"in formal insolvency excluded). Of the top {rs.get('checked', 0)} checked across their group and "
+            f"the charged title, {len(rs.get('group') or [])} were excluded for a group refinance and "
+            f"{len(rs.get('title') or [])} because the same title or property was charged to another lender; "
+            f"{len(rs.get('owner') or [])} owned by a PLC, REIT or sovereign investor were left out. "
+            f"Showing {len(sub)}, ranked by months past 5 years, likely loan size, "
             "same-lender extension signal and soft signals. These are live companies: approach is to the "
             "directors, same rules as the main list.")
     if sres.get("error"):
@@ -858,17 +872,33 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None, sub=Non
     subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}" + (
         f" (+{len(sub)} sub-performing)" if sub else "") + (
         f" (+{len(distress)} distressed)" if distress and rd.SHOW_FORMAL_INSOLVENCY else "")
-    intro = (f"{len(top)} sponsors whose facilities are likely in their refinancing window. "
+    intro = (f"{len(top)} sponsors whose loans are 4 to 5 years into a typical 5-year facility with no "
+             "refinance found, the natural window to plan one (ERCs usually 0% in the final year). "
              "Reply with the numbers you'd like approached and I'll draft a personal note for each.")
-    method = ("Method: public Companies House charges reaching their 5-year anniversary in the "
-              "next 3 months, still outstanding (BTL/residential lenders and housebuilder "
-              "counterparties excluded); target asset classes only (schools: SEN-specific only); "
-              "maturity is inferred from charge age, not known. Loan size is inferred from signals, "
+    rf = radar.get("refi") or {}
+    method = ("Method: public Companies House charges created 48 to 60 months ago and still outstanding, "
+              "i.e. loans 4 years into the facility with no refinance yet. Facilities typically run 5 years "
+              "and early repayment charges usually fall to 0% in the final year, so year 5 is the natural "
+              "window to plan the refinance. BTL/residential lenders and housebuilder "
+              "counterparties excluded; target asset classes only (schools: SEN-specific only); "
+              "maturity is inferred from charge age, not known. Companies owned by or part of a PLC, REIT "
+              "or sovereign wealth / state-backed investor (checked up the ownership chain) are left out"
+              + (f" ({len(rf.get('owner') or [])} this week in the main window)" if rf else "") + ". "
+              "Refinance check, both sections: a candidate is left out when a newer charge from a different "
+              "lender appears on the company itself, on a parent or sibling company (same corporate owner or "
+              "board) where that charge is a security-agent or portfolio charge or names the same property, "
+              "or on the same title number or address under any company (asset refinanced or sold). Other "
+              "newer group charges are flagged as a possible group refinance and ranked down"
+              + (f"; main window this week: {rf.get('checked', 0)} checked, {len(rf.get('own') or [])} out on "
+                 f"own charges, {len(rf.get('group') or [])} on group charges, {len(rf.get('title') or [])} "
+                 f"on the title search, {len(rf.get('flag') or [])} flagged" if rf else "") + ". "
+              "Only Companies House charges are visible; the HM Land Registry title register (£3 per title) "
+              "is the definitive check of charges currently on the property. Loan size is inferred from signals, "
               "not stated by Companies House (which never shows loan amounts): lender named as "
               "security agent/trustee or several lenders on one charge, lender type (clearing banks "
               "score nothing as they lend at every size), asset capacity, rateable value, portfolio, "
               "accounts filing type (never the figures) and institutional parent. Ranked Likely £10m+, "
-              "then Likely £5m+, then Possible"
+              "then Likely £5m+, then Possible, then by time elapsed (closest to 5 years first)"
               + (f"; {sc.get('unlikely', 0)} of {sc.get('profiled', 0)} profiled candidates "
                  f"(+{sc.get('micro_skipped', 0)} micro-entities not profiled) judged Unlikely and left out"
                  if sc else "")
@@ -1122,6 +1152,8 @@ def main():
     import radar_distress as rd
     from radar_size import score_size
     radar = maturity_radar.main(RADAR_ARGS)
+    for s_, n_, k_ in radar["stages"]:
+        log(f"main funnel: {n_:>8,} rows {k_:>7,} cos  {s_}")
     cands, micro = profile_set(radar)
     log(f"profile set {len(cands)} (cap {PROFILE_MAX}, max {PROFILE_PER_CLASS}/class); "
         f"micro-entity skipped before profiling {len(micro)}")
@@ -1163,6 +1195,12 @@ def main():
 
     top = select_top(cands)
     log(f"selected {len(top)}")
+    for c in top:
+        log(f"  M {c['name'][:44]:<44} {c['cls']:<20} {c['size']['label']:<15} {c.get('months_old')} months "
+            f"| {(c.get('anchor_lender') or '')[:30]} | {(c.get('refi_line') or '')[:150]}")
+    from radar_size import band_rank as _br
+    log("main size bands after refinance check (profiled): " + ", ".join(
+        f"{b_} {sum(1 for c in cands if c['size']['band'] == b_)}" for b_ in ("likely_10m", "likely_5m", "possible", "unlikely")))
     log("property charged in top %d: address %d, not stated %d" % (
         len(top), sum(1 for c in top if not c["prop"]["generic"]),
         sum(1 for c in top if c["prop"]["generic"])))
@@ -1197,7 +1235,7 @@ def main():
         for c in sub:
             log(f"  S {c['name'][:44]:<44} {c['cls']:<20} {c['size']['label']:<15} +{c['months_past']}m past 5y "
                 f"| {c['anchor_lender'][:30]} | ext {'y' if c.get('extensions') else 'n'}{' (rolling)' if c.get('rolling') else ''} "
-                f"| soft {len(c.get('soft') or [])}")
+                f"| soft {len(c.get('soft') or [])} | {(c.get('refi_line') or '')[:150]}")
     except Exception as ex:  # never lose the main radar on a sub-performing problem
         import traceback
         traceback.print_exc()

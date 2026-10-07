@@ -17,8 +17,9 @@ DATA GUARD (hard rule, do not relax):
   * Lenders are never targets: finance/lending borrowers are screened out.
 
 Pipeline
-  1. Outstanding charges created MIN_MONTHS-MAX_MONTHS (default 57-60) months before the run
-     date, i.e. reaching the 5-year anniversary within the next 3 months
+  1. Outstanding charges created MIN_MONTHS-MAX_MONTHS (default 48-60) months before the run
+     date, i.e. loans 4 years into a typical 5-year facility (Marcus, 7 Oct 2026: ERCs usually fall
+     to 0% in the final year, so year 5 is the natural window to plan the refinance)
      -> institution/trustee lenders -> minus BTL/residential lenders
      -> minus housebuilder/land-seller counterparties
      -> minus finance-named / lender borrowers.
@@ -28,7 +29,13 @@ Pipeline
   3. Pre-score in SQL data; top N get CH company profile (SIC confirm/upgrade, status,
      accounts type, insolvency). Distressed companies listed separately, not targeted.
   4. Top ~50 get CH officers + PSC + charge particulars and a PROVISIONAL size band
-     (radar_size.score_size, no asset capacity yet); pick top 20 balanced across classes.
+     (radar_size.score_size, no asset capacity yet).
+  4b. Institutional-owner exclusion (PLC / REIT / sovereign owners, scripts/radar_excluded_owners.txt)
+     and the refinance check (radar_refi_check.py) on the top REFI_CHECK_MAX by score: own CH charges
+     register (qualifying charge still outstanding, no newer charge from another lender), group
+     companies (parents + siblings) and a title/address search across all companies. Excluded
+     candidates drop out; "possible group refinance" flags are kept and ranked down.
+     Pick top 20 balanced across classes.
      radar_weekly_email.py re-scores after asset profiles and drops "Unlikely".
   5. Match against tp outreach contacts; flag suppressed/unsubscribed/hold = DO NOT CONTACT.
   6. Write reports/radar/radar-YYYY-MM-DD.{md,csv} + lender-review-YYYY-MM-DD.csv.
@@ -43,6 +50,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import Counter, defaultdict
 
@@ -61,9 +69,10 @@ CH_BASE = "https://api.company-information.service.gov.uk"
 CH_KEYS_SOURCE = "/root/scanner.py"  # existing CH scanner holds the API key list
 CACHE_TTL_DAYS = 6  # weekly reruns refresh; same-week reruns hit cache
 CH_LINK = "https://find-and-update.company-information.service.gov.uk/company/{}"
-# Charge age window (months since creation). Default 57-60: charges reaching their
-# 5-year anniversary within the next 3 months, i.e. a typical 5-year facility nearing term.
-MIN_MONTHS = 57
+# Charge age window (months since creation). Default 48-60 (Marcus, 7 Oct 2026): loans 4 years into
+# a typical 5-year facility with no refinance yet. ERCs usually fall to 0% in the final year, so year 5
+# is the natural window to plan the refinance. Older charges belong to the sub-performing section.
+MIN_MONTHS = 48
 MAX_MONTHS = 60
 
 # --------------------------------------------------------------------------- guards
@@ -246,8 +255,12 @@ class CH:
     def get(self, path):
         fn = os.path.join(CACHE_DIR, re.sub(r"[^A-Za-z0-9]+", "_", path.strip("/")) + ".json")
         if os.path.exists(fn) and time.time() - os.path.getmtime(fn) < CACHE_TTL_DAYS * 86400:
-            self.cached += 1
-            return json.load(open(fn)).get("data")
+            try:
+                data = json.load(open(fn)).get("data")
+                self.cached += 1
+                return data
+            except ValueError:  # partial file (concurrent writer / crash): refetch
+                pass
         for attempt in range(6):
             k = self._key()
             try:
@@ -266,7 +279,10 @@ class CH:
                 continue
             data = r.json() if r.status_code == 200 else None
             self.fetched += 1
-            json.dump({"status": r.status_code, "data": data}, open(fn, "w"))
+            tmp = f"{fn}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump({"status": r.status_code, "data": data}, fh)
+            os.replace(tmp, fn)  # atomic: readers never see a partial file
             return data
         return None
 
@@ -804,6 +820,8 @@ def main(argv=None):
                     help="youngest charge age in months (default %(default)s)")
     ap.add_argument("--max-months", type=int, default=MAX_MONTHS,
                     help="oldest charge age in months (default %(default)s)")
+    ap.add_argument("--refi-cap", type=int, default=None,
+                    help="candidates refinance-checked (default radar_refi_check.REFI_CHECK_MAX)")
     a = ap.parse_args(argv)
     t0 = time.time()
     run = dt.date.fromisoformat(a.date) if a.date else dt.date.today()
@@ -831,7 +849,7 @@ def main(argv=None):
     for r in rows:
         r["lname"] = norm_lender(r["trading_name"] or r["lender"])
         r["company_name"] = r["company_name"] or ""
-    stage(f"Outstanding charges created {a.min_months}-{a.max_months}m ago", rows)
+    stage(f"Outstanding charges created {a.min_months}-{a.max_months} months ago", rows)
     rows = stage("Lender type institution/trustee",
                  [r for r in rows if r["lender_type"] in ("institution", "trustee")])
     rows = stage("Minus BTL / residential lenders",
@@ -1020,6 +1038,37 @@ def main(argv=None):
         c["prop"] = charge_property(ch, c)
     stages.append(("Deep-checked (officers + PSC + charge particulars)", len(deep), len(deep)))
 
+    # ---- institutional owners out; refinance check (own + group + title) on the top by score ----
+    import radar_refi_check as rfc
+    import radar_distress as rd
+    deep.sort(key=lambda c: -c["score"])
+
+    def _own(c):
+        return rfc.own_check_main(c, rd.fetch_charges(ch, c["company_number"]), w_start, w_end)
+
+    def _since(c):
+        return (dt.date.fromisoformat(c["anchor"]) + dt.timedelta(days=1)).isoformat()
+
+    deep, refi_st = rfc.screen(ch, conn, deep, run, "main", own=_own, since_fn=_since,
+                               cap=a.refi_cap or rfc.REFI_CHECK_MAX, label="main")
+    stages.append(("Excluded: institutional owner (PLC / REIT / sovereign, incl. parent chain)",
+                   len(refi_st["owner"]), len(refi_st["owner"])))
+    stages.append((f"Refinance-checked (top {refi_st['checked']} by score)", refi_st["checked"],
+                   refi_st["checked"]))
+    stages.append(("Excluded: own company (newer other-lender charge / qualifying charge satisfied)",
+                   len(refi_st["own"]), len(refi_st["own"])))
+    stages.append(("Excluded: group company refinance (parent / sibling)", len(refi_st["group"]),
+                   len(refi_st["group"])))
+    stages.append(("Excluded: same title / property charged to another lender", len(refi_st["title"]),
+                   len(refi_st["title"])))
+    stages.append(("Kept: clear", len(refi_st["clear"]), len(refi_st["clear"])))
+    stages.append(("Kept: flagged (possible group refinance / restructure, ranked down)",
+                   len(refi_st["flag"]), len(refi_st["flag"])))
+    for c in deep:
+        c["months_old"] = months_between(dt.date.fromisoformat(c["anchor"]), run)
+        if (c.get("refi_check") or {}).get("status") == "flag":
+            c["score"] -= 15
+
     # ---- estimated debt from latest filed accounts (deep set only) ----
     # Off by default (Marcus, Oct 2026: filed accounts aren't reliable enough to filter on).
     acc_stats = Counter()
@@ -1091,19 +1140,23 @@ def main(argv=None):
         return f"{y} year{'s' if y != 1 else ''}" + (f" {r} month{'s' if r != 1 else ''}" if r else "")
 
     def why(c):
-        first = c["dates"][0]  # earliest charge = first to reach 5 years
-        m1 = mo(first)
-        to5 = add_months(dt.date.fromisoformat(first), 60)
-        left = 60 - m1
-        when = (f"reaches 5 years in ~{left} month{'s' if left != 1 else ''} ({to5:%b %Y})"
-                if left >= 1 else f"reaches 5 years this month ({to5:%b %Y})")
-        lender = c["lenders"][0] + (" +" if len(c["lenders"]) > 1 else "")
-        n = c["n"]
-        bits = [f"{lender} charge registered {ym(m1)} ago, {when}, still outstanding"
-                + (f" ({n} charges in window)" if n > 1 else "")]
-        if c["later"]:
-            bits.append("NB newer institutional charge exists (may already be refinanced)")
-        return "; ".join(bits)
+        """Marcus's format: 'Charge with NatWest registered Nov 2021, 4 years 11 months into a typical
+        5-year term; ERCs usually 0% in the final year; no newer loan from another lender found.'"""
+        anchor = c.get("anchor") or c["dates"][0]  # earliest qualifying charge = closest to 5 years
+        m1 = mo(anchor)
+        lender = c.get("anchor_lender") or c["lenders"][0]
+        if len(c["lenders"]) > 1:
+            lender += " (+ other lenders)"
+        s = (f"Charge with {lender} registered {dt.date.fromisoformat(anchor):%b %Y}, {ym(m1)} into a "
+             "typical 5-year term; ERCs usually 0% in the final year")
+        rc = c.get("refi_check") or {}
+        if rc.get("status") == "flag":
+            s += f"; no newer loan from another lender on this company or title, but {rc['flags'][0]}"
+        elif rc:
+            s += "; no newer loan from another lender found"
+        if c["n"] > 1:
+            s += f" ({c['n']} charges in the window)"
+        return s
 
     md_path = os.path.join(OUT_DIR, f"radar-{run}.md")
     csv_path = os.path.join(OUT_DIR, f"radar-{run}.csv")
@@ -1128,7 +1181,7 @@ def main(argv=None):
               f"- Asset class: **{c['cls']}** (evidence: {', '.join(c['evidence'][:4]) or '-'}"
               f"{'; ' + c['sic_note'] if c.get('sic_note') else ''}; SIC {', '.join(c['sic'])})",
               f"- Window charges: {c['n']} (outstanding total {c['n_total']}); dates "
-              + ", ".join(f"{d} ({mo(d)}m)" for d in c["dates"][:6])
+              + ", ".join(f"{d} ({mo(d)} months old)" for d in c["dates"][:6])
               + (" ..." if c["n"] > 6 else ""),
               *([f"- Sibling SPVs under same parent (also in window): {'; '.join(c['siblings'])}"]
                 if c.get("siblings") else []),
@@ -1147,6 +1200,7 @@ def main(argv=None):
                   f"{x['name']} <{x['email']}> [{x['how']}]"
                   + (f" FLAGS: {', '.join(x['flags'])}" if x["flags"] else "")
                   for x in c["contacts"]) or "none"),
+              f"- Refinance check: {c.get('refi_line') or 'not checked'}",
               f"- Score: {c['score']}",
               f"- Why now: {why(c)}", ""]
     L += [f"## Excluded: debt under £10m from accounts ({len(under)})", ""]
@@ -1208,7 +1262,8 @@ def main(argv=None):
     conn.close()
     return {"run": run, "window": (w_start, w_end), "picked": picked, "distress": distress,
             "stages": stages, "why": why, "months_old": mo, "md_path": md_path,
-            "csv_path": csv_path, "debt_excluded": under, "acc_stats": dict(acc_stats)}
+            "csv_path": csv_path, "debt_excluded": under, "acc_stats": dict(acc_stats),
+            "refi": refi_st, "args": vars(a)}
 
 
 if __name__ == "__main__":

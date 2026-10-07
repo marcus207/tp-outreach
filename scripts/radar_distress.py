@@ -99,7 +99,8 @@ SUB_SHOW, SUB_PER_CLASS = 10, 3
 SUB_RANK = {"month": 1.0, "month_cap": 36,
             "band": {"likely_10m": 24, "likely_5m": 14, "possible": 4, "unlikely": 0},
             "extension": 8, "soft": 4, "soft_cap": 12,
-            "rolling_month_cap": 12}     # rolling portfolio facility: months credit capped, no extension points
+            "rolling_month_cap": 12,     # rolling portfolio facility: months credit capped, no extension points
+            "group_flag": -10}           # refinance check flagged a possible group refinance / restructure
 # Rolling portfolio facility: the incumbent registered charges in at least this many distinct calendar
 # years (portfolio landlords adding properties under one facility). The 5-year clock from the first
 # qualifying charge means little there, and later same-lender charges are routine, not an extension.
@@ -1163,6 +1164,9 @@ def evaluate_refinance(c, items, run, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS
             yrs = sorted({(i.get("created_on") or "")[:4] for i in inc_items if i.get("created_on")})
             c["inc_count"], c["inc_years"] = len(inc_items), yrs
             c["rolling"] = len(yrs) >= ROLLING_MIN_YEARS and len(inc_items) >= ROLLING_MIN_CHARGES
+            c["incumbents"] = sorted(inc_names)
+            c["qual_descs"] = [(i.get("particulars") or {}).get("description") for i in qual] + \
+                [r.get("property_description") for r in c["charges"]]
             c["new_lender"] = sorted(new_lender, key=lambda r: r["date"])
             c["extensions"] = sorted(ext, key=lambda r: r["date"])
             c["refi"] = "refinanced" if new_lender else "keep"
@@ -1256,6 +1260,7 @@ def sub_rank_score(c):
     s += R["band"].get((c.get("size") or {}).get("band", "unlikely"), 0)
     s += R["extension"] if c.get("extensions") and not c.get("rolling") else 0
     s += min(len(c.get("soft") or []) * R["soft"], R["soft_cap"])
+    s += R["group_flag"] if (c.get("refi_check") or {}).get("status") == "flag" else 0
     return s
 
 
@@ -1315,8 +1320,8 @@ def build_subperforming(run=None, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS, ex
     for c in target:
         evaluate_refinance(c, fetch_charges(ch, c["company_number"]), run, min_m, max_m)
         {"refinanced": refi, "satisfied": satisfied, "unverified": unverified}.get(c["refi"], kept).append(c)
-    steps.append(("Excluded: new charge from a different lender on/after 6 months before the 5-year "
-                  "anniversary (likely refinanced)", len(refi)))
+    steps.append(("Excluded (own company): new charge from a different lender on/after 6 months before the "
+                  "5-year anniversary (likely refinanced)", len(refi)))
     steps.append(("Excluded: qualifying charge now satisfied on the CH register", len(satisfied)))
     if unverified:
         steps.append(("  qualifying charge not matched on the CH register (kept, DB dates used)", len(unverified)))
@@ -1366,9 +1371,27 @@ def build_subperforming(run=None, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS, ex
                   f">= {ROLLING_MIN_YEARS} distinct years; ranked lower)", sum(1 for c in live if c.get("rolling"))))
     steps.append(("  of which with soft signals", sum(1 for c in live if c.get("soft"))))
     live.sort(key=lambda c: -c["sub_score"])
+
+    # 5. institutional owners out; refinance check across the group and the title (own done in step 2)
+    import radar_refi_check as rfc
+
+    def _cut(c):
+        return mr.add_months(mr.add_months(c["anchor"], 60), -SUB_PRE_ANNIV_MONTHS).isoformat()
+
+    live, rst = rfc.screen(ch, conn, live, run, "sub", own=None, since_fn=_cut, label="sub-performing")
+    steps.append(("Excluded: institutional owner (PLC / REIT / sovereign, incl. parent chain)", len(rst["owner"])))
+    steps.append((f"Refinance-checked across group + title (top {rst['checked']} by rank; "
+                  f"{rst['unchecked']} lower-ranked not checked, dropped)", rst["checked"]))
+    steps.append(("Excluded: group company refinance (parent / sibling)", len(rst["group"])))
+    steps.append(("Excluded: same title / property charged to another lender", len(rst["title"])))
+    steps.append(("Kept: clear", len(rst["clear"])))
+    steps.append(("Kept: flagged possible group refinance / restructure (ranked down)", len(rst["flag"])))
+    for c in live:
+        c["sub_score"] = sub_rank_score(c)
+    live.sort(key=lambda c: -c["sub_score"])
     conn.close()
     return {"run": run, "candidates": live, "steps": steps, "window": (min_m, max_m), "db_min": db_min,
-            "refinanced": refi, "formal": dict(formal), "ch": ch, "secs": round(time.time() - t0),
+            "refinanced": refi, "formal": dict(formal), "ch": ch, "secs": round(time.time() - t0), "refi": rst,
             "size_counts": dict(Counter(c["size"]["band"] for c in live)),
             "class_counts": dict(Counter(c["cls"] for c in live))}
 
@@ -1379,7 +1402,10 @@ def sub_why(c):
     past = (f"{mp} month{'s' if mp != 1 else ''} past a typical 5-year term" if mp
             else "just past a typical 5-year term")
     s = (f"Facility with {c.get('anchor_lender') or 'the lender'} registered {mon(c['anchor'])}, {past}, "
-         "no refinance charge from another lender registered")
+         "no refinance charge from another lender registered on the company, its group or the title")
+    rc = c.get("refi_check") or {}
+    if rc.get("status") == "flag":
+        s = s.replace(" on the company, its group or the title", f"; but {rc['flags'][0]}")
     ext = c.get("extensions") or []
     if c.get("rolling"):
         s += (f"; rolling portfolio facility ({c.get('inc_count')} charges to the same lender "

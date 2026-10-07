@@ -1,0 +1,59 @@
+# Refinancing Radar: INSTITUTIONAL OWNER EXCLUSIONS (Marcus, 7 Oct 2026). EDITABLE.
+#
+# A candidate is hard-excluded from BOTH radar sections when the company itself, or any owner in its
+# parent chain (current corporate / legal-person PSCs up to 4 levels via the Companies House PSC API,
+# plus PSCs ceased in the last 12 months), matches one of the patterns below. Also excluded: the
+# company's own Companies House type is 'plc', or a PSC's stated legal form is a public limited company.
+#
+# Format: [section] headers; one case-insensitive Python regex per line; '#' starts a comment.
+# Matching is against the owner's name as filed at Companies House. Used by scripts/radar_refi_check.py.
+
+[plc]
+\bp\.?\s?l\.?\s?c\b\.?
+public limited company
+
+[reit]
+\breit\b
+real estate investment trust
+
+[sovereign]
+# Abu Dhabi
+\badq\b
+abu dhabi developmental holding
+\badia\b
+abu dhabi investment (authority|council)
+mubadala
+\bmodon\b
+\badnec\b
+abu dhabi national exhibitions?
+emirate of abu dhabi
+government of abu dhabi
+abu dhabi (government|holding company)
+# Dubai
+investment corporation of dubai
+dubai holding
+dubai world
+government of dubai
+# Saudi Arabia
+\bpif\b
+public investment fund
+# Qatar
+\bqia\b
+qatar investment authority
+qatari diar
+qatar holding
+# Singapore
+\bgic\b
+government of singapore investment
+temasek
+# Kuwait (St Martins Property is the Kuwait Investment Office's UK property arm)
+\bkia\b(?!\s+(motors|uk|cars|retail))
+kuwait investment (authority|office)
+st\.? martins property
+# Norway
+norges bank
+\bnbim\b
+# China
+china investment corporation
+# Brunei
+brunei investment agency
