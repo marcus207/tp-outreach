@@ -8,11 +8,16 @@ Weekly refinancing radar email for Marcus (Monday morning).
      (scripts/radar_size.py, rules in radar_size_rules.json). The email TOP 10 ranks
      Likely £10m+, then Likely £5m-10m, then Possible (max 3 per asset class); Unlikely
      candidates are excluded and counted.
-     DISTRESSED section (scripts/radar_distress.py): wider 24-72 month universe, formal / receiver /
-     soft distress signals from Companies House, The Gazette and cached credit data; up to 10, ranked
-     by tier then size band; approach via the appointed IP/receiver, never the directors. A company
-     appears in one section only (formal/receiver tiers leave the main list; early-warning main
-     candidates stay in the main list).
+     SUB-PERFORMING section (scripts/radar_distress.build_subperforming, since 7 Oct 2026). Marcus:
+     "Sub-performing / distressed isn't when it is already in administration. It is when the loan is
+     longer than 5 years and they haven't found a refinance solution." Same base filters and size
+     score, qualifying charge MORE than 60 months old (60-96), still outstanding, no new charge from a
+     different lender since 6 months before the 5-year anniversary (CH charges register per
+     candidate); same-lender further charges flagged as a possible extension; companies in formal
+     insolvency excluded (log only). Up to 10 (max 3 per class), ranked by months past 5 years, size
+     band, extension signal and soft signals. Approach is to the directors, same rules as the main
+     list. A company appears in one section only.
+     The old formal-insolvency DISTRESSED section is kept but hidden (radar_distress.SHOW_FORMAL_INSOLVENCY).
   2. Enriches the 10 with credit data via the existing integration in /root/tp_api_v2
      (creditsafe_browser.fetch_creditsafe_report). Uses a cached creditsafe_reports row
      if < 7 days old; otherwise fetches (rate limited ~10s/company inside the module) in
@@ -54,6 +59,7 @@ SENDER = "marcus.emadi@go.tp.finance"
 SENDER_NAME = "Refinancing Radar"
 DEFAULT_TO = "marcus@tp.finance"
 TOP_N, PER_CLASS, DISTRESS_MAX = 10, 3, 10
+SUB_TITLE = "Sub-performing: past 5 years, no refinance yet"
 DISTRESS_PROFILE_MAX = 14  # distressed candidates given an asset profile (web/LLM cost)
 # Asset profiles cost web search + LLM calls: profile at most PROFILE_MAX candidates
 # (max PROFILE_PER_CLASS per class), cached for PROFILE_CACHE_DAYS.
@@ -150,6 +156,26 @@ def distress_list(dres, top):
         c["size"] = score_size(c)
     picked.sort(key=lambda c: (radar_distress.TIER_KEYS.index(c["tier"]), band_rank(c["size"]), -c["dscore"]))
     return picked[:DISTRESS_MAX], prof
+
+
+def sub_list(sres, top):
+    """Up to SUB_SHOW sub-performing candidates not in the main top list: profile pool (provisional
+    rank, DO NOT CONTACT and micro-entities skipped, siblings collapsed), asset profiles, size
+    re-scored, Unlikely excluded, max 3 per class."""
+    import radar_distress as rd
+    from radar_size import score_size
+    shown = {c["company_number"] for c in top}
+    orig = sres
+    sres = {**sres, "candidates": [c for c in sres["candidates"] if c["company_number"] not in shown]}
+    pool = rd.sub_select_pool(sres)
+    prof = asset_profiles(pool)
+    for c in pool:
+        c["size"] = score_size(c)
+    final = rd.sub_final(pool)
+    orig["profiled"] = len(pool)
+    orig["profiled_unlikely"] = sum(1 for c in pool if c["size"]["band"] == "unlikely")
+    orig["dnc"] = sum(1 for c in sres["candidates"] if c.get("dnc"))
+    return final, prof
 
 
 # --------------------------------------------------------------------------- credit data
@@ -303,7 +329,7 @@ def enrich(companies, enabled=True):
 # Public web search only via the Brave Search API: LinkedIn itself is never scraped or logged
 # into. Matches are "likely", never "confirmed". Results cached; queries throttled and capped.
 LI_CACHE_DIR = os.path.join(OUT_DIR, "linkedin_cache")
-LI_MAX_QUERIES = 40
+LI_MAX_QUERIES = 80  # main 10 + sub-performing 10, up to 3 directors + company each
 LI_DIRECTORS = 3
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 PROPERTY_TERM = re.compile(r"propert|real estate|estates?\b|investment|asset manage|develop|"
@@ -448,7 +474,7 @@ def linkedin(companies):
 # never written to tp contacts or any sequence.
 APOLLO_URL = "https://api.apollo.io/api/v1/people/match"
 APOLLO_CACHE_DIR = os.path.join(OUT_DIR, "apollo_cache")
-APOLLO_MAX_CALLS = 30
+APOLLO_MAX_CALLS = 60
 APOLLO_CACHE_DAYS = 90
 FREE_MAIL = re.compile(r"gmail|hotmail|outlook|yahoo|icloud|aol|btinternet|live\.|me\.com|"
                        r"googlemail|msn|sky\.com|virginmedia|talktalk|protonmail")
@@ -694,6 +720,87 @@ def distress_fields(c, radar):
     return out
 
 
+def sub_fields(c, radar):
+    """Card rows for a sub-performing company: the main card layout, with the facility line,
+    same-lender extension and soft signals in place of the main 'Charges' row."""
+    import radar_distress as rd
+    mo = radar["months_old"]
+    rows = card_fields(c, radar)
+    dates = c.get("out_dates") or c["dates"]
+    shown = ", ".join(f"{d} ({mo(d)} months old)" for d in dates[:5]) + (" ..." if len(dates) > 5 else "")
+    sig_t, sig_h = [], []
+    for s_ in c.get("soft") or []:
+        when = f" ({rd.fmt(s_['date'])})" if s_.get("date") and rd.fmt(s_["date"]) not in s_["text"] else ""
+        sig_t.append(s_["text"] + when + (f" [{s_['url']}]" if s_.get("url") else ""))
+        sig_h.append("&bull; " + e(s_["text"] + when)
+                     + (f' <a href="{html.escape(s_["url"])}" style="color:#1f3a5f">[source]</a>'
+                        if s_.get("url") else " [credit data]" if s_["kind"] == "credit" else ""))
+    out = []
+    for r in rows:
+        if r[0] == "Charges":
+            out.append(("Facility", rd.sub_facility_line(c), f"{CH_LINK.format(c['company_number'])}/charges",
+                        "charges register"))
+            out.append(("Charges", f"{c.get('n_total', c['n'])} outstanding in total; {shown}"))
+            continue
+        out.append(r)
+        if r[0] == "Lender(s)":
+            out.append(("Same-lender extension", rd.sub_extension_line(c)))
+            out.append(("Soft signals", "; ".join(sig_t) or "None found", None, None,
+                        "<br>".join(sig_h) or "None found"))
+    if c.get("related"):
+        out.append(("Related SPVs (same group)", "; ".join(c["related"][:4])
+                    + (f" (+{len(c['related']) - 4} more)" if len(c["related"]) > 4 else "")))
+    return out
+
+
+def sub_block(sub, credit=None, radar=None, sres=None):
+    """(html lines, text lines) for the SUB-PERFORMING section."""
+    credit = credit or {}
+    sres = sres or {}
+    mn, mx = sres.get("window", (60, 96))
+    live = next((v for k, v in (sres.get("steps") or []) if k.startswith("Live pool")), 0)
+    refi = next((v for k, v in (sres.get("steps") or []) if k.startswith("Excluded: new charge")), 0)
+    summ = (f"Charges more than {mn} months old (up to {mx}) with no refinance found: {live} companies in the "
+            f"target classes are past their 5-year point with the charge still outstanding and no new charge "
+            f"from a different lender ({refi} excluded as likely refinanced; companies already in formal "
+            f"insolvency excluded). Showing {len(sub)}, ranked by months past 5 years, likely loan size, "
+            "same-lender extension signal and soft signals. These are live companies: approach is to the "
+            "directors, same rules as the main list.")
+    if sres.get("error"):
+        summ += f" Source problem this week: {sres['error']}."
+    td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
+    tv = 'style="padding:3px 0;vertical-align:top;font-size:13px"'
+    H = [f'<h2 style="font-size:18px;font-weight:normal;margin:26px 0 6px;font-family:Georgia,serif">{e(SUB_TITLE)}</h2>',
+         f'<p style="font-family:Arial,sans-serif;font-size:13px;line-height:1.5;margin:0 0 12px">{e(summ)}</p>']
+    T = ["", SUB_TITLE, summ, ""]
+    for i, c in enumerate(sub, 1):
+        cn = c["company_number"]
+        fields = sub_fields(c, radar)
+        H.append('<div style="background:#fff;border:1px solid #ddd;border-left:3px solid #b07a1f;'
+                 'padding:14px 16px;margin:0 0 14px;font-family:Arial,sans-serif">')
+        H.append(f'<div style="font-family:Georgia,serif;font-size:17px;margin:0 0 2px">S{i}. {e(c["name"])}</div>')
+        H.append(f'<div style="font-size:12px;color:#555;margin:0 0 10px">{e(cn)} &middot; '
+                 f'<a href="{CH_LINK.format(cn)}" style="color:#1f3a5f">Companies House</a></div>')
+        H.append('<table style="border-collapse:collapse;width:100%">')
+        for k, v, *lk in fields:
+            if len(lk) >= 3 and lk[2]:
+                H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{lk[2]}</td></tr>")
+                continue
+            link = f' <a href="{html.escape(lk[0])}" style="color:#1f3a5f">[{e(lk[1])}]</a>' if lk and lk[0] else ""
+            H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{e(v)}{link}</td></tr>")
+        cl = credit_lines(credit.get(cn), _ddmmyyyy((c.get("profile") or {}).get("date_of_creation")))
+        H.append(f"<tr><td {td}>Credit data</td><td {tv}>{'<br>'.join(e(x) for x in cl)}</td></tr>")
+        H.append(f'<tr><td {td}><b>Why now</b></td><td {tv}><b>{e(c.get("angle") or "")}</b></td></tr>')
+        H.append("</table></div>")
+        T += [f"S{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
+        T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
+        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {c.get('angle') or ''}", ""]
+    if not sub:
+        H.append('<p style="font-family:Arial,sans-serif;font-size:13px">None this week</p>')
+        T.append(" - None this week")
+    return H, T
+
+
 def distress_block(distress, credit=None, radar=None, dres=None):
     """(html lines, text lines) for the DISTRESSED section."""
     import radar_distress as rd
@@ -741,11 +848,16 @@ def distress_block(distress, credit=None, radar=None, dres=None):
     return H, T
 
 
-def build(radar, top, distress, credit, wc, size_counts=None, dres=None):
+def build(radar, top, distress, credit, wc, size_counts=None, dres=None, sub=None, sres=None):
+    import radar_distress as rd
     why = radar["why"]
     sc = size_counts or {}
+    sub = sub or []
+    sres = sres or {}
+    smn, smx = sres.get("window", (rd.SUB_MIN_MONTHS, rd.SUB_MAX_MONTHS))
     subject = f"Refinancing radar: {len(top)} for w/c {fmt_date(wc)}" + (
-        f" (+{len(distress)} distressed)" if distress else "")
+        f" (+{len(sub)} sub-performing)" if sub else "") + (
+        f" (+{len(distress)} distressed)" if distress and rd.SHOW_FORMAL_INSOLVENCY else "")
     intro = (f"{len(top)} sponsors whose facilities are likely in their refinancing window. "
              "Reply with the numbers you'd like approached and I'll draft a personal note for each.")
     method = ("Method: public Companies House charges reaching their 5-year anniversary in the "
@@ -768,12 +880,27 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None):
               "LinkedIn links come from public web search "
               "and are marked likely, not confirmed. Director work emails are from Apollo: only "
               "'verified' emails are usable; nothing here is added to contacts or sequences. "
-              "Distressed section: same base filters and size score, but charges 24-72 months old; "
-              "signals from Companies House (status, insolvency cases and practitioners, receiver "
-              "filings, overdue filings, compulsory strike-off, director and auditor changes, new "
-              "bridging/specialist charges), The Gazette (appointments, petitions, dividend notices) "
-              "and credit data; tiers In insolvency, Receiver appointed, Early warning; angle lines "
-              "state the signals, not outcomes. "
+              f"Sub-performing section: a facility longer than 5 years with no refinance found. Same base "
+              f"filters and size score as the main list, but the qualifying charge is more than {smn} months "
+              f"old (up to {smx}) and still outstanding on the Companies House charges register; companies "
+              "where a new charge from a different lender was registered from 6 months before the 5-year "
+              "anniversary onwards (likely refinanced), or where the charge has been satisfied, are left "
+              "out, as are companies already in formal insolvency (administration, liquidation, "
+              "receivership, CVA). A further charge or alteration by the same lender after that point is "
+              "shown as a possible extension or amendment, not confirmed. A 5-year term is typical, not "
+              "known, and lenders do not always register satisfaction promptly, so an old outstanding "
+              "charge can occasionally be one already repaid. Soft signals: overdue accounts or "
+              "confirmation statement, low credit score or CCJs (credit data, cached), director "
+              "resignations in the last 6 months. Ranked by months past 5 years, then likely loan size, "
+              "extension signal and soft signals; max 3 per asset class"
+              + (f"; {sres.get('profiled_unlikely', 0)} of {sres.get('profiled', 0)} profiled judged "
+                 "Unlikely on size and left out" if sres.get("profiled") else "") + ". "
+              + ("Distressed section: same base filters and size score, but charges 24-72 months old; "
+                 "signals from Companies House (status, insolvency cases and practitioners, receiver "
+                 "filings, overdue filings, compulsory strike-off, director and auditor changes, new "
+                 "bridging/specialist charges), The Gazette (appointments, petitions, dividend notices) "
+                 "and credit data; tiers In insolvency, Receiver appointed, Early warning; angle lines "
+                 "state the signals, not outcomes. " if rd.SHOW_FORMAL_INSOLVENCY else "") +
               "Credit data cached up to 7 days. Directors' names are personal data: "
               "internal use only.")
     td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
@@ -807,9 +934,13 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None):
         T += [f"{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
         T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
         T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", ""]
-    dh, dtx = distress_block(distress, credit, radar, dres)
-    H += dh
-    T += dtx
+    sh, stx = sub_block(sub, credit, radar, sres)
+    H += sh
+    T += stx
+    if rd.SHOW_FORMAL_INSOLVENCY:
+        dh, dtx = distress_block(distress, credit, radar, dres)
+        H += dh
+        T += dtx
     H.append(f'<p style="font-family:Arial,sans-serif;font-size:11px;color:#666;line-height:1.5;'
              f'border-top:1px solid #ccc;padding-top:10px">{e(method)}</p></div></body></html>')
     T += ["", method]
@@ -988,26 +1119,29 @@ def main():
     log(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] radar weekly email start")
 
     import maturity_radar
+    import radar_distress as rd
     from radar_size import score_size
     radar = maturity_radar.main(RADAR_ARGS)
     cands, micro = profile_set(radar)
     log(f"profile set {len(cands)} (cap {PROFILE_MAX}, max {PROFILE_PER_CLASS}/class); "
         f"micro-entity skipped before profiling {len(micro)}")
-    td0 = time.time()
-    try:
-        dres = distress_build(radar, cands)
-    except Exception as ex:  # never lose the main radar on a distress problem
-        log(f"DISTRESS SCAN FAILED ({type(ex).__name__}: {ex}); main list unaffected")
-        dres = {"candidates": [], "counts": {}, "sources": {"distress scan": f"FAILED ({type(ex).__name__})"},
-                "window": (24, 72)}
-    # formal / receiver tiers leave the main list (one section per company)
-    hard = {c["company_number"] for c in dres["candidates"] if c["tier"] in ("insolvency", "receiver")}
-    moved = [c for c in cands if c["company_number"] in hard]
-    cands = [c for c in cands if c["company_number"] not in hard]
-    for k, v in (dres.get("sources") or {}).items():
-        log(f"distress source {k}: {v}")
-    log(f"distress scan: {time.time() - td0:.0f}s; tiers {dres.get('counts')}; moved out of main "
-        f"(formal/receiver) {len(moved)}")
+    dres = {"candidates": [], "counts": {}, "sources": {}, "window": (rd.MIN_MONTHS, rd.MAX_MONTHS)}
+    if rd.SHOW_FORMAL_INSOLVENCY:  # old formal-insolvency section (hidden since 7 Oct 2026)
+        td0 = time.time()
+        try:
+            dres = distress_build(radar, cands)
+        except Exception as ex:  # never lose the main radar on a distress problem
+            log(f"DISTRESS SCAN FAILED ({type(ex).__name__}: {ex}); main list unaffected")
+            dres = {"candidates": [], "counts": {}, "sources": {"distress scan": f"FAILED ({type(ex).__name__})"},
+                    "window": (24, 72)}
+        # formal / receiver tiers leave the main list (one section per company)
+        hard = {c["company_number"] for c in dres["candidates"] if c["tier"] in ("insolvency", "receiver")}
+        moved = [c for c in cands if c["company_number"] in hard]
+        cands = [c for c in cands if c["company_number"] not in hard]
+        for k, v in (dres.get("sources") or {}).items():
+            log(f"distress source {k}: {v}")
+        log(f"distress scan: {time.time() - td0:.0f}s; tiers {dres.get('counts')}; moved out of main "
+            f"(formal/receiver) {len(moved)}")
 
     t1 = time.time()
     prof = asset_profiles(cands)
@@ -1033,35 +1167,61 @@ def main():
         len(top), sum(1 for c in top if not c["prop"]["generic"]),
         sum(1 for c in top if c["prop"]["generic"])))
 
-    td1 = time.time()
-    try:
-        distress, dprof = distress_list(dres, top) if dres["candidates"] else ([], {})
-    except Exception as ex:
-        log(f"DISTRESS LIST FAILED ({type(ex).__name__}: {ex})")
-        distress = []
-    import radar_distress as rd
-    log(f"distressed shown {len(distress)} ({time.time() - td1:.0f}s incl. asset profiles):")
-    for c in distress:
-        log(f"  [{rd.TIER_LABEL[c['tier']]}] {c['name'][:45]} ({c['company_number']}) {c['cls']} | "
-            f"{c['size']['label']} | {rd.appointee_line(c)[:120]}")
+    distress = []
+    if rd.SHOW_FORMAL_INSOLVENCY:
+        td1 = time.time()
+        try:
+            distress, dprof = distress_list(dres, top) if dres["candidates"] else ([], {})
+        except Exception as ex:
+            log(f"DISTRESS LIST FAILED ({type(ex).__name__}: {ex})")
+            distress = []
+        log(f"distressed shown {len(distress)} ({time.time() - td1:.0f}s incl. asset profiles):")
+        for c in distress:
+            log(f"  [{rd.TIER_LABEL[c['tier']]}] {c['name'][:45]} ({c['company_number']}) {c['cls']} | "
+                f"{c['size']['label']} | {rd.appointee_line(c)[:120]}")
 
-    li = linkedin(top)
+    # ---- sub-performing: past 5 years, no refinance found (never in the main list too) ----
+    ts = time.time()
+    sub, sres = [], {"steps": [], "window": (rd.SUB_MIN_MONTHS, rd.SUB_MAX_MONTHS)}
+    try:
+        sres = rd.build_subperforming(run=radar["run"], exclude=[c["company_number"] for c in top])
+        for lbl, n in sres["steps"]:
+            log(f"sub-performing funnel: {n:>7,}  {lbl}")
+        log(f"sub-performing pool by provisional size: {sres['size_counts']}; by class: {sres['class_counts']}"
+            f"; scan {sres['secs']}s")
+        sub, sprof = sub_list(sres, top)
+        sub = [c for c in sub if c["company_number"] not in {t["company_number"] for t in top}]  # enforce
+        log(f"sub-performing: profiled {sres.get('profiled')} (Unlikely after profile "
+            f"{sres.get('profiled_unlikely')}; DO NOT CONTACT skipped {sres.get('dnc')}); shown {len(sub)} "
+            f"({time.time() - ts:.0f}s incl. asset profiles):")
+        for c in sub:
+            log(f"  S {c['name'][:44]:<44} {c['cls']:<20} {c['size']['label']:<15} +{c['months_past']}m past 5y "
+                f"| {c['anchor_lender'][:30]} | ext {'y' if c.get('extensions') else 'n'}{' (rolling)' if c.get('rolling') else ''} "
+                f"| soft {len(c.get('soft') or [])}")
+    except Exception as ex:  # never lose the main radar on a sub-performing problem
+        import traceback
+        traceback.print_exc()
+        log(f"SUB-PERFORMING FAILED ({type(ex).__name__}: {ex}); main list unaffected")
+        sres["error"] = f"sub-performing scan failed ({type(ex).__name__})"
+        sub = []
+
+    li = linkedin(top + sub)
     log(f"linkedin (search, likely only): directors {li['dir_hit']}/{li['dir_q']}, companies "
         f"{li['co_hit']}/{li['co_q']}; queries {li['queries']}, cached {li['cached']}, "
         f"capped {li['capped']}" + ("" if li["enabled"] else " (no search key)"))
-    ap = apollo(top)
+    ap = apollo(top + sub)
     log(f"apollo work email: people {ap['people']}, credits used (match calls) {ap['calls']}, "
         f"cached {ap['cached']}, capped {ap['capped']}, matched {ap['matched']}, with email "
         f"{ap['email']}, verified {ap['verified']}, errors {ap['errors']}"
         + ("" if ap["enabled"] else " (no API key)"))
 
-    credit, st = enrich(top + distress, enabled=not a.no_credit)  # main first: the cap favours it
+    credit, st = enrich(top + sub + distress, enabled=not a.no_credit)  # main first: the cap favours it
     log(f"credit data: cached {st['cached']}, fetched {st['fetched']}, failed {st['failed']}, "
         f"not reached (cap) {st['skipped_cap']}")
 
     run = radar["run"]
     wc = run - dt.timedelta(days=run.weekday())
-    subject, html_body, text_body = build(radar, top, distress, credit, wc, size_counts, dres)
+    subject, html_body, text_body = build(radar, top, distress, credit, wc, size_counts, dres, sub, sres)
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"email-{run}.html")
     open(path, "w").write(html_body)

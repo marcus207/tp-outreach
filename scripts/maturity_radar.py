@@ -730,6 +730,67 @@ def debt_line(info, with_link=True):
     return f"not available ({why})" + (f" {info['link']}" if with_link else "")
 
 
+def contact_matcher(conn):
+    """match(c) -> existing tp contacts for a company (SPV or parent name / domain), each with
+    DO NOT CONTACT flags (suppressed / unsubscribed / hold). tp tenant only. Shared with the
+    sub-performing section (radar_distress.py)."""
+    contacts = q(conn, """select email, first_name, last_name, title, company, company_domain,
+                                 tags from public.contacts where tenant = 'tp'""")
+    supp = q(conn, """select lower(email) email, lower(domain) domain, reason
+                      from public.suppressed_emails where tenant = 'tp'""")
+    supp_email = {s["email"]: s["reason"] for s in supp}
+    supp_domain = {s["domain"]: s["reason"] for s in supp
+                   if s["domain"] and re.search(r"domain", s["reason"] or "", re.I)}
+    FREE = re.compile(r"gmail|hotmail|outlook|yahoo|icloud|aol|btinternet|live\.|me\.com|"
+                      r"googlemail|msn|sky\.com|virginmedia|talktalk|protonmail")
+    by_name, by_dom, by_first2 = defaultdict(list), defaultdict(list), defaultdict(list)
+    for ct in contacts:
+        nk = norm(ct["company"])
+        if len(nk) > 3:
+            by_name[nk].append(ct)
+            toks = nk.split()
+            if len(toks) >= 2 and len(toks[0]) >= 4:
+                by_first2[" ".join(toks[:2])].append(ct)
+        dom = (ct["company_domain"] or (ct["email"] or "").split("@")[-1]).lower()
+        dom = re.sub(r"^www\.", "", dom)
+        if dom and not FREE.search(dom):
+            stem = dom.split(".")[0]
+            if len(stem) >= 5:
+                by_dom[stem].append(ct)
+
+    def match(c):
+        out = {}
+        keys = [(c["name"], "SPV")] + [(p, "parent") for p in c.get("parents", [])]
+        for nm, kind in keys:
+            nk = norm(nm)
+            if len(nk) <= 3:
+                continue
+            for ct in by_name.get(nk, []):
+                out.setdefault(ct["email"].lower(), (ct, f"company name = {kind}"))
+            for ct in by_dom.get(nk.replace(" ", ""), []):
+                out.setdefault(ct["email"].lower(), (ct, f"email domain = {kind}"))
+            toks = nk.split()
+            if len(toks) >= 2 and len(toks[0]) >= 4:
+                for ct in by_first2.get(" ".join(toks[:2]), []):
+                    out.setdefault(ct["email"].lower(), (ct, f"possible (first words of {kind})"))
+        res = []
+        for em, (ct, how) in list(out.items())[:6]:
+            flags = []
+            if em in supp_email:
+                flags.append(f"suppressed: {supp_email[em]}")
+            d = em.split("@")[-1]
+            if d in supp_domain:
+                flags.append(f"domain suppressed: {supp_domain[d]}")
+            for t in ct["tags"] or []:
+                if t.lower() in ("unsubscribed", "hold"):
+                    flags.append(f"tag: {t}")
+            res.append({"name": f"{ct['first_name'] or ''} {ct['last_name'] or ''}".strip(),
+                        "email": ct["email"], "title": ct["title"] or "", "how": how,
+                        "flags": flags})
+        return res
+    return match
+
+
 # --------------------------------------------------------------------------- main
 def main(argv=None):
     """CLI entry. Also importable: returns a dict with the shortlist and distress list."""
@@ -1016,61 +1077,7 @@ def main(argv=None):
         c["size"] = score_size(c)
 
     # ---- contact matching (tp tenant only) ----
-    contacts = q(conn, """select email, first_name, last_name, title, company, company_domain,
-                                 tags from public.contacts where tenant = 'tp'""")
-    supp = q(conn, """select lower(email) email, lower(domain) domain, reason
-                      from public.suppressed_emails where tenant = 'tp'""")
-    supp_email = {s["email"]: s["reason"] for s in supp}
-    supp_domain = {s["domain"]: s["reason"] for s in supp
-                   if s["domain"] and re.search(r"domain", s["reason"] or "", re.I)}
-    FREE = re.compile(r"gmail|hotmail|outlook|yahoo|icloud|aol|btinternet|live\.|me\.com|"
-                      r"googlemail|msn|sky\.com|virginmedia|talktalk|protonmail")
-    by_name, by_dom, by_first2 = defaultdict(list), defaultdict(list), defaultdict(list)
-    for ct in contacts:
-        nk = norm(ct["company"])
-        if len(nk) > 3:
-            by_name[nk].append(ct)
-            toks = nk.split()
-            if len(toks) >= 2 and len(toks[0]) >= 4:
-                by_first2[" ".join(toks[:2])].append(ct)
-        dom = (ct["company_domain"] or (ct["email"] or "").split("@")[-1]).lower()
-        dom = re.sub(r"^www\.", "", dom)
-        if dom and not FREE.search(dom):
-            stem = dom.split(".")[0]
-            if len(stem) >= 5:
-                by_dom[stem].append(ct)
-
-    def match(c):
-        out = {}
-        keys = [(c["name"], "SPV")] + [(p, "parent") for p in c.get("parents", [])]
-        for nm, kind in keys:
-            nk = norm(nm)
-            if len(nk) <= 3:
-                continue
-            for ct in by_name.get(nk, []):
-                out.setdefault(ct["email"].lower(), (ct, f"company name = {kind}"))
-            for ct in by_dom.get(nk.replace(" ", ""), []):
-                out.setdefault(ct["email"].lower(), (ct, f"email domain = {kind}"))
-            toks = nk.split()
-            if len(toks) >= 2 and len(toks[0]) >= 4:
-                for ct in by_first2.get(" ".join(toks[:2]), []):
-                    out.setdefault(ct["email"].lower(), (ct, f"possible (first words of {kind})"))
-        res = []
-        for em, (ct, how) in list(out.items())[:6]:
-            flags = []
-            if em in supp_email:
-                flags.append(f"suppressed: {supp_email[em]}")
-            d = em.split("@")[-1]
-            if d in supp_domain:
-                flags.append(f"domain suppressed: {supp_domain[d]}")
-            for t in ct["tags"] or []:
-                if t.lower() in ("unsubscribed", "hold"):
-                    flags.append(f"tag: {t}")
-            res.append({"name": f"{ct['first_name'] or ''} {ct['last_name'] or ''}".strip(),
-                        "email": ct["email"], "title": ct["title"] or "", "how": how,
-                        "flags": flags})
-        return res
-
+    match = contact_matcher(conn)
     for c in picked:
         c["contacts"] = match(c)
         c["dnc"] = any(x["flags"] for x in c["contacts"])

@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 """
-DISTRESSED section of the Refinancing Radar (Turning Point Capital Advisory).
+SUB-PERFORMING and (hidden) DISTRESSED sections of the Refinancing Radar (Turning Point Capital Advisory).
 
+SUB-PERFORMING (shown in the weekly email since 7 Oct 2026, build_subperforming()):
+  Marcus's definition (authoritative): "Sub-performing / distressed isn't when it is already in
+  administration. It is when the loan is longer than 5 years and they haven't found a refinance
+  solution."
+  Universe: same base filters as the radar (institution/trustee lenders, minus BTL/residential lenders,
+  housebuilder counterparties and finance borrowers, target asset classes, size score, Unlikely
+  excluded) with a qualifying charge created MORE than 60 months ago (default 60-96 months,
+  SUB_MIN_MONTHS / SUB_MAX_MONTHS), still outstanding.
+  "No refinance found": the full CH charges register is read per candidate (cached). The company is
+  excluded if, on or after 6 months before the qualifying charge's 5-year anniversary, a NEW charge
+  was registered by a DIFFERENT lender (likely refinanced), or the qualifying charge is now satisfied.
+  Later charges from the SAME (incumbent) lender, or an alteration filed on the qualifying charge,
+  are kept and flagged as a "same-lender extension/amendment signal".
+  Companies in formal insolvency (administration, liquidation, receivership, CVA, insolvency
+  proceedings, or a live non-solvent CH insolvency case) are excluded and only counted in the log.
+  Ranked by months past the 5-year point, size band, extension signal and soft signals (accounts
+  overdue, weak credit data from cache, director resignations in 6 months). Approach is to the
+  directors (live companies), same rules as the main list.
+
+DISTRESSED (formal insolvency / receivers / Gazette; kept but NOT shown: SHOW_FORMAL_INSOLVENCY=False).
 Distressed sponsors with property debt are opportunities (rescue refinance, or a sale of the asset
 to fund clients via the desk). The approach is to the insolvency practitioner / receiver once one is
 appointed, never to the directors.
@@ -33,7 +53,9 @@ Sources and how they are reached (public only):
     does capped live fetches for the shortlisted cards). Output says "credit data", never the provider.
 Never reads Loan Intel member tables (loan_book, loan_data) or experian_*.
 
-Usage (standalone check): python3 scripts/radar_distress.py [--date YYYY-MM-DD] [--min-months 24]
+Usage (standalone check): python3 scripts/radar_distress.py [--date YYYY-MM-DD] [--min-months 60]
+                                                            [--max-months 96]
+         old formal-insolvency scan:  python3 scripts/radar_distress.py --formal [--min-months 24]
                                                             [--max-months 72] [--no-gazette]
 """
 import argparse
@@ -64,7 +86,26 @@ GAZ_CACHE = os.path.join(OUT_DIR, "gazette_cache")
 DSN = mr.DSN
 
 # --------------------------------------------------------------------------- configuration
-MIN_MONTHS, MAX_MONTHS = 24, 72          # charge age window (months) for the distress universe
+# Sub-performing section (shown). Marcus 7 Oct 2026: past 5 years with no refinance found.
+SHOW_FORMAL_INSOLVENCY = False           # old formal-insolvency/receiver/Gazette section: kept, not shown
+SUB_MIN_MONTHS, SUB_MAX_MONTHS = 60, 96  # qualifying charge MORE than 60 months old, up to 96
+SUB_PRE_ANNIV_MONTHS = 6                 # a different-lender charge from 6 months before the anniversary = refinanced
+SUB_SIC_POOL = 300                       # unclassified universe companies (top by pre-score) checked for a SIC class
+SUB_RESIGN_MIN = 1                       # director resignations in the last 6 months that count as a soft signal
+SUB_PROFILE_MAX, SUB_PROFILE_PER_CLASS = 16, 4   # candidates given an asset profile (web/LLM cost)
+SUB_SHOW, SUB_PER_CLASS = 10, 3
+# Ranking points (composite): months past the 5-year point dominate, then size band, then the
+# same-lender extension signal, then soft signals. EDITABLE.
+SUB_RANK = {"month": 1.0, "month_cap": 36,
+            "band": {"likely_10m": 24, "likely_5m": 14, "possible": 4, "unlikely": 0},
+            "extension": 8, "soft": 4, "soft_cap": 12,
+            "rolling_month_cap": 12}     # rolling portfolio facility: months credit capped, no extension points
+# Rolling portfolio facility: the incumbent registered charges in at least this many distinct calendar
+# years (portfolio landlords adding properties under one facility). The 5-year clock from the first
+# qualifying charge means little there, and later same-lender charges are routine, not an extension.
+ROLLING_MIN_YEARS, ROLLING_MIN_CHARGES = 4, 6
+
+MIN_MONTHS, MAX_MONTHS = 24, 72          # charge age window (months) for the (hidden) distress universe
 GAZETTE_LOOKBACK_MONTHS = 12             # Gazette notices considered
 SOFT_POOL = 400                          # top classified universe companies (size proxy) profile-checked
 RESCUE_MONTHS = 12                       # bridging/rescue charge registered within this many months
@@ -371,10 +412,12 @@ def advanced_status_map(ch):
 
 
 # --------------------------------------------------------------------------- universe
-def build_universe(conn, run, min_m, max_m):
+def build_universe(conn, run, min_m, max_m, strict_min=False):
     """Every company with an outstanding qualifying charge created min_m..max_m months ago, after
-    the radar's base filters. Class from name/description (SIC added later where needed)."""
+    the radar's base filters. Class from name/description (SIC added later where needed).
+    strict_min: charge must be MORE than min_m months old (created before run - min_m months)."""
     w_start, w_end = mr.add_months(run, -max_m), mr.add_months(run, -min_m)
+    upper = "c.date_created < %s" if strict_min else "c.date_created <= %s"
     rows = mr.q(conn, """
         select c.company_number, c.lender, c.date_created, c.property_description,
                lc.lender_type, lc.trading_name, s.company_name, s.psc, s.postcode
@@ -383,8 +426,9 @@ def build_universe(conn, run, min_m, max_m):
         left join public.spv_companies s on s.company_number = c.company_number
         where c.status = 'outstanding' and not coalesce(c.excluded, false)
           and c.date_created ~ '^\\d{4}-\\d{2}-\\d{2}$'
-          and c.date_created between %s and %s""", (w_start.isoformat(), w_end.isoformat()))
-    funnel = [("Outstanding charges %d-%d months old" % (min_m, max_m), len(rows),
+          and c.date_created >= %s and """ + upper, (w_start.isoformat(), w_end.isoformat()))
+    funnel = [(("Outstanding charges more than %d (up to %d) months old" if strict_min
+                else "Outstanding charges %d-%d months old") % (min_m, max_m), len(rows),
                len({r["company_number"] for r in rows}))]
     lender_names = {mr.norm(x["lender"]) for x in mr.q(conn, """
         select lender from public.lender_classifications
@@ -988,16 +1032,456 @@ def appointee_line(c):
     return "; ".join(parts)
 
 
+# =========================================================================== SUB-PERFORMING
+# Lender families: names that are the same lender for the "same vs different lender" test.
+LENDER_FAMILIES = [
+    (re.compile(r"natwest|national westminster|royal bank of scotland|\brbs\b|coutts|ulster bank"), "natwest"),
+    (re.compile(r"lloyds|bank of scotland|\bhbos\b|halifax"), "lloyds"),
+    (re.compile(r"barclays"), "barclays"),
+    (re.compile(r"\bhsbc\b|midland bank"), "hsbc"),
+    (re.compile(r"santander|abbey national|alliance (and|&) leicester"), "santander"),
+    (re.compile(r"clydesdale|yorkshire bank|virgin money|\bcybg\b"), "virgin money"),
+    (re.compile(r"handelsbanken"), "handelsbanken"),
+    (re.compile(r"\bmetro bank"), "metro"),
+    (re.compile(r"\bshawbrook"), "shawbrook"),
+    (re.compile(r"\binvestec"), "investec"),
+    (re.compile(r"close brothers"), "close brothers"),
+    (re.compile(r"cooperative bank|co-operative bank|co operative bank"), "co-op bank"),
+    (re.compile(r"\bunity trust"), "unity trust"),
+    (re.compile(r"\btriodos"), "triodos"),
+    (re.compile(r"\baib\b|allied irish"), "aib"),
+    (re.compile(r"bank of ireland"), "bank of ireland"),
+    (re.compile(r"\bovo\b|ovo bank|ultimate finance"), "ultimate"),
+]
+_LK_STOP = {"bank", "the", "of", "as", "security", "agent", "trustee", "trustees", "ag", "sa", "nv", "bv",
+            "plc", "uk", "branch", "london", "limited", "gmbh", "for", "itself", "and", "on", "behalf"}
+_LK_GENERIC_FIRST = {"royal", "national", "first", "united", "capital", "private", "european",
+                     "international", "credit", "general", "city", "commercial", "property", "lombard",
+                     "secure", "british", "scottish", "global"}
+
+
+def lender_key(name):
+    """Normalised lender identity for the same/different lender test."""
+    raw = (name or "").lower()
+    s = mr.norm(mr.norm_lender(name or ""))
+    for rx, k in LENDER_FAMILIES:
+        if rx.search(s) or rx.search(raw):
+            return k
+    toks = [t for t in s.split() if t not in _LK_STOP]
+    return " ".join(toks[:2]) or s
+
+
+def same_lender(a, b):
+    ka, kb = lender_key(a), lender_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    fa, fb = ka.split()[0], kb.split()[0]
+    return fa == fb and len(fa) >= 5 and fa not in _LK_GENERIC_FIRST
+
+
+def ym(m):
+    y, r = divmod(max(m or 0, 0), 12)
+    return f"{y} year{'s' if y != 1 else ''}" + (f" {r} month{'s' if r != 1 else ''}" if r else "")
+
+
+def fetch_charges(ch, cn):
+    """Full CH charges register for one company (paged, cached via CH). None if unavailable."""
+    items, start, ok = [], 0, False
+    while True:
+        d = ch.get(f"/company/{cn}/charges?items_per_page=100&start_index={start}")
+        if d is None:
+            break
+        ok = True
+        items += d.get("items") or []
+        start += 100
+        if start >= (d.get("total_count") or 0) or not d.get("items"):
+            break
+    return items if ok else None
+
+
+def _persons(item):
+    return [p.get("name") or "" for p in item.get("persons_entitled") or [] if p.get("name")]
+
+
+def evaluate_refinance(c, items, run, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS):
+    """'No refinance found' test on the CH charges register. Sets c['refi'] to one of
+    'keep' / 'refinanced' / 'satisfied' / 'unverified' and fills the qualifying-charge fields."""
+    incumbents = {n for r in c["charges"] for n in (r.get("lender"), r.get("lname")) if n}
+    lo, hi = mr.add_months(run, -max_m).isoformat(), mr.add_months(run, -min_m).isoformat()
+    db_dates = set(c["dates"])
+    if items is None:  # CH unavailable: fall back to the database rows, flagged unverified
+        c.update(refi="unverified", qual=[], anchor=_d(c["dates"][0]), new_lender=[], extensions=[],
+                 anchor_lender=c["charges"][0]["lname"])
+    else:
+        in_win = [i for i in items if lo <= (i.get("created_on") or "") < hi]
+        by_name = [i for i in in_win if any(same_lender(p, n) for p in _persons(i) for n in incumbents)]
+        cand = by_name or [i for i in in_win if i.get("created_on") in db_dates]
+        qual = [i for i in cand if i.get("status") in ("outstanding", "part-satisfied")]
+        if cand and not qual:
+            c.update(refi="satisfied", qual=[], satisfied_on=max((i.get("satisfied_on") or "") for i in cand))
+            return c
+        if not qual:  # not on the CH register at all (e.g. DB row mismatch): use DB dates, flag
+            c.update(refi="unverified", qual=[], anchor=_d(c["dates"][0]), new_lender=[], extensions=[],
+                     anchor_lender=c["charges"][0]["lname"])
+        else:
+            qual.sort(key=lambda i: i.get("created_on"))
+            anchor = qual[0]
+            c["qual"] = qual
+            c["anchor"] = _d(anchor["created_on"])
+            inc_names = incumbents | {p for i in qual for p in _persons(i)}
+            db_hit = next((r for r in c["charges"] if r["date_created"] == anchor["created_on"]), None)
+            c["anchor_lender"] = (db_hit or {}).get("lname") or mr.norm_lender(
+                (_persons(anchor) or [c["charges"][0]["lname"]])[0])
+            cut = mr.add_months(mr.add_months(c["anchor"], 60), -SUB_PRE_ANNIV_MONTHS).isoformat()
+            qual_ids = {(i.get("links") or {}).get("self") for i in qual}
+            new_lender, ext = [], []
+            for i in items:
+                dc = i.get("created_on") or ""
+                if not dc or dc < cut or dc <= anchor["created_on"] or (i.get("links") or {}).get("self") in qual_ids:
+                    continue
+                ps = _persons(i)
+                desc = ((i.get("particulars") or {}).get("description") or "").strip()
+                desc = "" if (not desc or mr.GENERIC_DESC.match(desc) or len(desc) < 8) else mr._clean_addr(desc)
+                rec = {"date": dc, "lender": mr.norm_lender(ps[0]) if ps else "(not stated)",
+                       "status": i.get("status"), "persons": ps,
+                       "desc": desc if len(desc) <= 80 else desc[:77].rsplit(" ", 1)[0] + "...",
+                       "kind": "further charge"}
+                if ps and any(same_lender(p, n) for p in ps for n in inc_names):
+                    ext.append(rec)
+                else:
+                    new_lender.append(rec)
+            # alterations filed on the qualifying charge after the cut (deed of variation / amendment)
+            for i in qual:
+                for t in i.get("transactions") or []:
+                    ft, dd = t.get("filing_type") or "", t.get("delivered_on") or ""
+                    if dd >= cut and ft.startswith("alter"):
+                        ext.append({"date": dd, "lender": c["anchor_lender"], "status": i.get("status"),
+                                    "persons": _persons(i), "desc": "", "kind": "alteration filed on the charge"})
+            inc_items = [i for i in items if any(same_lender(p, n) for p in _persons(i) for n in inc_names)]
+            yrs = sorted({(i.get("created_on") or "")[:4] for i in inc_items if i.get("created_on")})
+            c["inc_count"], c["inc_years"] = len(inc_items), yrs
+            c["rolling"] = len(yrs) >= ROLLING_MIN_YEARS and len(inc_items) >= ROLLING_MIN_CHARGES
+            c["new_lender"] = sorted(new_lender, key=lambda r: r["date"])
+            c["extensions"] = sorted(ext, key=lambda r: r["date"])
+            c["refi"] = "refinanced" if new_lender else "keep"
+        c["n_total"] = sum(1 for i in items if i.get("status") in ("outstanding", "part-satisfied")) \
+            or len(c["dates"])
+        c["out_dates"] = sorted({i.get("created_on") for i in items
+                                 if i.get("status") in ("outstanding", "part-satisfied") and i.get("created_on")})
+    c["anniversary"] = mr.add_months(c["anchor"], 60)
+    c["months_past"] = max(mr.months_between(c["anniversary"], run), 0)
+    c["months_old"] = mr.months_between(c["anchor"], run)
+    c.setdefault("n_total", len(c["dates"]))
+    c.setdefault("out_dates", sorted(set(c["dates"])))
+    return c
+
+
+def live_insolvency(ch, c):
+    """(True, label) if the company is in formal insolvency now: CH status, or a live non-solvent
+    CH insolvency case."""
+    p = c.get("profile") or {}
+    st = p.get("company_status") or ""
+    if st in FORMAL_STATUS | RECEIVER_STATUS:
+        return True, STATUS_LABEL.get(st, st)
+    if p.get("has_insolvency_history"):
+        for case in (ch.get(f"/company/{c['company_number']}/insolvency") or {}).get("cases") or []:
+            typ = case.get("type") or ""
+            if typ in SOLVENT_CASES:
+                continue
+            dates = {x.get("type") for x in case.get("dates") or []}
+            ended = any(k in dates for k in ("dissolved-on", "case-end-on", "concluded-winding-up-on",
+                                             "administration-ended-on", "voluntary-arrangement-ended-on",
+                                             "wound-up-on"))
+            live_prs = [x for x in case.get("practitioners") or [] if not x.get("ceased_to_act_on")]
+            if not ended and live_prs:
+                return True, CASE_LABEL.get(typ, typ.replace("-", " ").capitalize()) + " (live CH case)"
+    return False, None
+
+
+def sub_soft_signals(ch, c, run, credit_rows):
+    """Supporting soft signals for a live company. Also fills directors / PSC."""
+    cn, p = c["company_number"], c.get("profile") or {}
+    sigs = []
+    fh_link = f"{CH_LINK.format(cn)}/filing-history"
+    acc = p.get("accounts") or {}
+    due = acc.get("next_due") or (acc.get("next_accounts") or {}).get("due_on")
+    if acc.get("overdue") and due:
+        mo = max(months_since(due, run) or 0, 0)
+        late = f"{mo} month{'s' if mo != 1 else ''} late" if mo else "under a month late"
+        sigs.append(_sig("accounts_overdue", "soft", f"Accounts overdue, {late} (due {fmt(due)})", due, fh_link, 1))
+    cs = p.get("confirmation_statement") or {}
+    if cs.get("overdue") and cs.get("next_due"):
+        sigs.append(_sig("cs_overdue", "soft", f"Confirmation statement overdue (due {fmt(cs['next_due'])})",
+                         cs["next_due"], fh_link, 1))
+    if "strike-off" in (p.get("company_status_detail") or ""):
+        sigs.append(_sig("strike_off", "soft", "Active proposal to strike off (Companies House)", None,
+                         CH_LINK.format(cn), 1))
+    cr = credit_rows.get(cn)
+    if cr:
+        bits = []
+        if cr.get("credit_score") is not None and cr["credit_score"] <= CREDIT_LOW_SCORE:
+            bits.append(f"low credit score {cr['credit_score']}")
+        if (cr.get("ccj_count") or 0) > 0:
+            bits.append(f"{cr['ccj_count']} CCJ(s)" + (f" totalling £{float(cr['ccj_total_value']):,.0f}"
+                                                        if cr.get("ccj_total_value") else ""))
+        if bits:
+            fa = cr.get("fetched_at")
+            sigs.append(_sig("credit", "soft", "Credit data: " + ", ".join(bits),
+                             fa.date().isoformat() if hasattr(fa, "date") else None, None, 1))
+    offs = (ch.get(f"/company/{cn}/officers?items_per_page=100") or {}).get("items") or []
+    roles = ("director", "corporate-director", "llp-member", "llp-designated-member")
+    cutoff = run - dt.timedelta(days=RESIGN_DAYS)
+    res = sorted(o.get("resigned_on") for o in offs if o.get("officer_role") in roles
+                 and _d(o.get("resigned_on")) and _d(o.get("resigned_on")) >= cutoff)
+    if len(res) >= SUB_RESIGN_MIN:
+        sigs.append(_sig("resignations", "soft", f"{len(res)} director resignation{'s' if len(res) != 1 else ''} "
+                         f"since {fmt(cutoff)} (latest {fmt(res[-1])})", res[-1], f"{CH_LINK.format(cn)}/officers", 1))
+    c["directors"] = [f"{o.get('name')} (appointed {o.get('appointed_on', '?')})" for o in offs
+                      if o.get("officer_role") in roles and not o.get("resigned_on")]
+    ps = ch.get(f"/company/{cn}/persons-with-significant-control?items_per_page=100") or {}
+    live = [x for x in ps.get("items", []) if not x.get("ceased_on")]
+    c["parents"] = [x.get("name") for x in live if "corporate" in (x.get("kind") or "")
+                    or "legal-person" in (x.get("kind") or "")]
+    c["psc_people"] = [x.get("name") for x in live if "individual" in (x.get("kind") or "")]
+    c["soft"] = sigs
+    return sigs
+
+
+def sub_rank_score(c):
+    R = SUB_RANK
+    cap = R["rolling_month_cap"] if c.get("rolling") else R["month_cap"]
+    s = min(c.get("months_past") or 0, cap) * R["month"]
+    s += R["band"].get((c.get("size") or {}).get("band", "unlikely"), 0)
+    s += R["extension"] if c.get("extensions") and not c.get("rolling") else 0
+    s += min(len(c.get("soft") or []) * R["soft"], R["soft_cap"])
+    return s
+
+
+def build_subperforming(run=None, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS, exclude=(), ch=None):
+    """Sub-performing candidates (past 5 years, no refinance found), ranked, with provisional size.
+    Returns dict with 'candidates', 'steps' (ordered (label, count)), 'size_counts', 'secs', etc."""
+    t0 = time.time()
+    run = run or dt.date.today()
+    steps = []
+    conn = psycopg2.connect(DSN)
+    conn.set_session(readonly=True, autocommit=True)
+    uni, funnel = build_universe(conn, run, min_m, max_m, strict_min=True)
+    db_min = (mr.q(conn, "select min(c.date_created) d from public.charges c "
+                         "where c.date_created ~ '^\\d{4}-\\d{2}-\\d{2}$'") or [{}])[0].get("d")
+    steps += [(funnel[0][0] + " (companies)", funnel[0][2]), (funnel[1][0] + " (companies)", funnel[1][2]),
+              ("  classified by name/description", funnel[2][2])]
+    ch = threaded_ch(ch or mr.CH())
+
+    # 1. target classes: name/description, plus SIC for the top unclassified by pre-score
+    classified = [cn for cn, c in uni.items() if c["cls"]]
+    sic_pool = [c["company_number"] for c in sorted((c for c in uni.values() if not c["cls"]),
+                                                    key=lambda c: -pre_score(c))[:SUB_SIC_POOL]]
+    prefetch(ch, [f"/company/{cn}" for cn in classified + sic_pool])
+    target, closed, fin = [], 0, 0
+    for cn in classified + sic_pool:
+        c = uni[cn]
+        p = ch.get(f"/company/{cn}") or {}
+        c["profile"] = p
+        if (p.get("company_status") or "") in mr.CLOSED_STATUS:
+            closed += 1
+            continue
+        c["sic"] = p.get("sic_codes") or []
+        if any(mr.FINANCE_SIC.match(s) for s in c["sic"]):
+            fin += 1
+            continue
+        if p.get("company_name"):
+            c["name"] = p["company_name"]
+        sic_cls = next((mr.sic_class(s) for s in c["sic"] if mr.sic_class(s)), None)
+        c["sic_note"] = ""
+        if not c["cls"] and sic_cls:
+            c["cls"], c["sic_note"] = sic_cls, "class from SIC"
+        elif sic_cls and sic_cls == c["cls"]:
+            c["sic_note"] = "SIC confirms"
+        if not c["cls"]:
+            continue
+        c["acc_type"] = ((p.get("accounts") or {}).get("last_accounts") or {}).get("type")
+        c["acc_overdue"] = bool((p.get("accounts") or {}).get("overdue"))
+        c["status"] = p.get("company_status") or "unknown"
+        target.append(c)
+    steps.append((f"In target asset classes, company not dissolved (SIC checked for top {SUB_SIC_POOL} "
+                  f"unclassified; {closed} dissolved/closed, {fin} finance SIC dropped)", len(target)))
+    log(f"sub-performing: universe {len(uni):,}, target classes {len(target)} ({time.time() - t0:.0f}s)")
+
+    # 2. 'no refinance found' test on the CH charges register
+    prefetch(ch, [f"/company/{c['company_number']}/charges?items_per_page=100&start_index=0" for c in target])
+    refi, satisfied, unverified, kept = [], [], [], []
+    for c in target:
+        evaluate_refinance(c, fetch_charges(ch, c["company_number"]), run, min_m, max_m)
+        {"refinanced": refi, "satisfied": satisfied, "unverified": unverified}.get(c["refi"], kept).append(c)
+    steps.append(("Excluded: new charge from a different lender on/after 6 months before the 5-year "
+                  "anniversary (likely refinanced)", len(refi)))
+    steps.append(("Excluded: qualifying charge now satisfied on the CH register", len(satisfied)))
+    if unverified:
+        steps.append(("  qualifying charge not matched on the CH register (kept, DB dates used)", len(unverified)))
+    pool = kept + unverified
+
+    # 3. formal insolvency: excluded, counted only
+    prefetch(ch, [f"/company/{c['company_number']}/insolvency" for c in pool
+                  if (c.get("profile") or {}).get("has_insolvency_history")])
+    formal, live = Counter(), []
+    for c in pool:
+        hit, lbl = live_insolvency(ch, c)
+        if hit:
+            formal[lbl] += 1
+        else:
+            live.append(c)
+    steps.append(("Excluded: formal insolvency (" + (", ".join(f"{k} {v}" for k, v in formal.most_common())
+                                                      or "none") + ")", sum(formal.values())))
+    ex = {cn8(x) for x in exclude}
+    shown_main = [c for c in live if c["company_number"] in ex]
+    live = [c for c in live if c["company_number"] not in ex]
+    if shown_main:
+        steps.append(("Excluded: already in this week's main list", len(shown_main)))
+
+    # 4. soft signals, directors, PSC, charge particulars, provisional size
+    paths = []
+    for c in live:
+        cn = c["company_number"]
+        paths += [f"/company/{cn}/officers?items_per_page=100",
+                  f"/company/{cn}/persons-with-significant-control?items_per_page=100"]
+    prefetch(ch, paths)
+    try:
+        credit_rows = credit_cache([c["company_number"] for c in live])
+    except Exception as exn:
+        credit_rows = {}
+        log(f"sub-performing: credit data cache unavailable ({type(exn).__name__})")
+    match = mr.contact_matcher(conn)  # existing tp contacts + DO NOT CONTACT flags (same as main list)
+    for c in live:
+        sub_soft_signals(ch, c, run, credit_rows)
+        c["prop"] = mr.charge_property(ch, c)
+        c["size"] = score_size(c)
+        c["contacts"] = match(c)
+        c["dnc"] = any(x["flags"] for x in c["contacts"])
+        c["sub_score"] = sub_rank_score(c)
+    steps.append(("Live pool: past 5 years, no refinance by another lender, not in insolvency", len(live)))
+    steps.append(("  of which same-lender extension/amendment signal", sum(1 for c in live if c.get("extensions"))))
+    steps.append((f"  of which rolling portfolio facility (>= {ROLLING_MIN_CHARGES} incumbent charges over "
+                  f">= {ROLLING_MIN_YEARS} distinct years; ranked lower)", sum(1 for c in live if c.get("rolling"))))
+    steps.append(("  of which with soft signals", sum(1 for c in live if c.get("soft"))))
+    live.sort(key=lambda c: -c["sub_score"])
+    conn.close()
+    return {"run": run, "candidates": live, "steps": steps, "window": (min_m, max_m), "db_min": db_min,
+            "refinanced": refi, "formal": dict(formal), "ch": ch, "secs": round(time.time() - t0),
+            "size_counts": dict(Counter(c["size"]["band"] for c in live)),
+            "class_counts": dict(Counter(c["cls"] for c in live))}
+
+
+def sub_why(c):
+    """Factual 'why now' line for a sub-performing card."""
+    mp = c.get("months_past") or 0
+    past = (f"{mp} month{'s' if mp != 1 else ''} past a typical 5-year term" if mp
+            else "just past a typical 5-year term")
+    s = (f"Facility with {c.get('anchor_lender') or 'the lender'} registered {mon(c['anchor'])}, {past}, "
+         "no refinance charge from another lender registered")
+    ext = c.get("extensions") or []
+    if c.get("rolling"):
+        s += (f"; rolling portfolio facility ({c.get('inc_count')} charges to the same lender "
+              f"{c['inc_years'][0]}-{c['inc_years'][-1]}), so the 5-year point is a weaker guide")
+    elif ext:
+        x = ext[-1]
+        s += (f"; incumbent added a further charge {mon(x['date'])} (possible extension)"
+              if x["kind"] == "further charge" else
+              f"; alteration filed on the charge {mon(x['date'])} (possible amendment)")
+    soft = c.get("soft") or []
+    if soft:
+        s += "; " + soft[0]["text"][:1].lower() + soft[0]["text"][1:]
+    if c.get("refi") == "unverified":
+        s += " (charge not matched on the CH register, check)"
+    return s
+
+
+def sub_facility_line(c):
+    mp = c.get("months_past") or 0
+    others = max(len(c.get("qual") or []) - 1, 0)
+    return (f"{c.get('anchor_lender')} charge registered {fmt(c['anchor'])}: {ym(c['months_old'])} old, "
+            f"{mp} month{'s' if mp != 1 else ''} past 5 years (anniversary {mon(c['anniversary'])}), "
+            "still outstanding, no new lender charge since"
+            + (f" (+{others} other qualifying charge{'s' if others != 1 else ''} with the same lender)"
+               if others else ""))
+
+
+def sub_extension_line(c):
+    ext = c.get("extensions") or []
+    pre = (f"Rolling portfolio facility: {c.get('inc_count')} charges to the same lender registered "
+           f"{c['inc_years'][0]}-{c['inc_years'][-1]}, later charges likely routine additions. ") if c.get("rolling") else ""
+    if not ext:
+        return pre + "None registered after year 4.5"
+    parts = []
+    for x in ext[:3]:
+        if x["kind"] == "further charge":
+            who = c.get("anchor_lender") if same_lender(x["lender"], c.get("anchor_lender") or "") else x["lender"]
+            parts.append(f"further charge to {who} registered {fmt(x['date'])} ({x['status']})"
+                         + (f": {x['desc'][:90]}" if x.get("desc") else ""))
+        else:
+            parts.append(f"{x['kind']} {fmt(x['date'])}")
+    return pre + ("Possible additions: " if pre else "Yes (same-lender extension/amendment signal): ") + "; ".join(parts) \
+        + (f" (+{len(ext) - 3} more)" if len(ext) > 3 else "")
+
+
+def sub_select_pool(res, n=SUB_PROFILE_MAX, per_class=SUB_PROFILE_PER_CLASS):
+    """Candidates to profile: no DO NOT CONTACT, sibling groups collapsed, micro-entities skipped
+    (can never be Likely), balanced across classes, by provisional rank."""
+    ok = [c for c in res["candidates"] if (c.get("acc_type") or "") != "micro-entity" and not c.get("dnc")]
+    ok.sort(key=lambda c: -c["sub_score"])
+    kept = dedupe_groups(ok)
+    picked, per = [], Counter()
+    for c in kept:
+        if per[c["cls"]] >= per_class:
+            continue
+        picked.append(c)
+        per[c["cls"]] += 1
+        if len(picked) >= n:
+            break
+    return picked
+
+
+def sub_final(cands, n=SUB_SHOW, per_class=SUB_PER_CLASS):
+    """Final list after asset profiles + re-scored size: Unlikely excluded, max per_class per class."""
+    ok = [c for c in cands if not (EXCLUDE_UNLIKELY and c["size"]["band"] == "unlikely")]
+    for c in ok:
+        c["sub_score"] = sub_rank_score(c)
+    ok.sort(key=lambda c: -c["sub_score"])
+    picked, per = [], Counter()
+    for c in ok:
+        if per[c["cls"]] >= per_class:
+            continue
+        picked.append(c)
+        per[c["cls"]] += 1
+        if len(picked) >= n:
+            break
+    for c in picked:
+        c["angle"] = sub_why(c)
+    return picked
+
+
 # --------------------------------------------------------------------------- CLI
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--date")
-    ap.add_argument("--min-months", type=int, default=MIN_MONTHS)
-    ap.add_argument("--max-months", type=int, default=MAX_MONTHS)
+    ap.add_argument("--formal", action="store_true", help="old formal-insolvency scan instead")
+    ap.add_argument("--min-months", type=int)
+    ap.add_argument("--max-months", type=int)
     ap.add_argument("--no-gazette", action="store_true")
     a = ap.parse_args(argv)
     run = dt.date.fromisoformat(a.date) if a.date else dt.date.today()
-    res = build(run, a.min_months, a.max_months, use_gazette=not a.no_gazette)
+    if not a.formal:
+        res = build_subperforming(run, a.min_months or SUB_MIN_MONTHS, a.max_months or SUB_MAX_MONTHS)
+        for lbl, n in res["steps"]:
+            log(f"  {n:>7,}  {lbl}")
+        log("sizes (provisional):", res["size_counts"], "classes:", res["class_counts"], f"{res['secs']}s")
+        for c in res["candidates"][:25]:
+            log(f"  {c['sub_score']:>5.0f} {c['name'][:42]:<42} {c['cls']:<20} {c['size']['label']:<15} "
+                f"+{c['months_past']}m {c['anchor_lender'][:25]:<25} ext={'y' if c.get('extensions') else 'n'} "
+                f"soft={len(c.get('soft') or [])}")
+        return
+    res = build(run, a.min_months or MIN_MONTHS, a.max_months or MAX_MONTHS, use_gazette=not a.no_gazette)
     for s, v in res["sources"].items():
         log(f"source {s}: {v}")
     log("tiers:", res["counts"], "sizes:", res["size_counts"], f"{res['secs']}s")
