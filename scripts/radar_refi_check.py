@@ -19,8 +19,8 @@ Marcus, 7 Oct 2026:
          same title (or a strong address match: same full postcode + street/building words, house/unit numbers
          consistent) EXCLUDES ("asset refinanced/sold"); same title + same lender under another
          company is FLAGGED "possible restructure within group, same lender".
-    "Newer" = after the qualifying charge (main band) or on/after 6 months before the 5-year
-    anniversary (sub-performing). Only Companies House charges are visible: the HM Land Registry title
+    "Newer" = after the qualifying charge, both sections (sub-performing since 7 Oct 2026; it was
+    on/after 6 months before the 5-year anniversary). Only Companies House charges are visible: the HM Land Registry title
     register (GBP 3 per title) is the definitive check of charges currently on the property.
   * Institutional owners are IGNORED (hard exclusion, both sections): the company or any owner in its
     parent chain (current corporate / legal-person PSCs up to 4 levels, plus PSCs ceased in the last
@@ -434,7 +434,8 @@ def own_check_main(c, items, w_start, w_end):
 
 def group_title_check(conn, c, nodes, dir_sibs, since, incumbents, descs):
     """(b) group + (c) same property. Returns dict(status, kind, reason, flags, n_group, titles, addr)."""
-    res = {"status": "clear", "kind": None, "reason": "", "flags": [], "titles": [], "addr": False}
+    res = {"status": "clear", "kind": None, "reason": "", "flags": [], "titles": [], "addr": False,
+           "group_charges": [], "since": since}  # group_charges: newer different-lender group charges (deep dive)
     grp = group_companies(conn, c, nodes, dir_sibs, since)
     res["n_group"] = len(grp)
     titles, keys = property_keys(descs)
@@ -492,6 +493,8 @@ def group_title_check(conn, c, nodes, dir_sibs, since, incumbents, descs):
             who = f"{nm.title()} ({r['company_number']}; {rel})"
             hit_t = [t for t in titles if re.search(r"\b" + t + r"\b", d, re.I)]
             same_prop = hit_t or any(addr_match(k, d) for k in keys)
+            res["group_charges"].append({"date": r["date_created"], "company": nm, "company_number": r["company_number"],
+                                         "relation": rel, "lender": ln, "status": r.get("status")})
             n_titles = len([t for t in mr._titles(d) if TITLE_OK.match(t)]) if d else 0
             agent = r["lender_type"] == "trustee" or bool(TRUSTEE_LENDER.search(r["lender"] or ""))
             portfolio = n_titles >= 3 or bool(PORTFOLIO_DESC.search(d))

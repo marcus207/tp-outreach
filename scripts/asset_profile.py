@@ -84,7 +84,7 @@ DAY = 86400
 TTL = {"postcodes": 90 * DAY, "brave": 14 * DAY, "page": 30 * DAY, "epc": 30 * DAY,
        "llm": 30 * DAY, "cqc_api": 30 * DAY, "robots": 7 * DAY}
 BULK_TTL = {"cqc": 30 * DAY, "gias": 7 * DAY, "voa": 120 * DAY}
-MIN_INTERVAL = {"api.search.brave.com": 1.1, "default": 1.0}
+MIN_INTERVAL = {"api.search.brave.com": 0.1, "default": 1.0}  # Brave plan: 50 queries/second (Oct 2026)
 
 OK, NOT_FOUND, NEEDS_KEY, UNAVAILABLE = "ok", "not_found", "needs_key", "unavailable"
 UNKNOWN = "unknown"
@@ -751,14 +751,16 @@ def src_epc(address, postcode) -> dict:
     return out
 
 
-def brave(query: str, count=8) -> dict:
+def brave(query: str, count=8, freshness=None, ns="brave", ttl=None) -> dict:
     key = _key("BRAVE_API_KEY")
     if not key:
         return {"status": NEEDS_KEY, "results": []}
-    code, body = http_get("https://api.search.brave.com/res/v1/web/search",
-                          {"q": query, "count": count, "country": "gb", "extra_snippets": 1},
+    params = {"q": query, "count": count, "country": "gb", "extra_snippets": 1}
+    if freshness:
+        params["freshness"] = freshness
+    code, body = http_get("https://api.search.brave.com/res/v1/web/search", params,
                           {"X-Subscription-Token": key, "Accept": "application/json"},
-                          ns="brave", ttl=TTL["brave"])
+                          ns=ns, ttl=ttl or TTL["brave"])
     if code != 200 or not body:
         return {"status": UNAVAILABLE, "results": [], "http": code}
     res = [{"title": r.get("title"), "url": r.get("url"),
@@ -1314,6 +1316,10 @@ companycheck, globaldatabase, bloomberg/pitchbook profiles) merely restate Compa
 except where they report a dated transaction. If the sources show the company is an operating business (e.g. home care /
 domiciliary care, services) rather than a property owner, return confidence "none".
 Always return sector (your best reading of what the company's business is) and country even when confidence is "none".
+Always return business_model: "property_owner" (owns or develops real estate, incl. owner-operators of hotels, care
+homes or schools that own their buildings), "operating_business" (a services / trading business with no property asset
+in the sources, e.g. domiciliary or home care, staffing, healthcare services, construction contracting) or "unclear",
+plus business_model_reason (one short sentence citing the source).
 The asset may be a portfolio (e.g. "portfolio of 12 care homes") if the sources say so; name the portfolio as the sources do.
 Never invent capacity: capacity only if a number with its unit (rooms, beds, units, apartments, homes, properties, sq ft)
 appears verbatim in a supplied snippet or passage about THIS asset; copy that text into capacity.quote exactly and give its url.
@@ -1327,6 +1333,7 @@ Return ONLY JSON:
 {"asset_name": str|null, "asset_type": str|null, "sector": str|null,
  "capacity": {"value": int, "metric": str, "quote": str, "source_url": str}|null,
  "location": str|null, "country": str|null, "confidence": "likely"|"possible"|"none",
+ "business_model": "property_owner"|"operating_business"|"unclear", "business_model_reason": str|null,
  "evidence": [{"text": str, "source": str}]}
 British English. No em dashes."""
 
@@ -1508,6 +1515,8 @@ def identify_by_ownership(company_number: str, company_name: str, asset_class: s
     if sector in (None, "care home", "hospital / clinic", "other", "mixed / portfolio") and PRIMARY_CARE.search(blob):
         sector = "primary care / medical centres"      # classification guard: GP / medical centres are not Care
     country = raw.get("country")
+    bm = raw.get("business_model") if raw.get("business_model") in ("property_owner", "operating_business") else "unclear"
+    out.update(business_model=bm, business_model_reason=re.sub(r"\s*[—–]\s*", ", ", raw.get("business_model_reason") or ""))
     out.update(confidence=conf, sector=sector, country=country,
                outside_uk=bool(country) and country.strip().lower() not in UK_COUNTRIES,
                evidence=ev[:4] if conf != "none" else ev[:2])

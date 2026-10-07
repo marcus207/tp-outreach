@@ -11,10 +11,11 @@ SUB-PERFORMING (shown in the weekly email since 7 Oct 2026, build_subperforming(
   excluded) with a qualifying charge created MORE than 60 months ago (default 60-96 months,
   SUB_MIN_MONTHS / SUB_MAX_MONTHS), still outstanding.
   "No refinance found": the full CH charges register is read per candidate (cached). The company is
-  excluded if, on or after 6 months before the qualifying charge's 5-year anniversary, a NEW charge
-  was registered by a DIFFERENT lender (likely refinanced), or the qualifying charge is now satisfied.
-  Later charges from the SAME (incumbent) lender, or an alteration filed on the qualifying charge,
-  are kept and flagged as a "same-lender extension/amendment signal".
+  excluded if ANY newer charge was registered by a DIFFERENT lender after the qualifying charge
+  (likely refinanced; since 7 Oct 2026, previously only from 6 months before the 5-year anniversary),
+  or the qualifying charge is now satisfied. Later charges from the SAME (incumbent) lender from 6
+  months before the anniversary, or an alteration filed on the qualifying charge, are kept and
+  flagged as a "same-lender extension/amendment signal".
   Companies in formal insolvency (administration, liquidation, receivership, CVA, insolvency
   proceedings, or a live non-solvent CH insolvency case) are excluded and only counted in the log.
   Ranked by months past the 5-year point, size band, extension signal and soft signals (accounts
@@ -89,7 +90,9 @@ DSN = mr.DSN
 # Sub-performing section (shown). Marcus 7 Oct 2026: past 5 years with no refinance found.
 SHOW_FORMAL_INSOLVENCY = False           # old formal-insolvency/receiver/Gazette section: kept, not shown
 SUB_MIN_MONTHS, SUB_MAX_MONTHS = 60, 96  # qualifying charge MORE than 60 months old, up to 96
-SUB_PRE_ANNIV_MONTHS = 6                 # a different-lender charge from 6 months before the anniversary = refinanced
+SUB_PRE_ANNIV_MONTHS = 6                 # same-lender charges/alterations from 6 months before the anniversary = extension signal
+# (since 7 Oct 2026 ANY newer charge from a different lender after the qualifying charge = refinanced; the old rule only
+# counted those from 6 months before the anniversary and missed e.g. Braintree Property's 2023 HSBC refinance)
 SUB_SIC_POOL = 300                       # unclassified universe companies (top by pre-score) checked for a SIC class
 SUB_RESIGN_MIN = 1                       # director resignations in the last 6 months that count as a soft signal
 SUB_PROFILE_MAX, SUB_PROFILE_PER_CLASS = 16, 4   # candidates given an asset profile (web/LLM cost)
@@ -1140,7 +1143,7 @@ def evaluate_refinance(c, items, run, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS
             new_lender, ext = [], []
             for i in items:
                 dc = i.get("created_on") or ""
-                if not dc or dc < cut or dc <= anchor["created_on"] or (i.get("links") or {}).get("self") in qual_ids:
+                if not dc or dc <= anchor["created_on"] or (i.get("links") or {}).get("self") in qual_ids:
                     continue
                 ps = _persons(i)
                 desc = ((i.get("particulars") or {}).get("description") or "").strip()
@@ -1150,8 +1153,9 @@ def evaluate_refinance(c, items, run, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS
                        "desc": desc if len(desc) <= 80 else desc[:77].rsplit(" ", 1)[0] + "...",
                        "kind": "further charge"}
                 if ps and any(same_lender(p, n) for p in ps for n in inc_names):
-                    ext.append(rec)
-                else:
+                    if dc >= cut:  # same-lender charge from year 4.5 on = possible extension
+                        ext.append(rec)
+                else:  # ANY newer different-lender charge after the qualifying charge = likely refinanced
                     new_lender.append(rec)
             # alterations filed on the qualifying charge after the cut (deed of variation / amendment)
             for i in qual:
@@ -1320,8 +1324,13 @@ def build_subperforming(run=None, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS, ex
     for c in target:
         evaluate_refinance(c, fetch_charges(ch, c["company_number"]), run, min_m, max_m)
         {"refinanced": refi, "satisfied": satisfied, "unverified": unverified}.get(c["refi"], kept).append(c)
-    steps.append(("Excluded (own company): new charge from a different lender on/after 6 months before the "
-                  "5-year anniversary (likely refinanced)", len(refi)))
+    steps.append(("Excluded (own company): any newer charge from a different lender after the qualifying "
+                  "charge (likely refinanced)", len(refi)))
+    for c in refi:
+        x = c["new_lender"][0]
+        log(f"  sub excluded [own] {c['name'][:50]} ({c['company_number']}): newer charge from another lender: "
+            f"{x['lender']} on {x['date']} ({x['status']})"
+            + (f" (+{len(c['new_lender']) - 1} more)" if len(c["new_lender"]) > 1 else ""))
     steps.append(("Excluded: qualifying charge now satisfied on the CH register", len(satisfied)))
     if unverified:
         steps.append(("  qualifying charge not matched on the CH register (kept, DB dates used)", len(unverified)))
@@ -1375,10 +1384,10 @@ def build_subperforming(run=None, min_m=SUB_MIN_MONTHS, max_m=SUB_MAX_MONTHS, ex
     # 5. institutional owners out; refinance check across the group and the title (own done in step 2)
     import radar_refi_check as rfc
 
-    def _cut(c):
-        return mr.add_months(mr.add_months(c["anchor"], 60), -SUB_PRE_ANNIV_MONTHS).isoformat()
+    def _since(c):  # group / title: any different-lender charge after the qualifying charge counts
+        return (c["anchor"] + dt.timedelta(days=1)).isoformat()
 
-    live, rst = rfc.screen(ch, conn, live, run, "sub", own=None, since_fn=_cut, label="sub-performing")
+    live, rst = rfc.screen(ch, conn, live, run, "sub", own=None, since_fn=_since, label="sub-performing")
     steps.append(("Excluded: institutional owner (PLC / REIT / sovereign, incl. parent chain)", len(rst["owner"])))
     steps.append((f"Refinance-checked across group + title (top {rst['checked']} by rank; "
                   f"{rst['unchecked']} lower-ranked not checked, dropped)", rst["checked"]))

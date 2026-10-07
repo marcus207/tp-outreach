@@ -12,7 +12,7 @@ Weekly refinancing radar email for Marcus (Monday morning).
      "Sub-performing / distressed isn't when it is already in administration. It is when the loan is
      longer than 5 years and they haven't found a refinance solution." Same base filters and size
      score, qualifying charge MORE than 60 months old (60-96), still outstanding, no new charge from a
-     different lender since 6 months before the 5-year anniversary (CH charges register per
+     different lender at any time after the qualifying charge (CH charges register per
      candidate); same-lender further charges flagged as a possible extension; companies in formal
      insolvency excluded (log only). Up to 10 (max 3 per class), ranked by months past 5 years, size
      band, extension signal and soft signals. Approach is to the directors, same rules as the main
@@ -177,6 +177,8 @@ def sub_list(sres, top):
     sres = {**sres, "candidates": [c for c in sres["candidates"] if c["company_number"] not in shown]}
     pool = rd.sub_select_pool(sres)
     prof = asset_profiles(pool)
+    pool, ops = drop_operators(pool, "sub-performing")
+    orig["operators"] = len(ops)
     for c in pool:
         c["size"] = score_size(c)
     final = rd.sub_final(pool)
@@ -333,90 +335,16 @@ def enrich(companies, enabled=True):
     return out, stats
 
 
-# --------------------------------------------------------------------------- LinkedIn (Brave)
-# Public web search only via the Brave Search API: LinkedIn itself is never scraped or logged
-# into. Matches are "likely", never "confirmed". Results cached; queries throttled and capped.
-LI_CACHE_DIR = os.path.join(OUT_DIR, "linkedin_cache")
-LI_MAX_QUERIES = 80  # main 10 + sub-performing 10, up to 3 directors + company each
-LI_DIRECTORS = 3
-BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
-PROPERTY_TERM = re.compile(r"propert|real estate|estates?\b|investment|asset manage|develop|"
-                           r"hotel|hospitality|care|living|residential|logistics|capital|"
-                           r"fund|REIT|portfolio|director|founder|partner|chief|CEO|CFO", re.I)
-GENERIC_TOKENS = {"investments", "investment", "properties", "property", "estates", "estate",
-                  "capital", "management", "services", "partners", "international", "global",
-                  "living", "care", "healthcare", "hotel", "hotels", "residential", "developments",
-                  "london", "britain", "british", "england", "operating", "opco", "topco", "bidco",
-                  "midco", "holdco", "investors", "real", "assets", "asset", "fund", "group"}
-
-
-def _brave_key():
-    try:
-        for line in open(os.path.join(ROOT, ".env")):
-            m = re.match(r"\s*BRAVE_API_KEY\s*=\s*['\"]?([^'\"\s#]+)", line)
-            if m:
-                return m.group(1)
-    except OSError:
-        pass
-    return os.environ.get("BRAVE_API_KEY") or None
-
-
-class Brave:
-    def __init__(self):
-        self.key = _brave_key()
-        self.queries = self.cached = self.capped = 0
-        self.last = 0.0
-        os.makedirs(LI_CACHE_DIR, exist_ok=True)
-
-    def top(self, q):
-        """Top web result {title, description, url} or None. Cached indefinitely."""
-        import hashlib
-        import requests
-        fn = os.path.join(LI_CACHE_DIR, hashlib.sha1(q.encode()).hexdigest() + ".json")
-        if os.path.exists(fn):
-            self.cached += 1
-            return json.load(open(fn)).get("top")
-        if not self.key:
-            return None
-        if self.queries >= LI_MAX_QUERIES:
-            self.capped += 1
-            return None
-        for attempt in range(3):
-            wait = 1.1 - (time.time() - self.last)  # free tier: 1 query/second
-            if wait > 0:
-                time.sleep(wait)
-            self.last = time.time()
-            try:
-                r = requests.get(BRAVE_URL, params={"q": q, "count": 3, "country": "GB",
-                                                    "search_lang": "en"},
-                                 headers={"Accept": "application/json",
-                                          "X-Subscription-Token": self.key}, timeout=15)
-            except Exception:
-                continue
-            if r.status_code == 429:
-                time.sleep(2 + attempt * 2)
-                continue
-            self.queries += 1
-            if r.status_code != 200:
-                return None
-            res = ((r.json().get("web") or {}).get("results") or [])
-            top = ({k: res[0].get(k) for k in ("title", "description", "url")} if res else None)
-            json.dump({"q": q, "top": top, "at": dt.datetime.now().isoformat()}, open(fn, "w"))
-            return top
-        return None
+# --------------------------------------------------------------------------- LinkedIn
+# Rebuilt 7 Oct 2026 in scripts/radar_linkedin.py (several Brave queries per director, company team pages,
+# Claude picks per director with matched / possible / none). Public web search only: LinkedIn itself is never
+# fetched, scraped or logged into.
+LI_DIRECTORS = 3  # directors per card sent to Apollo
 
 
 def _clean_co(name):
     return re.sub(r"\s*\b(limited|ltd\.?|plc|llp|l\.?p\.?)\s*$", "", (name or "").strip(),
                   flags=re.I).strip(" ,.")
-
-
-def _tokens(*names):
-    from maturity_radar import norm
-    out = set()
-    for n in names:
-        out |= {t for t in norm(n).split() if len(t) >= 4 and t not in GENERIC_TOKENS}
-    return out
 
 
 def _person(d):
@@ -429,51 +357,6 @@ def _person(d):
     if not first or not sur:
         return None
     return f"{first[0].title()} {sur.title()}", sur.lower()
-
-
-def linkedin(companies):
-    """Adds c['li_directors'] = {director string: url|None} and c['li_company'] = url|None.
-    Returns stats."""
-    br = Brave()
-    st = {"dir_q": 0, "dir_hit": 0, "co_q": 0, "co_hit": 0, "enabled": bool(br.key)}
-    for c in companies:
-        parent = next((p for p in c.get("parents") or [] if p), None)
-        org = _clean_co(parent or c["name"])
-        toks = _tokens(c["name"], *(c.get("parents") or []))
-        c["li_directors"] = {}
-        for d in (c.get("directors") or [])[:LI_DIRECTORS]:
-            p = _person(d)
-            if not p:
-                continue
-            full, sur = p
-            st["dir_q"] += 1
-            top = br.top(f'"{full}" "{org}" site:linkedin.com/in')
-            url = None
-            if top and "linkedin.com/in/" in (top.get("url") or ""):
-                text = re.sub(r"<[^>]+>", "", f"{top.get('title')} {top.get('description')}")
-                low = text.lower()
-                # the profile's own name (title before " - " / " | ") must carry the surname and
-                # first name, so a relative or colleague mentioned in a snippet never matches
-                who = re.split(r"\s[-|–]\s", re.sub(r"<[^>]+>", "", top.get("title") or ""))[0].lower()
-                fn = full.split()[0].lower()
-                if sur in who and fn in who and (any(t in low for t in toks)
-                                                 or PROPERTY_TERM.search(text)):
-                    url = top["url"]
-            c["li_directors"][d] = url
-            st["dir_hit"] += bool(url)
-        st["co_q"] += 1
-        top = br.top(f'"{org}" site:linkedin.com/company')
-        url = None
-        if top and "linkedin.com/company/" in (top.get("url") or ""):
-            text = re.sub(r"<[^>]+>", "", f"{top.get('title')} {top.get('description')} {top.get('url')}")
-            low = text.lower()
-            if any(t in low for t in _tokens(org)):
-                url = top["url"]
-        c["li_company"] = url
-        c["li_company_org"] = org
-        st["co_hit"] += bool(url)
-    st.update(queries=br.queries, cached=br.cached, capped=br.capped)
-    return st
 
 
 # --------------------------------------------------------------------------- Apollo (work email)
@@ -535,9 +418,9 @@ def apollo(companies):
                 body = {"first_name": first, "last_name": last, "organization_name": org}
                 if dom:
                     body["domain"] = dom
-                li = (c.get("li_directors") or {}).get(d)
-                if li:
-                    body["linkedin_url"] = li
+                li = (c.get("li_detail") or {}).get(d) or {}
+                if li.get("confidence") == "matched":
+                    body["linkedin_url"] = li["url"]
                 try:
                     r = requests.post(APOLLO_URL, json=body, timeout=30,
                                       headers={"X-Api-Key": key, "Content-Type": "application/json",
@@ -573,11 +456,6 @@ def apollo(companies):
 def director_bits(c, d):
     """Plain-text extras for one director line: LinkedIn + Apollo email/title."""
     bits = []
-    li = (c.get("li_directors") or {}).get(d, "n/a")
-    if li and li != "n/a":
-        bits.append("LinkedIn (likely)")
-    elif d in (c.get("li_directors") or {}):
-        bits.append("LinkedIn not found")
     ap = (c.get("apollo") or {}).get(d)
     if ap:
         if ap.get("title"):
@@ -649,19 +527,17 @@ def card_fields(c, radar):
     debt_link = di and di.get("debt") is None and di.get("link")
     # directors: one line each with LinkedIn (likely) link and Apollo title / work email
     t_lines, h_lines = [], []
+    from radar_linkedin import director_line
     for d in c.get("directors") or []:
         bits = director_bits(c, d)
-        li = (c.get("li_directors") or {}).get(d)
-        t_lines.append(d + "".join(f" · {b}" for b in bits) + (f" [{li}]" if li else ""))
-        hb = []
-        for b in bits:
-            hb.append(f'<a href="{html.escape(li)}" style="color:#1f3a5f">LinkedIn</a> (likely)'
-                      if b == "LinkedIn (likely)" else e(b))
-        h_lines.append(e(d) + "".join(f" &middot; {x}" for x in hb))
+        lt, lh = director_line(c, d)
+        t_lines.append(d + (f" · {lt}" if lt else "") + "".join(f" · {b}" for b in bits))
+        h_lines.append(e(d) + (f" &middot; {scrub(lh)}" if lh else "") + "".join(f" &middot; {e(b)}" for b in bits))
     dir_text = "; ".join(t_lines) or "-"
     dir_html = "<br>".join(h_lines) or "-"
-    co_li_text = (f"({c.get('li_company_org')}) (likely)" if c.get("li_company") else
-                  "not found" if "li_company" in c else "not checked")
+    cd = c.get("li_company_detail") or {}
+    co_li_text = (f"{c['li_company']} ({cd.get('confidence')}" + (f": {cd['reason']}" if cd.get("reason") else "") + ")"
+                  if c.get("li_company") else "not found" if "li_company" in c else "not checked")
     contacts = "; ".join(f"{x['name'] or '(no name)'} <{x['email']}>" for x in c["contacts"][:3]) \
         or "No contact held"
     if len(c["contacts"]) > 3:
@@ -690,7 +566,7 @@ def card_fields(c, radar):
         ("Accounts", (c.get("acc_type") or "none filed") + (" (overdue)" if c.get("acc_overdue") else "")
          + (f", made up to {fmt_date(_ddmmyyyy(di['made_up']))}" if di and di.get("made_up") else "")),
         ("Directors", dir_text, None, None, dir_html),
-        ("Company LinkedIn", co_li_text, c.get("li_company"), "LinkedIn"),
+        ("Company LinkedIn", co_li_text),
         ("Existing contact", contacts),
     ]
 
@@ -762,6 +638,24 @@ def sub_fields(c, radar):
     return out
 
 
+def dd_render(c, td, tv):
+    """(html rows, text lines) for the card's Deep dive block (after Why now)."""
+    from radar_deep_dive import dd_rows
+    H, T = [], []
+    rows = dd_rows(c)
+    if rows:
+        H.append(f'<tr><td colspan="2" style="padding:10px 0 2px;font-family:Georgia,serif;font-size:14px;'
+                 f'border-top:1px solid #eee">Deep dive</td></tr>')
+    for k, v, *lk in rows:
+        k = k.replace("Deep dive: ", "").capitalize()
+        if len(lk) >= 3 and lk[2]:
+            H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{lk[2]}</td></tr>")
+        else:
+            H.append(f"<tr><td {td}>{e(k)}</td><td {tv}>{e(v)}</td></tr>")
+        T.append(f"   Deep dive, {k}: {v}")
+    return H, T
+
+
 def sub_block(sub, credit=None, radar=None, sres=None):
     """(html lines, text lines) for the SUB-PERFORMING section."""
     credit = credit or {}
@@ -805,10 +699,12 @@ def sub_block(sub, credit=None, radar=None, sres=None):
         cl = credit_lines(credit.get(cn), _ddmmyyyy((c.get("profile") or {}).get("date_of_creation")))
         H.append(f"<tr><td {td}>Credit data</td><td {tv}>{'<br>'.join(e(x) for x in cl)}</td></tr>")
         H.append(f'<tr><td {td}><b>Why now</b></td><td {tv}><b>{e(c.get("angle") or "")}</b></td></tr>')
+        dh, dt_ = dd_render(c, td, tv)
+        H += dh
         H.append("</table></div>")
         T += [f"S{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
         T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
-        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {c.get('angle') or ''}", ""]
+        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {c.get('angle') or ''}", *dt_, ""]
     if not sub:
         H.append('<p style="font-family:Arial,sans-serif;font-size:13px">None this week</p>')
         T.append(" - None this week")
@@ -907,14 +803,25 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None, sub=Non
               "particulars; where the charge is an all-assets debenture the property is not stated, and the "
               "asset is inferred from current and former owners (Companies House), timing and dated public "
               "news, shown as Likely or Possible with its evidence; capacity only where a source states it. "
-              "LinkedIn links come from public web search "
-              "and are marked likely, not confirmed. Director work emails are from Apollo: only "
+              "Operating companies with no property asset found (charge names no property, no asset identified, "
+              "and an operating-business SIC such as domiciliary care or health services, or sources describing "
+              "a services business) are left out"
+              + (f" ({sc.get('operators', 0)} this week)" if sc else "") + ". "
+              "LinkedIn links come from public web search only (several searches per director: company, group, "
+              "town and sector, middle-name variants, plus the company's own team pages), with the best match "
+              "picked against the director's name, employer, group and other directorships: 'matched' means the "
+              "name and an employer, group or other directorship agree; 'possible' means the name plus sector "
+              "or location only. LinkedIn itself is never visited. Deep dive: public sources only (Companies "
+              "House, regulators' data, web search and public web pages), every fact linked to its source and "
+              "'not found' where no source states it; web facts are kept only when the quoted text is found "
+              "in the cited page; news limited to the last 24 months; the summary is written only from those "
+              "facts. Director work emails are from Apollo: only "
               "'verified' emails are usable; nothing here is added to contacts or sequences. "
               f"Sub-performing section: a facility longer than 5 years with no refinance found. Same base "
               f"filters and size score as the main list, but the qualifying charge is more than {smn} months "
               f"old (up to {smx}) and still outstanding on the Companies House charges register; companies "
-              "where a new charge from a different lender was registered from 6 months before the 5-year "
-              "anniversary onwards (likely refinanced), or where the charge has been satisfied, are left "
+              "where any newer charge from a different lender was registered after the qualifying charge "
+              "(likely refinanced), or where the charge has been satisfied, are left "
               "out, as are companies already in formal insolvency (administration, liquidation, "
               "receivership, CVA). A further charge or alteration by the same lender after that point is "
               "shown as a possible extension or amendment, not confirmed. A 5-year term is typical, not "
@@ -960,10 +867,12 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None, sub=Non
         cl = credit_lines(credit.get(cn), _ddmmyyyy((c.get("profile") or {}).get("date_of_creation")))
         H.append(f"<tr><td {td}>Credit data</td><td {tv}>{'<br>'.join(e(x) for x in cl)}</td></tr>")
         H.append(f'<tr><td {td}><b>Why now</b></td><td {tv}><b>{e(why(c))}</b></td></tr>')
+        dh, dt_ = dd_render(c, td, tv)
+        H += dh
         H.append("</table></div>")
         T += [f"{i}. {c['name']} ({cn})", f"   {CH_LINK.format(cn)}"]
         T += [f"   {k}: {v}" + (f" [{lk[0]}]" if lk and lk[0] else "") for k, v, *lk in fields]
-        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", ""]
+        T += ["   Credit data: " + " | ".join(cl), f"   Why now: {why(c)}", *dt_, ""]
     sh, stx = sub_block(sub, credit, radar, sres)
     H += sh
     T += stx
@@ -974,7 +883,21 @@ def build(radar, top, distress, credit, wc, size_counts=None, dres=None, sub=Non
     H.append(f'<p style="font-family:Arial,sans-serif;font-size:11px;color:#666;line-height:1.5;'
              f'border-top:1px solid #ccc;padding-top:10px">{e(method)}</p></div></body></html>')
     T += ["", method]
-    return scrub(subject), scrub("\n".join(H)), scrub("\n".join(T))
+    return scrub(subject), scrub(compact_html("\n".join(H))), scrub("\n".join(T))
+
+
+CSS = ("<style>td.k{padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px}"
+       "td.v{padding:3px 0;vertical-align:top;font-size:13px}a{color:#1f3a5f}</style>")
+
+
+def compact_html(h):
+    """Shrink the email (Gmail clips messages over ~102 KB): repeated inline cell / link styles become two
+    CSS classes in a <style> block (supported by Gmail); the layout is unchanged."""
+    td = 'style="padding:3px 10px 3px 0;vertical-align:top;color:#555;white-space:nowrap;font-size:13px"'
+    tv = 'style="padding:3px 0;vertical-align:top;font-size:13px"'
+    h = h.replace(f"<td {td}>", '<td class="k">').replace(f"<td {tv}>", '<td class="v">')
+    h = h.replace(' style="color:#1f3a5f"', "")
+    return h.replace("<html><body", f"<html><head>{CSS}</head><body", 1)
 
 
 # --------------------------------------------------------------------------- send
@@ -1061,7 +984,7 @@ def asset_profiles(top):
                 return r
             try:
                 c["asset_id"], _ = _profile_cache(
-                    c, ["ident", c.get("name"), c.get("cls"), c.get("dates"), c.get("lenders")], _ident)
+                    c, ["ident-v2", c.get("name"), c.get("cls"), c.get("dates"), c.get("lenders")], _ident)
                 st["identified"] += c["asset_id"].get("confidence") in ("likely", "possible")
             except Exception as ex:
                 c["asset_id"] = None
@@ -1116,6 +1039,57 @@ def asset_fields(c):
     if epc and epc != "unknown":
         out.append(("EPC", str(epc)))
     return out
+
+
+# Operating companies that don't own property (Marcus, 7 Oct 2026: e.g. GROSVENOR HEALTH AND SOCIAL CARE, a
+# home-care operator). Excluded only when NO property asset was found: the charge names no property, the
+# ownership identification found no asset, no capacity / CQC care home / school from any source; AND either an
+# operating-business SIC (88100 domiciliary care, 8899x social work, 86xxx health services) or the
+# identification read the company as an operating business.
+OPERATOR_SIC = re.compile(r"^(881|8899|86)")
+OPERATOR_TEXT = re.compile(r"operating (business|company)|domiciliary|home ?care|not a property|staffing|"
+                           r"services business|service provider", re.I)
+
+
+def operator_exclusion(c):
+    """None, or the reason the company is an operating business with no property asset found."""
+    pi = c.get("prop") or {}
+    if not pi.get("generic"):
+        return None  # the charge names a property
+    a = c.get("asset") or {}
+    ident = c.get("asset_id") or {}
+    if ident.get("confidence") in ("likely", "possible"):
+        return None
+    if (a.get("capacity") or {}).get("value") not in (None, "unknown") or a.get("cqc") or a.get("gias") \
+            or (a.get("cqc_portfolio") or {}).get("care_homes") or a.get("gias_portfolio"):
+        return None
+    sic = c.get("sic") or (c.get("profile") or {}).get("sic_codes") or []
+    op_sic = [x for x in sic if OPERATOR_SIC.match(x)]
+    ev = " ".join([ident.get("business_model_reason") or ""] + [b.get("text") or "" for b in ident.get("evidence") or []])
+    op_txt = ident.get("business_model") == "operating_business" or bool(OPERATOR_TEXT.search(ev))
+    if not (op_sic or op_txt):
+        return None
+    why = []
+    if op_sic:
+        why.append(f"operating-business SIC {', '.join(op_sic)}")
+    if op_txt:
+        why.append("identified as an operating business: " + ((ident.get("business_model_reason") or "").strip()
+                                                              or next((b["text"] for b in ident.get("evidence") or []
+                                                                       if OPERATOR_TEXT.search(b.get("text") or "")), ""))[:160])
+    return "; ".join(why) + "; no property asset found (general debenture, no asset identified, no capacity source)"
+
+
+def drop_operators(cands, label):
+    kept, out = [], []
+    for c in cands:
+        why = operator_exclusion(c)
+        if why:
+            c["operator_excluded"] = why
+            out.append(c)
+            log(f"  {label} excluded [operating company, no property] {c['name'][:50]} ({c['company_number']}): {why}")
+        else:
+            kept.append(c)
+    return kept, out
 
 
 def write_size_csv(run, cands, micro):
@@ -1182,11 +1156,13 @@ def main():
         + ", ".join(f"{cn} {s_}s" for cn, s_ in slow) + f"); {prof['ok']} with capacity, errors "
         f"{prof['errors']}; debenture cards identified {prof['identified']}/{prof['debenture']}")
 
+    cands, operators = drop_operators(cands, "main")
+    log(f"operating companies with no property asset excluded (main): {len(operators)}")
     for c in cands:
         c["size"] = score_size(c)
     counts = {b: sum(1 for c in cands if c["size"]["band"] == b)
               for b in ("likely_10m", "likely_5m", "possible", "unlikely")}
-    size_counts = {**counts, "profiled": len(cands), "micro_skipped": len(micro)}
+    size_counts = {**counts, "profiled": len(cands), "micro_skipped": len(micro), "operators": len(operators)}
     log("size bands (profiled): Likely £10m+ {likely_10m}, Likely £5m-10m {likely_5m}, Possible "
         "{possible}, Unlikely {unlikely}".format(**counts))
     for c in cands:
@@ -1243,10 +1219,35 @@ def main():
         sres["error"] = f"sub-performing scan failed ({type(ex).__name__})"
         sub = []
 
-    li = linkedin(top + sub)
-    log(f"linkedin (search, likely only): directors {li['dir_hit']}/{li['dir_q']}, companies "
-        f"{li['co_hit']}/{li['co_q']}; queries {li['queries']}, cached {li['cached']}, "
-        f"capped {li['capped']}" + ("" if li["enabled"] else " (no search key)"))
+    import radar_deep_dive
+    import radar_linkedin
+    ch2 = maturity_radar.CH()
+    tdd = time.time()
+    dds = radar_deep_dive.run_all(top + sub, ch2, radar["run"])
+    log(f"deep dive: {len(top + sub)} assets in {dds['secs']}s (cached {dds['cached']}; new searches "
+        f"{dds['searches']}, page fetches {dds['fetches']}; errors {dds['errors'] or 'none'})")
+    for c in top + sub:
+        d_ = c.get("deep") or {}
+        log(f"  DD {c['name'][:44]:<44} {len(d_.get('coverage') or [])}/{len(radar_deep_dive.COVERAGE)} "
+            f"[{', '.join(d_.get('coverage') or [])}] {d_.get('secs')}s{' cached' if d_.get('cached') else ''}")
+    li = radar_linkedin.linkedin(top + sub, ch2)
+    log(f"linkedin: directors {li['matched']} matched + {li['possible']} possible of {li['directors']} "
+        f"({li['none']} not found); company pages {li['co_found']}/{li['companies']} ({li['co_matched']} matched); "
+        f"queries {li['queries']} (cached 90 days); {li['secs']}s; errors {li['errors'] or 'none'}"
+        + ("" if li["enabled"] else " (no search key)"))
+    for c in top + sub:
+        for d, det in (c.get("li_detail") or {}).items():
+            log(f"  LI {c['name'][:30]:<30} {d.split(' (appointed')[0][:30]:<30} {det['confidence']:<8} "
+                f"{det.get('url') or ''} {det.get('reason') or ''}")
+    _dd_secs = time.time() - tdd
+    try:  # debug dump (gitignored reports dir; directors' names are personal data, internal only)
+        json.dump([{"company_number": c["company_number"], "name": c["name"], "cls": c["cls"],
+                    "section": "main" if c in top else "sub", "li_detail": c.get("li_detail"),
+                    "li_company": c.get("li_company_detail"), "deep_coverage": (c.get("deep") or {}).get("coverage"),
+                    "size": (c.get("size") or {}).get("label")} for c in top + sub],
+                  open(os.path.join(OUT_DIR, f"cards-{radar['run']}.json"), "w"), indent=1, default=str)
+    except Exception as ex:
+        log(f"cards dump failed: {type(ex).__name__}")
     ap = apollo(top + sub)
     log(f"apollo work email: people {ap['people']}, credits used (match calls) {ap['calls']}, "
         f"cached {ap['cached']}, capped {ap['capped']}, matched {ap['matched']}, with email "
